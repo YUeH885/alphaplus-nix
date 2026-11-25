@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Keep main builds running to completion so publish + prune never leave half-updated state.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Nix configuration
+        id: nix-cfg
+        env:
+          R2_PUBLIC_URL: ${{ vars.R2_PUBLIC_URL }}
+          NIX_PUBLIC_KEY: ${{ vars.NIX_PUBLIC_KEY }}
+        run: |
+          {
+            echo "config<<EOF"
+            echo "connect-timeout = 10"
+            echo "fallback = true"
+            if [[ -n "$R2_PUBLIC_URL" && -n "$NIX_PUBLIC_KEY" ]]; then
+              echo "extra-substituters = $R2_PUBLIC_URL"
+              echo "extra-trusted-public-keys = $NIX_PUBLIC_KEY"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: ${{ steps.nix-cfg.outputs.config }}
+
+      - name: Check flake
+        run: nix flake check --no-build --option extra-platforms ""
+
+      - name: Build system and boot packages
+        run: |
+          nix build --no-link --print-out-paths \
+            --option extra-platforms "" --option builders "" \
+            ".#nixosConfigurations.alphaplus.config.system.build.toplevel" \
+            ".#packages.aarch64-linux.uboot" \
+            ".#packages.aarch64-linux.boot" \
+            | tee built-paths.txt
+          test -s built-paths.txt
+
+      - name: Publish and prune R2 binary cache
+        if: github.event_name != 'pull_request' && vars.R2_BUCKET != '' && vars.R2_ENDPOINT != '' && vars.NIX_PUBLIC_KEY != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PUBLIC_URL: ${{ vars.R2_PUBLIC_URL }}
+          NIX_PUBLIC_KEY: ${{ vars.NIX_PUBLIC_KEY }}
+          NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+        run: |
+          if [[ -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" || -z "$NIX_SIGNING_KEY" ]]; then
+            echo "::warning::R2 or Nix signing secrets are not set; skipping binary cache publish."
+            exit 0
+          fi
+
+          nix shell --inputs-from . nixpkgs#awscli2 nixpkgs#zstd nixpkgs#python3 --command \
+            bash -euo pipefail -c '
+              python3 tools/ci/r2-cache.py publish \
+                --manifest manifest-aarch64.json \
+                --paths-file built-paths.txt
+              python3 tools/ci/r2-cache.py prune manifest-aarch64.json
+            '
