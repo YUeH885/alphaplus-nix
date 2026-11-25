@@ -1,0 +1,22 @@
+{
+  "fastrpc_shell_3": "fdfc1269932ff8d18e60f285e036d3569c564cd7ac692395a076e71d002615ef",
+  "fastrpc_shell_unsigned_3": "8fa290bd2a5754e4aacc645cf20706bf5c886f98de8e30026d24516bf3415862",
+  "libbenchmark_skel.so": "9b1e6486eaf29627bcc4e454c055679bcceb395f3b0cdd655b97cabda1cb1efd",
+  "libc++.so.1": "1fc1384555cfad5dd23df8b2e07ffb10a22d6b4bce83a1eb7d0c5e71470188d7",
+  "libc++abi.so.1": "766a3ec60719b6a4b33dd5612ff92ba2c72fe6da16a2b8a97e7ef9d274030cb9",
+  "libhcp_rpc_skel.so": "7a1cb297be4b5d922e78c10fee1e740bf91ca45fb5cda8ecaab651d0dcc35f04",
+  "libhta_dsp_skel.so": "b1e14bcba569c9e8be1f58cc43b9107461b37a0b33a6f921e1df525b105e2b66",
+  "libimmotion_skel.so": "f72c050eef4ac9ac0e7f8db24b1d9e4f8da6c732a7287f6701396d571801a649",
+  "libstabilitydomain_skel.so": "32b679847591749e3e8daef28f602c746a0a0e6db11aac78a7a9811e16111f48",
+  "libsysmon_skel.so": "e12b53fccd1f0030f3392e08a82d733892565a70f5739a62fdb9dba7fbe88373",
+  "libsysmondomain_skel.so": "a6a10008d8aff96a6f3b83fb1f41759cc53a80bc25b2703c6809cebf8d932025",
+  "libsysmonhvxthrottle_skel.so": "48f50d5b816bccd0505ab5fa03e5d47b83c521168f286ae011cd5bb859bf3adc",
+  "libsysmonquery_skel.so": "80ca0bb9bffac155f5c630893e0a09b15a32b720b61e47d154dcae36cbd6c64c",
+  "libvpp_aie.so": "8d73f2052b6ec45c149be3a8638de8d630d06d5949c3d9ee46da421110df9b38",
+  "libvpp_frc.so": "bc3cc4e7c903c3aa3997c703fac31dbc8fe0d2cf5ffb58bd097bc9c035e33fc5",
+  "libvpp_mvp.so": "704fc9a000c9008b2da87cc24cd2b2d59c207b13c58d4ae1365e978a95631628",
+  "libvpp_nr.so": "10a422361c62a52b40a5c749d7e717533e237fb6903534d8976e53ed5978d170",
+  "libvpp_qbr.so": "ffe125ac49f34c54f1e525e9fd95eefee623dff50deedc4b7d107a68f3e20dca",
+  "libvpp_svc_skel.so": "99793dda2cf09d72f2cad11e28b1f5a6414d9568e966668d376f6fd84bdade79",
+  "ubwcdma_dynlib.so": "f4327aedb9870b509eab87062b2d305f03d4b1e941bd85ba00da69b59b59c687"
+}

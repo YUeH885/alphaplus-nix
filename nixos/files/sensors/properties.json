@@ -1,0 +1,20 @@
+{
+  "values": {
+    "soc_id": "339",
+    "revision": "2.2",
+    "hw_platform": "MTP",
+    "platform_subtype": "Unknown",
+    "platform_subtype_id": "0",
+    "platform_version": "786432",
+    "hw_rev": "rev_10"
+  },
+  "sources": {
+    "soc_id": "/sys/devices/soc0/soc_id",
+    "revision": "/sys/devices/soc0/revision",
+    "hw_platform": "/sys/kernel/debug/qcom_socinfo/hardware_platform; stock socinfo.c",
+    "platform_subtype": "/sys/kernel/debug/qcom_socinfo/hardware_platform_subtype; stock socinfo.c",
+    "platform_subtype_id": "/sys/kernel/debug/qcom_socinfo/hardware_platform_subtype",
+    "platform_version": "/sys/kernel/debug/qcom_socinfo/platform_version",
+    "hw_rev": "/proc/cmdline: androidboot.vendor.lge.hw.revision"
+  }
+}
