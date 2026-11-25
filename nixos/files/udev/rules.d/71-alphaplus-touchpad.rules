@@ -1,0 +1,2 @@
+# The virtual touchpad is part of the phone, not an attached pointing device.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="LG G8 Touchpad", TAG+="kwin-ignore-tablet-mode"

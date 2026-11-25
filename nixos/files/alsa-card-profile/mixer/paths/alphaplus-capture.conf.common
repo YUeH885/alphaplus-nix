@@ -1,0 +1,46 @@
+; Keep the handset endpoint connected while the ADC mux changes.
+; Jack detection controls the read-only headset endpoint.
+[Element Handset Mic]
+switch = on
+direction = playback
+
+[Element DEC5]
+volume = 84
+required = volume
+
+[Element DEC6]
+volume = 84
+required = volume
+
+[Element MultiMedia2 Mixer SLIMBUS_0_TX]
+switch = on
+direction = playback
+required = switch
+
+[Element CDC_IF TX5 MUX]
+enumeration = select
+required = enumeration
+
+[Option CDC_IF TX5 MUX:DEC5]
+name = dec5
+
+[Element CDC_IF TX6 MUX]
+enumeration = select
+required = enumeration
+
+[Option CDC_IF TX6 MUX:DEC6]
+name = dec6
+
+[Element ADC MUX5]
+enumeration = select
+required = enumeration
+
+[Option ADC MUX5:AMIC]
+name = amic
+
+[Element ADC MUX6]
+enumeration = select
+required = enumeration
+
+[Option ADC MUX6:AMIC]
+name = amic

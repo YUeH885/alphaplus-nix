@@ -1,0 +1,2 @@
+# USB gadget network interfaces provide host connectivity, not modem ports.
+SUBSYSTEM=="net", ENV{DEVTYPE}=="gadget", ENV{ID_MM_DEVICE_IGNORE}="1"

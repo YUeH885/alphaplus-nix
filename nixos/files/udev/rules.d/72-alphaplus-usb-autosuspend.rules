@@ -1,0 +1,6 @@
+# Opt in to USB runtime autosuspend. The DWC3 controller and its PHYs forbid
+# runtime PM at probe; the drivers are built-in, so allow it on add.
+ACTION=="add", SUBSYSTEM=="platform", DRIVER=="qcom-snps-hs-femto-v2-phy", ATTR{power/control}="auto"
+ACTION=="add", SUBSYSTEM=="platform", DRIVER=="qcom-qmp-combo-phy", ATTR{power/control}="auto"
+ACTION=="add", SUBSYSTEM=="platform", DRIVER=="dwc3-qcom-legacy", ATTR{power/control}="auto"
+ACTION=="add", SUBSYSTEM=="platform", DRIVER=="dwc3", ATTR{power/control}="auto"

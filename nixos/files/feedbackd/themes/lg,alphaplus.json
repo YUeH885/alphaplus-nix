@@ -1,0 +1,89 @@
+{
+  "name": "$device",
+  "parent-name": "default",
+  "profiles": [
+    {
+      "name": "quiet",
+      "feedbacks": [
+        {
+          "event-name": "key-pressed",
+          "type": "VibraPattern",
+          "magnitudes": [ 0.65 ],
+          "durations": [ 15 ]
+        },
+        {
+          "event-name": "key-released",
+          "type": "VibraRumble",
+          "magnitude": 0.25,
+          "duration": 8
+        },
+        {
+          "event-name": "button-pressed",
+          "type": "VibraPattern",
+          "magnitudes": [ 0.7 ],
+          "durations": [ 18 ]
+        },
+        {
+          "event-name": "button-released",
+          "type": "VibraRumble",
+          "magnitude": 0.3,
+          "duration": 10
+        },
+        {
+          "event-name": "bell-terminal",
+          "type": "VibraRumble",
+          "magnitude": 0.75,
+          "duration": 40
+        },
+        {
+          "event-name": "window-close",
+          "type": "VibraPattern",
+          "magnitudes": [ 0.4 ],
+          "durations": [ 15 ]
+        },
+        {
+          "event-name": "notification-new-generic",
+          "type": "VibraPattern",
+          "magnitudes": [ 0.6, 0.0, 0.8 ],
+          "durations": [ 35, 70, 35 ]
+        },
+        {
+          "event-name": "message-new-instant",
+          "type": "VibraPattern",
+          "magnitudes": [ 0.75, 0.0, 0.85 ],
+          "durations": [ 60, 40, 60 ]
+        },
+        {
+          "event-name": "message-sent-instant",
+          "type": "VibraPattern",
+          "magnitudes": [ 0.5 ],
+          "durations": [ 25 ]
+        },
+        {
+          "event-name": "message-new-sms",
+          "type": "VibraPattern",
+          "magnitudes": [ 0.8, 0.0, 0.9 ],
+          "durations": [ 80, 50, 80 ]
+        },
+        {
+          "event-name": "message-new-email",
+          "type": "VibraPattern",
+          "magnitudes": [ 0.7, 0.0, 0.7 ],
+          "durations": [ 100, 60, 100 ]
+        },
+        {
+          "event-name": "phone-incoming-call",
+          "type": "VibraPeriodic",
+          "magnitudes": [ 0.85, 0.0, 0.85, 0.0 ],
+          "durations": [ 400, 200, 400, 1000 ]
+        },
+        {
+          "event-name": "timeout-completed",
+          "type": "VibraPattern",
+          "magnitudes": [ 0.7, 0.0, 0.8, 0.0, 0.9 ],
+          "durations": [ 100, 50, 100, 50, 150 ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+[Libinput][1][1][LG G8 Touchpad]
+NaturalScroll=true
+PointerAcceleration=0.6
+
+[Libinput][Defaults][Touchpad]
+NaturalScroll=true
+PointerAcceleration=0.6
