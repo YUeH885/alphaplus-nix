@@ -1,0 +1,64 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] sensor: handle multilevel proximity events
+
+
+diff --git a/src/libssc-sensor-proximity.c b/src/libssc-sensor-proximity.c
+index fc46408..e42544a 100644
+--- a/src/libssc-sensor-proximity.c
++++ b/src/libssc-sensor-proximity.c
+@@ -25,6 +25,8 @@
+ 
+ #define SSC_SENSOR_PROXIMITY_NEAR	1
+ #define SSC_SENSOR_PROXIMITY_FAR	0
++#define SSC_SENSOR_PROXIMITY_FAR2	2
++#define SSC_SENSOR_PROXIMITY_NEAR2	3
+ 
+ enum {
+ 	SIGNAL_MEASUREMENT,
+@@ -89,13 +91,17 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 
+ 			switch (msg->near) {
+ 				case SSC_SENSOR_PROXIMITY_NEAR:
++				case SSC_SENSOR_PROXIMITY_NEAR2:
+ 					near = true;
+ 					break;
+ 				case SSC_SENSOR_PROXIMITY_FAR:
++				case SSC_SENSOR_PROXIMITY_FAR2:
+ 					near = false;
+ 					break;
+ 				default:
+-					g_assert_not_reached ();
++					g_warning ("Unknown proximity state: %d", msg->near);
++					ssc_proximity_response__free_unpacked (msg, NULL);
++					return;
+ 			}
+ 
+ 			ssc_proximity_response__free_unpacked (msg, NULL);
+@@ -109,7 +115,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 				return;
+ 			}
+ 
+-			if (msg->data->len != sizeof(ProximityDataDavinci)) {
++			if (msg->n_data != 1 || msg->data->len != sizeof(ProximityDataDavinci)) {
+ 				/* Not observed and unlikely to ever happen due to reserved fields in the data struct */
+ 				ssc_proximity_response_davinci__free_unpacked (msg, NULL);
+ 				return;
+@@ -119,13 +125,17 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 
+ 			switch ((int)data.near) {
+ 				case SSC_SENSOR_PROXIMITY_NEAR:
++				case SSC_SENSOR_PROXIMITY_NEAR2:
+ 					near = true;
+ 					break;
+ 				case SSC_SENSOR_PROXIMITY_FAR:
++				case SSC_SENSOR_PROXIMITY_FAR2:
+ 					near = false;
+ 					break;
+ 				default:
+-					g_assert_not_reached ();
++					g_warning ("Unknown Xiaomi Davinci proximity state: %g", data.near);
++					ssc_proximity_response_davinci__free_unpacked (msg, NULL);
++					return;
+ 			}
+ 
+ 			ssc_proximity_response_davinci__free_unpacked (msg, NULL);

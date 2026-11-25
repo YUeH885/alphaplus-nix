@@ -1,0 +1,52 @@
+--- a/fcitx5-osk/src/layout.rs
++++ b/fcitx5-osk/src/layout.rs
+@@ -662,7 +662,10 @@
+         // minus the size of < and > and their spacing
+         available_candidate_width -= 2 * font_size;
+         let candidate_list = state.candidate_list();
+-        let mut candidate_row = Row::new().spacing(spacing).align_y(Vertical::Center);
++        let mut candidate_row = Row::new()
++            .spacing(spacing)
++            .height(Length::Fill)
++            .align_y(Vertical::Center);
+         let char_width = font_size;
+         let (consumed, max_width) = if state.is_paged() {
+             (
+@@ -701,7 +704,7 @@
+         for candidate in &candidate_list[..consumed] {
+             candidate_row = candidate_row.push(
+                 candidate_btn(candidate, font, font_size, max_width)
+-                    .on_press(ImEvent::SelectCandidate(index).into()),
++                    .on_release_with(Some(move || ImEvent::SelectCandidate(index).into())),
+             );
+             index += 1;
+         }
+@@ -1476,12 +1479,12 @@
+         .center_y(Length::Fill)
+ }
+ 
+-fn candidate_btn(
+-    candidate: &Vec<(String, Option<Font>)>,
++fn candidate_btn<'a>(
++    candidate: &'a [(String, Option<Font>)],
+     font: Font,
+     font_size: KLength,
+     width: Length,
+-) -> Button<'_, Message> {
++) -> ExtButton<'a, Message, ButtonDummyCb<Message>, ButtonDummyCb<Message>> {
+     let mut texts = Row::new();
+     for chars in candidate {
+         texts = texts.push(
+@@ -1493,9 +1496,10 @@
+                 .align_y(Vertical::Center),
+         );
+     }
+-    Button::new(Container::new(texts).center(Length::Fill))
++    ExtButton::new(Container::new(texts).center(Length::Fill))
+         .width(width)
+-        .style(|_, _| ButtonStyle::default().with_background(Color::TRANSPARENT))
++        .height(Length::Fill)
++        .style(widget::button_text_class)
+         .padding(0)
+ }
+ 

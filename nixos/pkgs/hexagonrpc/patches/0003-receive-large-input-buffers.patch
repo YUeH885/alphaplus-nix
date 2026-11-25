@@ -1,0 +1,148 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] listener: fetch complete input buffers for registry writes
+
+Use get_in_bufs2 to receive the remainder when next2 reports an input
+larger than the initial buffer, following the Qualcomm listener protocol.
+Release partially decoded buffers on failure.
+
+diff --git a/hexagonrpcd/interfaces/adsp_listener.def b/hexagonrpcd/interfaces/adsp_listener.def
+index 4f521c0..1620471 100644
+--- a/hexagonrpcd/interfaces/adsp_listener.def
++++ b/hexagonrpcd/interfaces/adsp_listener.def
+@@ -28,5 +28,6 @@
+ 
+ HEXAGONRPC_DEFINE_REMOTE_METHOD(3, adsp_listener_init2, 0, 0, 0, 0)
+ HEXAGONRPC_DEFINE_REMOTE_METHOD(4, adsp_listener_next2, 2, 1, 4, 1)
++HEXAGONRPC_DEFINE_REMOTE_METHOD(5, adsp_listener_get_in_bufs2, 2, 0, 1, 1)
+ 
+ #endif /* INTERFACE_ADSP_LISTENER_DEF */
+diff --git a/hexagonrpcd/iobuffer.c b/hexagonrpcd/iobuffer.c
+index 6481651..08478ed 100644
+--- a/hexagonrpcd/iobuffer.c
++++ b/hexagonrpcd/iobuffer.c
+@@ -139,7 +139,7 @@ struct fastrpc_decoder_context *inbuf_decode_start(uint32_t sc)
+ 	ctx->buf_off = 0;
+ 	ctx->align = 0;
+ 
+-	ctx->inbufs = malloc(sizeof(*ctx->inbufs) * ctx->n_inbufs);
++	ctx->inbufs = calloc(ctx->n_inbufs, sizeof(*ctx->inbufs));
+ 	if (ctx->inbufs == NULL && ctx->n_inbufs != 0)
+ 		goto err;
+ 
+@@ -159,6 +159,14 @@ struct fastrpc_io_buffer *inbuf_decode_finish(struct fastrpc_decoder_context *ct
+ 	return inbufs;
+ }
+ 
++void inbuf_decode_abort(struct fastrpc_decoder_context *ctx)
++{
++	if (!ctx)
++		return;
++	iobuf_free(ctx->n_inbufs, ctx->inbufs);
++	free(ctx);
++}
++
+ int inbuf_decode_is_complete(struct fastrpc_decoder_context *ctx)
+ {
+ 	return ctx->idx >= ctx->n_inbufs;
+diff --git a/hexagonrpcd/iobuffer.h b/hexagonrpcd/iobuffer.h
+index 3b32cf6..2aa29bc 100644
+--- a/hexagonrpcd/iobuffer.h
++++ b/hexagonrpcd/iobuffer.h
+@@ -47,6 +47,7 @@ void iobuf_free(size_t n_iobufs, struct fastrpc_io_buffer *iobufs);
+ 
+ struct fastrpc_decoder_context *inbuf_decode_start(uint32_t sc);
+ struct fastrpc_io_buffer *inbuf_decode_finish(struct fastrpc_decoder_context *ctx);
++void inbuf_decode_abort(struct fastrpc_decoder_context *ctx);
+ int inbuf_decode_is_complete(struct fastrpc_decoder_context *ctx);
+ int inbuf_decode(struct fastrpc_decoder_context *ctx, size_t len, const void *src);
+ 
+diff --git a/hexagonrpcd/listener.c b/hexagonrpcd/listener.c
+index 932c54d..374303e 100644
+--- a/hexagonrpcd/listener.c
++++ b/hexagonrpcd/listener.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <inttypes.h>
++#include <string.h>
+ #include <libhexagonrpc/fastrpc.h>
+ #include <libhexagonrpc/interfaces/remotectl.def>
+ #include <stddef.h>
+@@ -56,6 +57,13 @@ static int adsp_listener_next2(int fd,
+ 			inbufs_size, inbufs);
+ }
+ 
++static int adsp_listener_get_in_bufs2(int fd, uint32_t rctx, uint32_t offset,
++                                      uint32_t *required, uint32_t size, void *buf)
++{
++	return fastrpc2(&adsp_listener_get_in_bufs2_def, fd, ADSP_LISTENER_HANDLE,
++			rctx, offset, required, size, buf);
++}
++
+ static struct fastrpc_io_buffer *allocate_outbufs(const struct fastrpc_function_def_interp2 *def,
+ 						  uint32_t *first_inbuf)
+ {
+@@ -141,8 +149,9 @@ static int return_for_next_invoke(int fd,
+ 				  const struct fastrpc_io_buffer *returned,
+ 				  struct fastrpc_io_buffer **decoded)
+ {
+-	struct fastrpc_decoder_context *ctx;
+-	char inbufs[256];
++	struct fastrpc_decoder_context *ctx = NULL;
++	char initial[256];
++	char *inbufs = initial;
+ 	char *outbufs = NULL;
+ 	uint32_t inbufs_len;
+ 	uint32_t outbufs_len;
+@@ -164,7 +173,7 @@ static int return_for_next_invoke(int fd,
+ 				  *rctx, result,
+ 				  outbufs_len, outbufs,
+ 				  rctx, handle, sc,
+-				  &inbufs_len, 256, inbufs);
++				  &inbufs_len, sizeof(initial), initial);
+ 	if (ret) {
+ 		if (ret == -1)
+ 			perror("Could not fetch next FastRPC message");
+@@ -174,10 +183,25 @@ static int return_for_next_invoke(int fd,
+ 		goto err_free_outbufs;
+ 	}
+ 
+-	if (inbufs_len > 256) {
+-		fprintf(stderr, "Large (>256B) input buffers aren't implemented\n");
+-		ret = -1;
+-		goto err_free_outbufs;
++	if (inbufs_len > sizeof(initial)) {
++		uint32_t required;
++
++		inbufs = malloc(inbufs_len);
++		if (!inbufs) {
++			ret = -1;
++			goto err_free_outbufs;
++		}
++		memcpy(inbufs, initial, sizeof(initial));
++		ret = adsp_listener_get_in_bufs2(fd, *rctx, sizeof(initial),
++					       &required, inbufs_len - sizeof(initial),
++					       inbufs + sizeof(initial));
++		if (ret)
++			goto err_free_outbufs;
++		if (required > inbufs_len) {
++			fprintf(stderr, "Input buffer grew during retrieval\n");
++			ret = -1;
++			goto err_free_outbufs;
++		}
+ 	}
+ 
+ 	ctx = inbuf_decode_start(*sc);
+@@ -200,8 +224,12 @@ static int return_for_next_invoke(int fd,
+ 	}
+ 
+ 	*decoded = inbuf_decode_finish(ctx);
++	ctx = NULL;
+ 
+ err_free_outbufs:
++	inbuf_decode_abort(ctx);
++	if (inbufs != initial)
++		free(inbufs);
+ 	free(outbufs);
+ 	return ret;
+ }

@@ -1,0 +1,15 @@
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -546,6 +546,12 @@
+                  uint64_t *iova)
+ {
+    VkResult result = VK_SUCCESS;
++
++   /* The A640 CCU can read the first address of the 64 KiB block that
++    * contains a render target. Keep that address inside its BO.
++    */
++   if (fd_dev_gpu_id(&dev->physical_device->dev_id) == 640)
++      align = MAX2(align, 65536);
+ 
+    msm_vma_lock(dev);
+ 

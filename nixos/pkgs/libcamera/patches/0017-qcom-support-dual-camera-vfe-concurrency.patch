@@ -1,0 +1,1035 @@
+diff --git a/src/libcamera/pipeline/qcom/fc4_engine.cpp b/src/libcamera/pipeline/qcom/fc4_engine.cpp
+index 929ec8b..6c99491 100644
+--- a/src/libcamera/pipeline/qcom/fc4_engine.cpp
++++ b/src/libcamera/pipeline/qcom/fc4_engine.cpp
+@@ -27,13 +27,24 @@ LOG_DECLARE_CATEGORY(QcomPipeline)
+ namespace libcamera::qcom {
+ 
+ struct FC4Engine::Impl {
++	static constexpr size_t kNumSensors = 3;
++
++	static size_t sensorSlot(const std::string &sensorName)
++	{
++		if (sensorName == "imx351")
++			return 0;
++		if (sensorName == "s5k3m5")
++			return 2;
++		return 1;
++	}
++
+ 	bool available_ = false;
+ 	bool running_{ false };
+-	uint64_t activeGeneration_{ 1 };
++	std::array<uint64_t, kNumSensors> activeGeneration_{ 1, 1, 1 };
+ 
+ 	std::unique_ptr<Ort::Env> env_;
+ 	std::unique_ptr<Ort::Session> fc4Session_;
+-	std::array<std::unique_ptr<Ort::Session>, 3> classifierSessions_;
++	std::array<std::unique_ptr<Ort::Session>, kNumSensors> classifierSessions_;
+ 	Ort::MemoryInfo memoryInfo_{ nullptr };
+ 
+ 	struct PendingResult {
+@@ -56,10 +67,11 @@ struct FC4Engine::Impl {
+ 	std::thread workerThread_;
+ 	mutable std::mutex mutex_;
+ 	std::condition_variable cv_;
+-	std::optional<FC4Snapshot> pendingSnapshot_;
+-	std::optional<PendingResult> pendingResult_;
+-	std::array<FC4IqmState, 3> sensorStates_{};
+-	std::array<std::optional<FC4PostprocessOutput>, 3> lastPostOut_{};
++	std::array<std::optional<FC4Snapshot>, kNumSensors> pendingSnapshot_{};
++	std::array<std::optional<PendingResult>, kNumSensors> pendingResult_{};
++	size_t nextSlot_ = 0;
++	std::array<FC4IqmState, kNumSensors> sensorStates_{};
++	std::array<std::optional<FC4PostprocessOutput>, kNumSensors> lastPostOut_{};
+ 
+ 	explicit Impl(const std::string &modelDir)
+ 	{
+@@ -106,18 +118,16 @@ struct FC4Engine::Impl {
+ 			workerThread_.join();
+ 	}
+ 
+-	void reset(uint64_t generation)
++	void reset(const std::string &sensorName, uint64_t generation)
+ 	{
++		const size_t idx = sensorSlot(sensorName);
+ 		std::lock_guard<std::mutex> lock(mutex_);
+-		activeGeneration_ = generation;
+-		pendingSnapshot_.reset();
+-		pendingResult_.reset();
+-		for (auto &s : sensorStates_) {
+-			s.reset();
+-			s.state = FC4IqmState::State::Ready;
+-		}
+-		for (auto &c : lastPostOut_)
+-			c.reset();
++		activeGeneration_[idx] = generation;
++		pendingSnapshot_[idx].reset();
++		pendingResult_[idx].reset();
++		sensorStates_[idx].reset();
++		sensorStates_[idx].state = FC4IqmState::State::Ready;
++		lastPostOut_[idx].reset();
+ 	}
+ 
+ 	bool submitSnapshot(const FC4Snapshot &snapshot)
+@@ -125,18 +135,14 @@ struct FC4Engine::Impl {
+ 		if (!available_)
+ 			return false;
+ 
+-		size_t stateIdx = 1;
+-		if (snapshot.sensorName == "imx351")
+-			stateIdx = 0;
+-		else if (snapshot.sensorName == "s5k3m5")
+-			stateIdx = 2;
++		const size_t stateIdx = sensorSlot(snapshot.sensorName);
+ 
+ 		{
+ 			std::lock_guard<std::mutex> lock(mutex_);
+-			if (!running_ || snapshot.generation != activeGeneration_)
++			if (!running_ || snapshot.generation != activeGeneration_[stateIdx])
+ 				return false;
+ 
+-			if (pendingSnapshot_.has_value())
++			if (pendingSnapshot_[stateIdx].has_value())
+ 				return false;
+ 
+ 			auto &sState = sensorStates_[stateIdx];
+@@ -150,7 +156,7 @@ struct FC4Engine::Impl {
+ 				return false;
+ 
+ 			sState.submitInput(snapshot.timestampNs, snapshot.stableCount);
+-			pendingSnapshot_ = snapshot;
++			pendingSnapshot_[stateIdx] = snapshot;
+ 		}
+ 		cv_.notify_one();
+ 		return true;
+@@ -158,49 +164,46 @@ struct FC4Engine::Impl {
+ 
+ 	bool hasResult(const std::string &sensorName, uint64_t currentGeneration) const
+ 	{
++		const size_t idx = sensorSlot(sensorName);
+ 		std::lock_guard<std::mutex> lock(mutex_);
+-		return pendingResult_.has_value() &&
+-		       pendingResult_->generation == currentGeneration &&
+-		       pendingResult_->sensorName == sensorName;
++		return pendingResult_[idx].has_value() &&
++		       pendingResult_[idx]->generation == currentGeneration &&
++		       pendingResult_[idx]->sensorName == sensorName;
+ 	}
+ 
+ 	std::optional<FC4Result> popResult(const std::string &sensorName, uint64_t currentGeneration)
+ 	{
++		const size_t stateIdx = sensorSlot(sensorName);
+ 		std::lock_guard<std::mutex> lock(mutex_);
+-		if (!pendingResult_)
++		auto &slotResult = pendingResult_[stateIdx];
++		if (!slotResult)
+ 			return std::nullopt;
+-		if (pendingResult_->generation != currentGeneration || pendingResult_->sensorName != sensorName)
++		if (slotResult->generation != currentGeneration || slotResult->sensorName != sensorName)
+ 			return std::nullopt;
+ 
+-		size_t stateIdx = 1;
+-		if (sensorName == "imx351")
+-			stateIdx = 0;
+-		else if (sensorName == "s5k3m5")
+-			stateIdx = 2;
+-
+ 		auto &sState = sensorStates_[stateIdx];
+-		if (!sState.getOutput(pendingResult_->finalClass, pendingResult_->finalWeight, pendingResult_->sensorType))
++		if (!sState.getOutput(slotResult->finalClass, slotResult->finalWeight, slotResult->sensorType))
+ 			return std::nullopt;
+ 
+-		auto calibRefs = resolveCalibRefs(pendingResult_->calibration, pendingResult_->sensorType);
++		auto calibRefs = resolveCalibRefs(slotResult->calibration, slotResult->sensorType);
+ 
+ 		FC4Result result;
+-		result.generation = pendingResult_->generation;
+-		result.sensorName = pendingResult_->sensorName;
+-		result.statsSequence = pendingResult_->statsSequence;
+-		result.timestampNs = pendingResult_->timestampNs;
++		result.generation = slotResult->generation;
++		result.sensorName = slotResult->sensorName;
++		result.statsSequence = slotResult->statsSequence;
++		result.timestampNs = slotResult->timestampNs;
+ 		result.iqmTuple = sState.getIqmTuple(goldenImx363, calibRefs);
+-		result.classProbabilities = pendingResult_->classProbabilities;
++		result.classProbabilities = slotResult->classProbabilities;
+ 		result.metadata = sState.extractMetadata(goldenImx363, calibRefs);
+ 		result.filteredOutdoorProb = sState.historySlots[4];
+-		result.estR = pendingResult_->estR;
+-		result.estB = pendingResult_->estB;
+-		result.topClass1 = pendingResult_->topClass1;
+-		result.topConf1 = pendingResult_->topConf1;
+-		result.finalClass = pendingResult_->finalClass;
+-		result.durationMs = pendingResult_->durationMs;
+-
+-		pendingResult_.reset();
++		result.estR = slotResult->estR;
++		result.estB = slotResult->estB;
++		result.topClass1 = slotResult->topClass1;
++		result.topConf1 = slotResult->topConf1;
++		result.finalClass = slotResult->finalClass;
++		result.durationMs = slotResult->durationMs;
++
++		slotResult.reset();
+ 		return result;
+ 	}
+ 
+@@ -210,21 +213,34 @@ struct FC4Engine::Impl {
+ 			FC4Snapshot snapshot;
+ 			bool skipFc4 = false;
+ 			std::optional<FC4PostprocessOutput> cachedPost;
+-			size_t stateIdx = 1;
++			size_t stateIdx = 0;
+ 			{
+ 				std::unique_lock<std::mutex> lock(mutex_);
+-				cv_.wait(lock, [this]() { return !running_ || pendingSnapshot_.has_value(); });
++				cv_.wait(lock, [this]() {
++					if (!running_)
++						return true;
++					for (const auto &slot : pendingSnapshot_)
++						if (slot.has_value())
++							return true;
++					return false;
++				});
+ 				if (!running_)
+ 					break;
+-				snapshot = *pendingSnapshot_;
+-				pendingSnapshot_.reset();
+-				if (snapshot.generation != activeGeneration_)
+-					continue;
+ 
+-				if (snapshot.sensorName == "imx351")
+-					stateIdx = 0;
+-				else if (snapshot.sensorName == "s5k3m5")
+-					stateIdx = 2;
++				bool found = false;
++				for (size_t offset = 0; offset < kNumSensors; ++offset) {
++					const size_t idx = (nextSlot_ + offset) % kNumSensors;
++					if (pendingSnapshot_[idx].has_value()) {
++						stateIdx = idx;
++						nextSlot_ = (idx + 1) % kNumSensors;
++						snapshot = *pendingSnapshot_[idx];
++						pendingSnapshot_[idx].reset();
++						found = true;
++						break;
++					}
++				}
++				if (!found || snapshot.generation != activeGeneration_[stateIdx])
++					continue;
+ 
+ 				auto &sState = sensorStates_[stateIdx];
+ 				sState.state = FC4IqmState::State::Processing;
+@@ -289,7 +305,7 @@ struct FC4Engine::Impl {
+ 		for (int i = 0; i < 4; ++i) {
+ 			if (!std::isfinite(probs[i])) {
+ 				std::lock_guard<std::mutex> lock(mutex_);
+-				if (running_ && snapshot.generation == activeGeneration_)
++				if (running_ && snapshot.generation == activeGeneration_[stateIdx])
+ 					sensorStates_[stateIdx].state = FC4IqmState::State::Ready;
+ 				return;
+ 			}
+@@ -336,14 +352,14 @@ struct FC4Engine::Impl {
+ 			for (int i = 0; i < 7; ++i) {
+ 				if (!std::isfinite(raw_7[i])) {
+ 					std::lock_guard<std::mutex> lock(mutex_);
+-					if (running_ && snapshot.generation == activeGeneration_)
++					if (running_ && snapshot.generation == activeGeneration_[stateIdx])
+ 						sensorStates_[stateIdx].state = FC4IqmState::State::Ready;
+ 					return;
+ 				}
+ 			}
+ 			if (raw_7[1] <= 1e-6f || raw_7[0] <= 0.0f || raw_7[2] <= 0.0f) {
+ 				std::lock_guard<std::mutex> lock(mutex_);
+-				if (running_ && snapshot.generation == activeGeneration_)
++				if (running_ && snapshot.generation == activeGeneration_[stateIdx])
+ 					sensorStates_[stateIdx].state = FC4IqmState::State::Ready;
+ 				return;
+ 			}
+@@ -371,7 +387,7 @@ struct FC4Engine::Impl {
+ 		// Short critical section: verify generation and update history atomically
+ 		{
+ 			std::lock_guard<std::mutex> lock(mutex_);
+-			if (!running_ || snapshot.generation != activeGeneration_)
++			if (!running_ || snapshot.generation != activeGeneration_[stateIdx])
+ 				return;
+ 
+ 			auto &sState = sensorStates_[stateIdx];
+@@ -399,7 +415,7 @@ struct FC4Engine::Impl {
+ 			pending.classProbabilities = { probs[0], probs[1], probs[2], probs[3] };
+ 			pending.calibration = snapshot.calibration;
+ 
+-			pendingResult_ = pending;
++			pendingResult_[stateIdx] = pending;
+ 		}
+ 	}
+ };
+@@ -416,10 +432,10 @@ bool FC4Engine::isAvailable() const
+ 	return impl_ && impl_->available_;
+ }
+ 
+-void FC4Engine::reset(uint64_t generation)
++void FC4Engine::reset(const std::string &sensorName, uint64_t generation)
+ {
+ 	if (impl_)
+-		impl_->reset(generation);
++		impl_->reset(sensorName, generation);
+ }
+ 
+ bool FC4Engine::submitSnapshot(const FC4Snapshot &snapshot)
+diff --git a/src/libcamera/pipeline/qcom/fc4_engine.h b/src/libcamera/pipeline/qcom/fc4_engine.h
+index 6b36e56..b8ff3ce 100644
+--- a/src/libcamera/pipeline/qcom/fc4_engine.h
++++ b/src/libcamera/pipeline/qcom/fc4_engine.h
+@@ -48,7 +48,7 @@ public:
+ 	~FC4Engine();
+ 
+ 	bool isAvailable() const;
+-	void reset(uint64_t generation);
++	void reset(const std::string &sensorName, uint64_t generation);
+ 	bool submitSnapshot(const FC4Snapshot &snapshot);
+ 	bool hasResult(const std::string &sensorName, uint64_t currentGeneration) const;
+ 	std::optional<FC4Result> popResult(const std::string &sensorName, uint64_t currentGeneration);
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 6c3ae1d..618b984 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -919,8 +919,14 @@ public:
+ 	{
+ 	}
+ 
+-	int init(MediaEntity *sensorEntity);
+-	int openAncillaryDevices();
++	int init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
++		 MediaEntity *videoEntity, MediaEntity *rdiEntity,
++		 MediaEntity *rawVideoEntity);
++	int bindVfeSlot(int slotIndex, MediaEntity *pixEntity,
++			MediaEntity *videoEntity, MediaEntity *rdiEntity,
++			MediaEntity *rawVideoEntity);
++	int teardownLinks();
++	int openAncillaryDevices(bool openFlash);
+ 	void closeAncillaryDevices();
+ 	void setFc4Engine(FC4Engine *engine) { fc4Engine_ = engine; }
+ 	PixelFormat rawFormatForTransform(Transform transform) const;
+@@ -972,6 +978,9 @@ public:
+ 
+ 	std::shared_ptr<MediaDevice> media_;
+ 	const SensorProfile &profile_;
++	MediaEntity *sensorEntity_ = nullptr;
++	MediaEntity *csiphyEntity_ = nullptr;
++	int boundSlot_ = -1;
+ 	std::vector<MediaEntity *> path_;
+ 	std::vector<MediaLink *> links_;
+ 	MediaEntity *pixEntity_ = nullptr;
+@@ -1084,6 +1093,8 @@ public:
+ 		Settled,
+ 	};
+ 	std::unique_ptr<FlashDevice> flash_;
++	bool flashOwned_ = false;
++	bool flashActive() const { return flash_ && flashOwned_; }
+ 	PreflashState preflashState_ = PreflashState::Idle;
+ 	int preflashSkipFrames_ = 0;
+ 	int preflashSettledFrames_ = 0;
+@@ -1257,13 +1268,28 @@ public:
+ 	bool match(DeviceEnumerator *enumerator) override;
+ 
+ private:
++	struct VfeSlot {
++		MediaEntity *pixEntity = nullptr;
++		MediaEntity *videoEntity = nullptr;
++		MediaEntity *rdiEntity = nullptr;
++		MediaEntity *rawVideoEntity = nullptr;
++		Camera *activeCamera = nullptr;
++		Camera *configuredCamera = nullptr;
++	};
++
+ 	QcomCameraData *cameraData(Camera *camera)
+ 	{
+ 		return static_cast<QcomCameraData *>(camera->_d());
+ 	}
+ 
++	bool hasCsiphyConflict(Camera *camera) const;
++	int allocateSlot(Camera *camera) const;
++	int bindCameraSlot(Camera *camera, int slotIndex);
++	bool anyActiveFc4Camera() const;
++
+ 	std::shared_ptr<MediaDevice> media_;
+-	Camera *activeCamera_ = nullptr;
++	std::vector<VfeSlot> vfeSlots_;
++	Camera *flashOwner_ = nullptr;
+ 	std::unique_ptr<FC4Engine> fc4Engine_;
+ };
+ 
+@@ -1399,6 +1425,9 @@ CameraConfiguration::Status QcomCameraConfiguration::validate()
+ 
+ int QcomCameraData::findPath(MediaEntity *sensor, MediaEntity *target)
+ {
++	path_.clear();
++	links_.clear();
++
+ 	std::map<MediaEntity *, std::pair<MediaEntity *, MediaLink *>> parents;
+ 	std::deque<MediaEntity *> queue;
+ 
+@@ -1456,26 +1485,139 @@ PixelFormat QcomCameraData::rawFormatForTransform(Transform transform) const
+ 	return bayer.toPixelFormat();
+ }
+ 
+-int QcomCameraData::setupLinks()
++int QcomCameraData::bindVfeSlot(int slotIndex, MediaEntity *pixEntity,
++				MediaEntity *videoEntity, MediaEntity *rdiEntity,
++				MediaEntity *rawVideoEntity)
+ {
+-	/* Other clients may have changed the links since enumeration. */
+-	int ret = media_->disableLinks();
++	if (boundSlot_ == slotIndex && pixEntity_ == pixEntity &&
++	    pix_ && video_)
++		return 0;
++
++	if (!sensorEntity_ || !pixEntity || !videoEntity)
++		return -ENODEV;
++
++	int ret = findPath(sensorEntity_, pixEntity);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	MediaEntity *csidEntity = path_.size() >= 2 ? path_[path_.size() - 2] : nullptr;
++	MediaLink *newRdiLink = nullptr;
++	if (rdiEntity && csidEntity) {
++		for (const MediaPad *pad : csidEntity->pads()) {
++			if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
++				continue;
++			for (MediaLink *link : pad->links()) {
++				if (link->sink()->entity() == rdiEntity) {
++					newRdiLink = link;
++					break;
++				}
++			}
++			if (newRdiLink)
++				break;
++		}
++	}
++
++	auto newPix = std::make_unique<V4L2Subdevice>(pixEntity);
++	auto newVideo = V4L2VideoDevice::fromEntityName(media_.get(), videoEntity->name());
++	if (!newVideo)
++		return -ENODEV;
++
++	std::unique_ptr<V4L2VideoDevice> newRawVideo;
++	if (newRdiLink && rawVideoEntity)
++		newRawVideo = V4L2VideoDevice::fromEntityName(media_.get(), rawVideoEntity->name());
++
++	newVideo->bufferReady.connect(this, &QcomCameraData::imageBufferReady);
++	if (newRawVideo)
++		newRawVideo->bufferReady.connect(this, &QcomCameraData::rawBufferReady);
++
++	pixEntity_ = pixEntity;
++	rdiEntity_ = newRawVideo ? rdiEntity : nullptr;
++	rdiLink_ = newRawVideo ? newRdiLink : nullptr;
++	pix_ = std::move(newPix);
++	video_ = std::move(newVideo);
++	rawVideo_ = std::move(newRawVideo);
++	boundSlot_ = slotIndex;
++	bfRoiProgrammed_ = false;
++	programmedBfRoi_ = {};
++	return 0;
++}
++
++int QcomCameraData::setupLinks()
++{
++	MediaEntity *csidEntity = path_.size() >= 2 ? path_[path_.size() - 2] : nullptr;
++	auto disableOtherLinks = [](const MediaPad *pad, MediaLink *keep) -> int {
++		for (MediaLink *other : pad->links()) {
++			if (other == keep ||
++			    (other->flags() & MEDIA_LNK_FL_IMMUTABLE) ||
++			    !(other->flags() & MEDIA_LNK_FL_ENABLED))
++				continue;
++			int ret = other->setEnabled(false);
++			if (ret < 0)
++				return ret;
++		}
++		return 0;
++	};
++
++	for (MediaLink *link : links_) {
++		MediaEntity *srcEntity = link->source()->entity();
++		MediaEntity *sinkEntity = link->sink()->entity();
++
++		if (sinkEntity->function() == MEDIA_ENT_F_VID_MUX) {
++			for (const MediaPad *pad : sinkEntity->pads()) {
++				if (!(pad->flags() & MEDIA_PAD_FL_SINK))
++					continue;
++				int ret = disableOtherLinks(pad, link);
++				if (ret < 0)
++					return ret;
++			}
++		}
++
++		if (srcEntity == csiphyEntity_) {
++			int ret = disableOtherLinks(link->source(), link);
++			if (ret < 0)
++				return ret;
++		}
++
++		if (sinkEntity == csidEntity) {
++			int ret = disableOtherLinks(link->sink(), link);
++			if (ret < 0)
++				return ret;
++		}
++	}
++
++	if (csidEntity) {
++		MediaLink *pixLink = (!links_.empty() && links_.back()->sink()->entity() == pixEntity_)
++			? links_.back() : nullptr;
++		for (const MediaPad *pad : csidEntity->pads()) {
++			if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
++				continue;
++			for (MediaLink *other : pad->links()) {
++				if ((other->flags() & MEDIA_LNK_FL_IMMUTABLE) ||
++				    !(other->flags() & MEDIA_LNK_FL_ENABLED))
++					continue;
++				if ((pixConfigured_ && other == pixLink) ||
++				    (rawConfigured_ && other == rdiLink_))
++					continue;
++				int ret = other->setEnabled(false);
++				if (ret < 0)
++					return ret;
++			}
++		}
++	}
++
+ 	for (MediaLink *link : links_) {
+ 		if (link->sink()->entity() == pixEntity_ && !pixConfigured_)
+ 			continue;
+ 		if (link->flags() & MEDIA_LNK_FL_ENABLED)
+ 			continue;
+ 
+-		ret = link->setEnabled(true);
++		int ret = link->setEnabled(true);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+ 
+ 	if (rawConfigured_ && rdiLink_ && !(rdiLink_->flags() & MEDIA_LNK_FL_ENABLED)) {
+-		ret = rdiLink_->setEnabled(true);
++		int ret = rdiLink_->setEnabled(true);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+@@ -1483,10 +1625,35 @@ int QcomCameraData::setupLinks()
+ 	return 0;
+ }
+ 
+-int QcomCameraData::init(MediaEntity *sensorEntity)
++int QcomCameraData::teardownLinks()
++{
++	int ret = 0;
++	if (rdiLink_ && !(rdiLink_->flags() & MEDIA_LNK_FL_IMMUTABLE) &&
++	    (rdiLink_->flags() & MEDIA_LNK_FL_ENABLED)) {
++		int err = rdiLink_->setEnabled(false);
++		if (err < 0 && !ret)
++			ret = err;
++	}
++
++	for (auto it = links_.rbegin(); it != links_.rend(); ++it) {
++		MediaLink *link = *it;
++		if ((link->flags() & MEDIA_LNK_FL_IMMUTABLE) ||
++		    !(link->flags() & MEDIA_LNK_FL_ENABLED))
++			continue;
++		int err = link->setEnabled(false);
++		if (err < 0 && !ret)
++			ret = err;
++	}
++	return ret;
++}
++
++int QcomCameraData::init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
++			 MediaEntity *videoEntity, MediaEntity *rdiEntity,
++			 MediaEntity *rawVideoEntity)
+ {
+ 	int ret;
+ 
++	sensorEntity_ = sensorEntity;
+ 	sensor_ = CameraSensorFactoryBase::create(sensorEntity);
+ 	if (!sensor_)
+ 		return -ENODEV;
+@@ -1580,74 +1747,17 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 			<< ", minimum gray count " << awbMinimumGrayCount_;
+ 	}
+ 
+-	pixEntity_ = media_->getEntityByName("msm_vfe0_pix");
+-	if (!pixEntity_) {
+-		LOG(QcomPipeline, Error) << "VFE PIX entity not found";
+-		return -ENODEV;
+-	}
+-
+-	ret = findPath(sensorEntity, pixEntity_);
++	ret = bindVfeSlot(0, pixEntity, videoEntity, rdiEntity, rawVideoEntity);
+ 	if (ret < 0) {
+-		LOG(QcomPipeline, Error) << "Failed to find sensor to VFE PIX path";
++		LOG(QcomPipeline, Error) << "Failed to bind initial VFE slot: " << ret;
+ 		return ret;
+ 	}
+ 
+-	MediaEntity *videoEntity = nullptr;
+-	for (const MediaPad *pad : pixEntity_->pads()) {
+-		if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
+-			continue;
+-
+-		for (MediaLink *link : pad->links()) {
+-			MediaEntity *next = link->sink()->entity();
+-			if (next->function() == MEDIA_ENT_F_IO_V4L) {
+-				videoEntity = next;
+-				break;
+-			}
+-		}
+-	}
+-
+-	if (!videoEntity) {
+-		LOG(QcomPipeline, Error) << "VFE PIX video node not found";
+-		return -ENODEV;
+-	}
+-
+-	pix_ = std::make_unique<V4L2Subdevice>(pixEntity_);
+-
+-	video_ = V4L2VideoDevice::fromEntityName(media_.get(), videoEntity->name());
+-	if (!video_) {
+-		LOG(QcomPipeline, Error) << "Failed to open VFE PIX video node";
+-		return -ENODEV;
+-	}
+-
+-	rdiEntity_ = media_->getEntityByName("msm_vfe0_rdi0");
+-	if (rdiEntity_ && path_.size() >= 2) {
+-		MediaEntity *csidEntity = path_[path_.size() - 2];
+-		for (const MediaPad *pad : csidEntity->pads()) {
+-			if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
+-				continue;
+-			for (MediaLink *link : pad->links()) {
+-				if (link->sink()->entity() == rdiEntity_) {
+-					rdiLink_ = link;
+-					break;
+-				}
+-			}
+-			if (rdiLink_)
+-				break;
+-		}
+-		MediaEntity *rawVideoEntity = nullptr;
+-		for (const MediaPad *pad : rdiEntity_->pads()) {
+-			if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
+-				continue;
+-			for (MediaLink *link : pad->links()) {
+-				MediaEntity *next = link->sink()->entity();
+-				if (next->function() == MEDIA_ENT_F_IO_V4L) {
+-					rawVideoEntity = next;
+-					break;
+-				}
+-			}
++	for (MediaEntity *entity : path_) {
++		if (entity->name().starts_with("msm_csiphy")) {
++			csiphyEntity_ = entity;
++			break;
+ 		}
+-		if (rdiLink_ && rawVideoEntity)
+-			rawVideo_ = V4L2VideoDevice::fromEntityName(media_.get(), rawVideoEntity->name());
+ 	}
+ 
+ 	ret = openCaptureDevices();
+@@ -1707,8 +1817,6 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 			rawVideo_.reset();
+ 			rdiEntity_ = nullptr;
+ 			rdiLink_ = nullptr;
+-		} else {
+-			rawVideo_->bufferReady.connect(this, &QcomCameraData::rawBufferReady);
+ 		}
+ 	}
+ 
+@@ -1718,7 +1826,6 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 
+ 	hasScalerCrop_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_IFE_CROP);
+ 	hasBfRoi_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_BF_ROI);
+-	video_->bufferReady.connect(this, &QcomCameraData::imageBufferReady);
+ 
+ 	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
+ 	if (delays.exposureDelay != 2 || delays.gainDelay != 2) {
+@@ -1864,13 +1971,15 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 	return 0;
+ }
+ 
+-int QcomCameraData::openAncillaryDevices()
++int QcomCameraData::openAncillaryDevices(bool openFlash)
+ {
+ 	int ret;
+-	if (flash_) {
++	flashOwned_ = false;
++	if (openFlash && flash_) {
+ 		ret = flash_->open();
+ 		if (ret < 0)
+ 			return ret;
++		flashOwned_ = true;
+ 	}
+ 	if (lens_) {
+ 		ret = lens_->open();
+@@ -1897,10 +2006,11 @@ int QcomCameraData::openAncillaryDevices()
+ 
+ void QcomCameraData::closeAncillaryDevices()
+ {
+-	if (flash_) {
++	if (flashActive()) {
+ 		flash_->turnOff();
+ 		flash_->close();
+ 	}
++	flashOwned_ = false;
+ 	if (accelerometer_)
+ 		accelerometer_->stop();
+ 	if (V4L2Subdevice *ois = sensor_->ois())
+@@ -2220,7 +2330,7 @@ void QcomCameraData::resetAwbProcessing()
+ 	awbLocked_ = false;
+ 	fc4Generation_++;
+ 	if (fc4Engine_)
+-		fc4Engine_->reset(fc4Generation_);
++		fc4Engine_->reset(sensorModel_, fc4Generation_);
+ 	fc4StableCount_ = 0;
+ 	currAeStep_ = 0;
+ 	targetAeStep_ = 0;
+@@ -2455,7 +2565,7 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 			return ret;
+ 	}
+ 
+-	bool firingMainFlash = flash_ && flashMode_ == controls::draft::FlashModeSingle;
++	bool firingMainFlash = flashActive() && flashMode_ == controls::draft::FlashModeSingle;
+ 	if (firingMainFlash && aeEnabled()) {
+ 		const AeLimits limits = aeLimits();
+ 		const float minIdx = aeExposureIndex(profile_, limits.minExposure * limits.minGain);
+@@ -2507,7 +2617,7 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	context.afWindows = afWindows_;
+ 	context.testPatternMode = testPatternMode_;
+ 	precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
+-	if (!flash_)
++	if (!flashActive())
+ 		context.flashState = controls::draft::FlashStateUnavailable;
+ 	else
+ 		context.flashState = controls::draft::FlashStateReady;
+@@ -3059,7 +3169,7 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 				 << aeExposure_ << " gain " << aeGain_;
+ 
+ 	bool aeSettled = result.settled;
+-	if (flash_) {
++	if (flashActive()) {
+ 		if (preflashState_ == PreflashState::Idle && !flash_->isTorchOn()) {
+ 			ambientZoneLuma_ = currentZoneLuma_;
+ 			if (luxIndex_)
+@@ -3155,7 +3265,7 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 	unsigned int flashState = 0;
+ 	unsigned int led = 0;
+ 	bool flashOn = false;
+-	if (flash_) {
++	if (flashActive()) {
+ 		if (flash_->isStrobeActive()) {
+ 			flashState = 3;
+ 			led = 3;
+@@ -3768,7 +3878,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 	if (aeEnabled() && controls.contains(controls::ExposureValue.id()))
+ 		aeEvStep_ = aeEvStep(*controls.get(controls::ExposureValue));
+ 
+-	if (flash_) {
++	if (flashActive()) {
+ 		if (controls.contains(controls::draft::FlashMode.id())) {
+ 			int32_t mode = *controls.get(controls::draft::FlashMode);
+ 			if (mode != controls::draft::FlashModeOff &&
+@@ -4236,14 +4346,92 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
+ 	return config;
+ }
+ 
+-int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
++bool QcomPipelineHandler::hasCsiphyConflict(Camera *camera) const
+ {
+-	if (activeCamera_ && activeCamera_ != camera)
++	const QcomCameraData *target = static_cast<const QcomCameraData *>(camera->_d());
++	if (!target->csiphyEntity_)
++		return false;
++
++	for (const VfeSlot &slot : vfeSlots_) {
++		if (!slot.activeCamera || slot.activeCamera == camera)
++			continue;
++		const QcomCameraData *other =
++			static_cast<const QcomCameraData *>(slot.activeCamera->_d());
++		if (other->csiphyEntity_ == target->csiphyEntity_)
++			return true;
++	}
++	return false;
++}
++
++int QcomPipelineHandler::allocateSlot(Camera *camera) const
++{
++	if (hasCsiphyConflict(camera))
+ 		return -EBUSY;
+ 
++	const QcomCameraData *data = static_cast<const QcomCameraData *>(camera->_d());
++	for (std::size_t i = 0; i < vfeSlots_.size(); ++i) {
++		if (vfeSlots_[i].activeCamera == camera)
++			return static_cast<int>(i);
++	}
++
++	if (data->boundSlot_ >= 0 &&
++	    static_cast<std::size_t>(data->boundSlot_) < vfeSlots_.size()) {
++		const VfeSlot &bound = vfeSlots_[data->boundSlot_];
++		if (!bound.activeCamera &&
++		    (!bound.configuredCamera || bound.configuredCamera == camera))
++			return data->boundSlot_;
++	}
++
++	for (std::size_t i = 0; i < vfeSlots_.size(); ++i) {
++		if (!vfeSlots_[i].activeCamera && !vfeSlots_[i].configuredCamera)
++			return static_cast<int>(i);
++	}
++
++	for (std::size_t i = 0; i < vfeSlots_.size(); ++i) {
++		if (!vfeSlots_[i].activeCamera)
++			return static_cast<int>(i);
++	}
++
++	return -EBUSY;
++}
++
++int QcomPipelineHandler::bindCameraSlot(Camera *camera, int slotIndex)
++{
++	if (slotIndex < 0 || static_cast<std::size_t>(slotIndex) >= vfeSlots_.size())
++		return -EINVAL;
++
++	QcomCameraData *data = cameraData(camera);
++	const VfeSlot &slot = vfeSlots_[slotIndex];
++	return data->bindVfeSlot(slotIndex, slot.pixEntity, slot.videoEntity,
++				 slot.rdiEntity, slot.rawVideoEntity);
++}
++
++bool QcomPipelineHandler::anyActiveFc4Camera() const
++{
++	for (const VfeSlot &slot : vfeSlots_) {
++		if (!slot.activeCamera)
++			continue;
++		const QcomCameraData *other =
++			static_cast<const QcomCameraData *>(slot.activeCamera->_d());
++		if (other->pixConfigured_ && other->lgAwb_)
++			return true;
++	}
++	return false;
++}
++
++int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
++{
++	int slot = allocateSlot(camera);
++	if (slot < 0)
++		return slot;
++
++	int ret = bindCameraSlot(camera, slot);
++	if (ret < 0)
++		return ret;
++
+ 	QcomCameraData *data = cameraData(camera);
+ 	QcomCameraConfiguration *qcomConfig = static_cast<QcomCameraConfiguration *>(config);
+-	int ret = data->openCaptureDevices();
++	ret = data->openCaptureDevices();
+ 	if (ret < 0)
+ 		return ret;
+ 	auto closeDevices = utils::scope_exit{ [&]() { data->closeCaptureDevices(); } };
+@@ -4275,6 +4463,12 @@ int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
+ 		return ret;
+ 	}
+ 
++	for (VfeSlot &entry : vfeSlots_) {
++		if (entry.configuredCamera == camera)
++			entry.configuredCamera = nullptr;
++	}
++	vfeSlots_[slot].configuredCamera = camera;
++
+ 	if (qcomConfig->pixIndex_)
+ 		config->at(*qcomConfig->pixIndex_).setStream(&data->stream_);
+ 	if (qcomConfig->rawIndex_)
+@@ -4286,12 +4480,17 @@ int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
+ int QcomPipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
+ 					    std::vector<std::unique_ptr<FrameBuffer>> *buffers)
+ {
+-	if (activeCamera_)
+-		return -EBUSY;
++	int slot = allocateSlot(camera);
++	if (slot < 0)
++		return slot;
++
++	int ret = bindCameraSlot(camera, slot);
++	if (ret < 0)
++		return ret;
+ 
+ 	QcomCameraData *data = cameraData(camera);
+ 	const StreamConfiguration &cfg = stream->configuration();
+-	int ret = data->openCaptureDevices();
++	ret = data->openCaptureDevices();
+ 	if (ret < 0)
+ 		return ret;
+ 	auto closeDevices = utils::scope_exit{ [&]() { data->closeCaptureDevices(); } };
+@@ -4310,23 +4509,32 @@ int QcomPipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
+ 
+ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ {
+-	if (activeCamera_ && activeCamera_ != camera)
+-		return -EBUSY;
++	int slot = allocateSlot(camera);
++	if (slot < 0)
++		return slot;
++
++	int ret = bindCameraSlot(camera, slot);
++	if (ret < 0)
++		return ret;
+ 
+ 	QcomCameraData *data = cameraData(camera);
+-	int ret = data->openCaptureDevices();
++	ret = data->openCaptureDevices();
+ 	if (ret < 0)
+ 		return ret;
+ 
++	const bool claimFlash = data->flash_ && (!flashOwner_ || flashOwner_ == camera);
+ 	auto errorCleanup = utils::scope_exit{ [&]() {
+ 		data->resetTestPattern();
++		data->teardownLinks();
+ 		data->closeCaptureDevices();
+ 		data->closeAncillaryDevices();
++		if (flashOwner_ == camera)
++			flashOwner_ = nullptr;
+ 		data->setFc4Engine(nullptr);
+-		fc4Engine_.reset();
++		if (!anyActiveFc4Camera())
++			fc4Engine_.reset();
+ 	} };
+ 
+-	/* All cameras share the PIX route and an idle camera may have reconfigured it. */
+ 	ret = data->setFormats(false);
+ 	if (ret < 0)
+ 		return ret;
+@@ -4337,10 +4545,11 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		data->setFc4Engine(fc4Engine_.get());
+ 	}
+ 
+-	ret = data->openAncillaryDevices();
++	ret = data->openAncillaryDevices(claimFlash);
+ 	if (ret < 0)
+ 		return ret;
+-	if (data->flash_) {
++	if (data->flashActive()) {
++		flashOwner_ = camera;
+ 		data->flash_->turnOff();
+ 		data->flashMode_ = controls::draft::FlashModeOff;
+ 		data->preflashState_ = QcomCameraData::PreflashState::Idle;
+@@ -4348,6 +4557,11 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		data->precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
+ 		data->ambientIndex_ = 0.0f;
+ 		data->flashInfluence_ = 0.0f;
++	} else {
++		data->flashMode_ = controls::draft::FlashModeOff;
++		data->preflashState_ = QcomCameraData::PreflashState::Idle;
++		data->flashState_ = controls::draft::FlashStateUnavailable;
++		data->precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
+ 	}
+ 
+ 	if (data->hasOis_) {
+@@ -4445,7 +4659,12 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		}
+ 	}
+ 
+-	activeCamera_ = camera;
++	for (VfeSlot &entry : vfeSlots_) {
++		if (entry.configuredCamera == camera)
++			entry.configuredCamera = nullptr;
++	}
++	vfeSlots_[slot].activeCamera = camera;
++	vfeSlots_[slot].configuredCamera = camera;
+ 	errorCleanup.release();
+ 
+ 	return 0;
+@@ -4455,7 +4674,7 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ {
+ 	QcomCameraData *data = cameraData(camera);
+ 
+-	if (data->flash_) {
++	if (data->flashActive()) {
+ 		data->flash_->turnOff();
+ 		data->flashMode_ = controls::draft::FlashModeOff;
+ 		data->preflashState_ = QcomCameraData::PreflashState::Idle;
+@@ -4464,6 +4683,8 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 		data->ambientIndex_ = 0.0f;
+ 		data->flashInfluence_ = 0.0f;
+ 	}
++	if (flashOwner_ == camera)
++		flashOwner_ = nullptr;
+ 
+ 	if (data->hasOis_)
+ 		data->setOisMode(controls::draft::OpticalImageStabilizationModeOff);
+@@ -4477,6 +4698,7 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 		data->video_->streamOff();
+ 	data->videoStarted_ = false;
+ 	data->resetTestPattern();
++	data->teardownLinks();
+ 	data->closeCaptureDevices();
+ 	data->frameContexts_.clear();
+ 	data->lastStatsSequence_ = UINT32_MAX;
+@@ -4484,10 +4706,13 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 	data->aeMotion_.reset();
+ 	data->resetAwb();
+ 	data->setFc4Engine(nullptr);
+-	fc4Engine_.reset();
++	for (VfeSlot &slot : vfeSlots_) {
++		if (slot.activeCamera == camera)
++			slot.activeCamera = nullptr;
++	}
++	if (!anyActiveFc4Camera())
++		fc4Engine_.reset();
+ 	data->closeAncillaryDevices();
+-	if (activeCamera_ == camera)
+-		activeCamera_ = nullptr;
+ }
+ 
+ int QcomPipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+@@ -4529,6 +4754,34 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+ 	if (!media_)
+ 		return false;
+ 
++	auto findOutputVideo = [](MediaEntity *entity) -> MediaEntity * {
++		if (!entity)
++			return nullptr;
++		for (const MediaPad *pad : entity->pads()) {
++			if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
++				continue;
++			for (MediaLink *link : pad->links()) {
++				MediaEntity *next = link->sink()->entity();
++				if (next->function() == MEDIA_ENT_F_IO_V4L)
++					return next;
++			}
++		}
++		return nullptr;
++	};
++
++	vfeSlots_.clear();
++	for (unsigned int i = 0; i < 2; ++i) {
++		MediaEntity *pix = media_->getEntityByName("msm_vfe" + std::to_string(i) + "_pix");
++		MediaEntity *video = findOutputVideo(pix);
++		if (!pix || !video)
++			continue;
++		MediaEntity *rdi = media_->getEntityByName("msm_vfe" + std::to_string(i) + "_rdi0");
++		MediaEntity *rawVideo = findOutputVideo(rdi);
++		vfeSlots_.push_back({ pix, video, rawVideo ? rdi : nullptr, rawVideo, nullptr, nullptr });
++	}
++	if (vfeSlots_.empty())
++		return false;
++
+ 	unsigned int registered = 0;
+ 	for (MediaEntity *entity : media_->entities()) {
+ 		if (entity->function() != MEDIA_ENT_F_CAM_SENSOR)
+@@ -4547,7 +4800,9 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+ 			continue;
+ 
+ 		auto data = std::make_unique<QcomCameraData>(this, media_, *profile);
+-		int ret = data->init(entity);
++		const VfeSlot &slot0 = vfeSlots_[0];
++		int ret = data->init(entity, slot0.pixEntity, slot0.videoEntity,
++				     slot0.rdiEntity, slot0.rawVideoEntity);
+ 		if (ret < 0) {
+ 			LOG(QcomPipeline, Error)
+ 				<< "Failed to initialize " << entity->name() << ": " << ret;

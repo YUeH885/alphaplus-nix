@@ -1,0 +1,1041 @@
+From 5cb4883d67d147bfff37431ab6400f5a7f9b7a9b Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu23234@gmail.com>
+Date: Sun, 22 Nov 2026 14:34:11 +0800
+Subject: [PATCH] qcom: add hybrid PDAF + CDAF autofocus for IMX363 and S5K3M5
+
+---
+ src/libcamera/pipeline/qcom/pdaf_engine.h | 471 ++++++++++++++++++++++
+ src/libcamera/pipeline/qcom/qcom.cpp      | 340 +++++++++++++++-
+ src/libcamera/pipeline/qcom/qcom_camss.h  |  28 ++
+ 3 files changed, 831 insertions(+), 8 deletions(-)
+ create mode 100644 src/libcamera/pipeline/qcom/pdaf_engine.h
+
+diff --git a/src/libcamera/pipeline/qcom/pdaf_engine.h b/src/libcamera/pipeline/qcom/pdaf_engine.h
+new file mode 100644
+index 0000000..3d9cc16
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/pdaf_engine.h
+@@ -0,0 +1,471 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <optional>
++#include <vector>
++
++#include <libcamera/geometry.h>
++#include <libcamera/transform.h>
++
++namespace libcamera::qcom {
++
++enum class PdafLayout {
++	/* IMX363 Dual-PD: even column = Left, odd column = Right. */
++	DualPdColLR,
++	/*
++	 * S5K3M5 sparse tail-mode (4x8 buffer block pattern):
++	 *   row % 8 in {0, 6} -> top row = Right, bottom row = Left
++	 *   row % 8 in {2, 4} -> top row = Left,  bottom row = Right
++	 */
++	SparseS5k3m5Row8,
++};
++
++struct PdafModeSpec {
++	Size sensorSize;
++	uint8_t vc;
++	uint8_t dt;
++	uint32_t width;
++	uint32_t height;
++	uint32_t stride;
++	double dccScale;
++	PdafLayout layout;
++	/* Normalized vertical FOV window within the full active sensor array. */
++	double vCropStart;
++	double vCropHeight;
++};
++
++struct PdafResult {
++	bool valid = false;
++	double phasePx = 0.0;
++	double confidence = 0.0;
++	double energy = 0.0;
++	double dcc = 0.0;
++	/* Signed delta in LG AF step / position units (targetStep = currentStep + defocusSteps). */
++	double defocusSteps = 0.0;
++	uint32_t sequence = 0;
++};
++
++struct PdafRoiSlice {
++	uint32_t offsetY = 0;
++	uint32_t copyLines = 0;
++	uint32_t xStart = 0;
++	uint32_t xEnd = 0;
++	double centerNx = 0.5;
++	double centerNy = 0.5;
++};
++
++class PdafCalibration
++{
++public:
++	static constexpr std::size_t kEepromPayloadBytes = 992;
++	static constexpr std::size_t kEepromBlockBytes = kEepromPayloadBytes + 2;
++	static constexpr unsigned int kGainW = 17;
++	static constexpr unsigned int kGainH = 13;
++	static constexpr unsigned int kGainPoints = kGainW * kGainH;
++	static constexpr unsigned int kDccW = 8;
++	static constexpr unsigned int kDccH = 6;
++	static constexpr unsigned int kDccPoints = kDccW * kDccH;
++
++	static std::optional<PdafCalibration>
++	parseEepromBlock(const std::array<uint8_t, kEepromBlockBytes> &block)
++	{
++		uint32_t sum = 0;
++		for (std::size_t i = 0; i < kEepromPayloadBytes; ++i)
++			sum += block[i];
++		uint16_t stored = (static_cast<uint16_t>(block[kEepromPayloadBytes]) << 8) |
++				  static_cast<uint16_t>(block[kEepromPayloadBytes + 1]);
++		if (!sum || (sum & 0xffffU) != stored)
++			return std::nullopt;
++
++		auto readBe16 = [&block](std::size_t off) -> uint16_t {
++			return (static_cast<uint16_t>(block[off]) << 8) |
++			       static_cast<uint16_t>(block[off + 1]);
++		};
++
++		uint16_t ver = readBe16(0);
++		uint16_t gw = readBe16(2);
++		uint16_t gh = readBe16(4);
++		if (ver != 4 || gw != kGainW || gh != kGainH)
++			return std::nullopt;
++
++		PdafCalibration cal;
++		cal.checksum_ = stored;
++
++		std::size_t off = 6;
++		for (unsigned int i = 0; i < kGainPoints; ++i, off += 2) {
++			uint16_t v = readBe16(off);
++			if (v < 128 || v > 4096)
++				return std::nullopt;
++			cal.leftGain_[i] = static_cast<float>(v) / 256.0f;
++		}
++		for (unsigned int i = 0; i < kGainPoints; ++i, off += 2) {
++			uint16_t v = readBe16(off);
++			if (v < 128 || v > 4096)
++				return std::nullopt;
++			cal.rightGain_[i] = static_cast<float>(v) / 256.0f;
++		}
++
++		uint16_t qShift = readBe16(off);
++		uint16_t dw = readBe16(off + 2);
++		uint16_t dh = readBe16(off + 4);
++		off += 6;
++		if (qShift > 12 || dw != kDccW || dh != kDccH)
++			return std::nullopt;
++
++		cal.qShift_ = qShift;
++		const float scale = static_cast<float>(1U << qShift);
++		for (unsigned int i = 0; i < kDccPoints; ++i, off += 2) {
++			uint16_t v = readBe16(off);
++			if (!v)
++				return std::nullopt;
++			cal.dcc_[i] = static_cast<float>(v) / scale;
++		}
++
++		return cal;
++	}
++
++	uint16_t checksum() const { return checksum_; }
++	unsigned int qShift() const { return qShift_; }
++
++	float sampleGainL(double nx, double ny) const
++	{
++		return sampleBilinear(leftGain_.data(), kGainW, kGainH, nx, ny);
++	}
++
++	float sampleGainR(double nx, double ny) const
++	{
++		return sampleBilinear(rightGain_.data(), kGainW, kGainH, nx, ny);
++	}
++
++	double sampleDcc(double nx, double ny) const
++	{
++		return static_cast<double>(sampleBilinear(dcc_.data(), kDccW, kDccH, nx, ny));
++	}
++
++private:
++	static float sampleBilinear(const float *grid, unsigned int w, unsigned int h,
++				    double nx, double ny)
++	{
++		double gx = std::clamp(nx, 0.0, 1.0) * (w - 1);
++		double gy = std::clamp(ny, 0.0, 1.0) * (h - 1);
++		unsigned int x0 = static_cast<unsigned int>(std::floor(gx));
++		unsigned int y0 = static_cast<unsigned int>(std::floor(gy));
++		unsigned int x1 = std::min(x0 + 1, w - 1);
++		unsigned int y1 = std::min(y0 + 1, h - 1);
++		float fx = static_cast<float>(gx - x0);
++		float fy = static_cast<float>(gy - y0);
++		float v00 = grid[y0 * w + x0];
++		float v10 = grid[y0 * w + x1];
++		float v01 = grid[y1 * w + x0];
++		float v11 = grid[y1 * w + x1];
++		float top = v00 * (1.0f - fx) + v10 * fx;
++		float bot = v01 * (1.0f - fx) + v11 * fx;
++		return top * (1.0f - fy) + bot * fy;
++	}
++
++	uint16_t checksum_ = 0;
++	unsigned int qShift_ = 0;
++	std::array<float, kGainPoints> leftGain_{};
++	std::array<float, kGainPoints> rightGain_{};
++	std::array<float, kDccPoints> dcc_{};
++};
++
++class PdafEngine
++{
++public:
++	static PdafRoiSlice planSlice(const PdafModeSpec &mode,
++				      double normX, double normY,
++				      double normW, double normH)
++	{
++		PdafRoiSlice slice;
++		normX = std::clamp(normX, 0.0, 0.9);
++		normY = std::clamp(normY, 0.0, 0.9);
++		normW = std::clamp(normW, 0.15, 1.0 - normX);
++		normH = std::clamp(normH, 0.10, 1.0 - normY);
++
++		/*
++		 * Keep the slice compact (<= 64 rows, 8-row aligned) so DMA copy
++		 * and vertically binned correlation finish in < 0.5 ms per frame
++		 * without starving 60 fps stats processing.
++		 */
++		constexpr uint32_t kMaxLines = 64;
++		constexpr uint32_t kMinLines = 24;
++		uint32_t lines = static_cast<uint32_t>(std::lround(normH * mode.height));
++		lines = std::clamp(lines, kMinLines, std::min(kMaxLines, mode.height));
++		lines = (lines / 8) * 8;
++		if (lines < 16)
++			lines = std::min<uint32_t>(16, mode.height & ~7U);
++
++		double centerY = (normY + 0.5 * normH) * mode.height;
++		int startY = static_cast<int>(std::lround(centerY - 0.5 * lines));
++		startY = std::clamp(startY, 0, static_cast<int>(mode.height - lines));
++		startY = (startY / 8) * 8;
++
++		uint32_t minCols = mode.layout == PdafLayout::DualPdColLR ? 256U : 96U;
++		uint32_t maxCols = mode.layout == PdafLayout::DualPdColLR ? 1024U : 320U;
++		uint32_t x0 = static_cast<uint32_t>(std::floor(normX * mode.width)) & ~7U;
++		uint32_t x1 = (static_cast<uint32_t>(std::ceil((normX + normW) * mode.width)) + 7U) & ~7U;
++		x1 = std::min(x1, mode.width & ~7U);
++		if (x1 > x0 && x1 - x0 > maxCols) {
++			uint32_t cx = (x0 + x1) / 2;
++			x0 = (cx > maxCols / 2 ? cx - maxCols / 2 : 0) & ~7U;
++			x1 = std::min(mode.width & ~7U, x0 + maxCols);
++		}
++		if (x1 <= x0 || x1 - x0 < minCols) {
++			uint32_t cx = static_cast<uint32_t>(std::lround((normX + 0.5 * normW) * mode.width));
++			uint32_t half = minCols / 2;
++			x0 = cx > half ? (cx - half) & ~7U : 0;
++			x1 = std::min(mode.width & ~7U, x0 + minCols);
++			if (x1 - x0 < minCols && x1 >= minCols)
++				x0 = (x1 - minCols) & ~7U;
++		}
++
++		slice.offsetY = static_cast<uint32_t>(startY);
++		slice.copyLines = lines;
++		slice.xStart = x0;
++		slice.xEnd = x1;
++		slice.centerNx = (0.5 * (x0 + x1)) / mode.width;
++		slice.centerNy = mode.vCropStart +
++				 ((startY + 0.5 * lines) / mode.height) * mode.vCropHeight;
++		return slice;
++	}
++
++	static PdafResult compute(const PdafCalibration &cal,
++				  const PdafModeSpec &mode,
++				  const uint8_t *rawData,
++				  const PdafRoiSlice &slice,
++				  Transform transform)
++	{
++		PdafResult out;
++		if (!rawData || slice.copyLines < 8 || slice.xEnd <= slice.xStart)
++			return out;
++
++		const bool hflip = !!(transform & Transform::HFlip);
++		const bool vflip = !!(transform & Transform::VFlip);
++		const double nyMidRaw = slice.centerNy;
++		const double nyMid = vflip ? (1.0 - nyMidRaw) : nyMidRaw;
++
++		std::vector<uint16_t> unpacked(slice.xEnd - slice.xStart);
++
++		if (mode.layout == PdafLayout::DualPdColLR) {
++			const unsigned int pairs = (slice.xEnd - slice.xStart) / 2;
++			constexpr int kMaxShift = 16;
++			constexpr unsigned int kMargin = kMaxShift + 2;
++			if (pairs <= 2 * kMargin + 16)
++				return out;
++
++			/*
++			 * Precompute 1D gain curves across the ROI width at slice midpoint
++			 * (gain map varies smoothly over a <=64-line band) and vertically
++			 * average every 8 rows into super-rows to suppress shot noise and
++			 * keep correlation under 0.3 ms at 60 fps.
++			 */
++			std::vector<float> gainL(pairs), gainR(pairs);
++			for (unsigned int p = 0; p < pairs; ++p) {
++				double nxRaw = (slice.xStart + 2.0 * p + 1.0) / mode.width;
++				double nx = hflip ? (1.0 - nxRaw) : nxRaw;
++				gainL[p] = cal.sampleGainL(nx, nyMid);
++				gainR[p] = cal.sampleGainR(nx, nyMid);
++			}
++
++			constexpr uint32_t kBandRows = 8;
++			std::vector<float> bandL(pairs), bandR(pairs);
++			std::vector<float> fL(pairs - 2), fR(pairs - 2);
++			std::array<double, 2 * kMaxShift + 1> sad{};
++			double energySum = 0.0;
++			uint64_t energyCount = 0;
++
++			for (uint32_t r0 = 0; r0 + kBandRows <= slice.copyLines; r0 += kBandRows) {
++				std::fill(bandL.begin(), bandL.end(), 0.0f);
++				std::fill(bandR.begin(), bandR.end(), 0.0f);
++
++				for (uint32_t dr = 0; dr < kBandRows; ++dr) {
++					unpackRaw10Slice(rawData + static_cast<std::size_t>(r0 + dr) * mode.stride,
++							 slice.xStart, slice.xEnd, unpacked.data());
++					for (unsigned int p = 0; p < pairs; ++p) {
++						float rawA = std::max(0.0f, static_cast<float>(unpacked[2 * p]) - 64.0f);
++						float rawB = std::max(0.0f, static_cast<float>(unpacked[2 * p + 1]) - 64.0f);
++						if (hflip) {
++							bandL[p] += rawB;
++							bandR[p] += rawA;
++						} else {
++							bandL[p] += rawA;
++							bandR[p] += rawB;
++						}
++					}
++				}
++
++				const float invBand = 1.0f / static_cast<float>(kBandRows);
++				for (unsigned int p = 0; p < pairs; ++p) {
++					bandL[p] *= invBand * gainL[p];
++					bandR[p] *= invBand * gainR[p];
++				}
++
++				const unsigned int n = pairs - 2;
++				for (unsigned int i = 0; i < n; ++i) {
++					fL[i] = bandL[i + 2] - bandL[i];
++					fR[i] = bandR[i + 2] - bandR[i];
++				}
++				const unsigned int x0 = kMargin;
++				const unsigned int x1 = n - kMargin;
++				for (unsigned int x = x0; x < x1; ++x)
++					energySum += std::abs(fL[x]) + std::abs(fR[x]);
++				energyCount += (x1 - x0);
++
++				for (int s = -kMaxShift; s <= kMaxShift; ++s) {
++					float acc = 0.0f;
++					for (unsigned int x = x0; x < x1; ++x)
++						acc += std::abs(fL[x] - fR[static_cast<int>(x) + s]);
++					sad[s + kMaxShift] += acc;
++				}
++			}
++
++			finishSad(sad.data(), kMaxShift, energySum / std::max<uint64_t>(energyCount, 1),
++				  2.5, 0.14, cal, mode, slice, hflip, vflip, out);
++		} else {
++			/* S5K3M5 8-row sparse pattern: pair adjacent even/odd rows by mod-8 phase. */
++			const unsigned int w = slice.xEnd - slice.xStart;
++			constexpr int kMaxShift = 6;
++			constexpr unsigned int kMargin = kMaxShift + 2;
++			if (w <= 2 * kMargin + 16)
++				return out;
++
++			std::vector<float> gainL(w), gainR(w);
++			for (unsigned int i = 0; i < w; ++i) {
++				double nxRaw = (slice.xStart + i + 0.5) / mode.width;
++				double nx = hflip ? (1.0 - nxRaw) : nxRaw;
++				gainL[i] = cal.sampleGainL(nx, nyMid);
++				gainR[i] = cal.sampleGainR(nx, nyMid);
++			}
++
++			std::vector<uint16_t> unpackedTop(w), unpackedBot(w);
++			std::vector<float> lRow(w), rRow(w);
++			std::array<double, 2 * kMaxShift + 1> sad{};
++			double energySum = 0.0;
++			uint64_t energyCount = 0;
++
++			for (uint32_t r = 0; r + 1 < slice.copyLines; ++r) {
++				uint32_t absY = slice.offsetY + r;
++				if (absY & 1U)
++					continue;
++				uint32_t m8 = absY & 7U;
++				unpackRaw10Slice(rawData + static_cast<std::size_t>(r) * mode.stride,
++						 slice.xStart, slice.xEnd, unpackedTop.data());
++				unpackRaw10Slice(rawData + static_cast<std::size_t>(r + 1) * mode.stride,
++						 slice.xStart, slice.xEnd, unpackedBot.data());
++
++				bool topIsRight = (m8 == 0 || m8 == 6);
++				if (hflip)
++					topIsRight = !topIsRight;
++				const uint16_t *rawL = topIsRight ? unpackedBot.data() : unpackedTop.data();
++				const uint16_t *rawR = topIsRight ? unpackedTop.data() : unpackedBot.data();
++
++				float sumL = 0.0f, sumR = 0.0f;
++				for (unsigned int i = 0; i < w; ++i) {
++					lRow[i] = std::max(0.0f, static_cast<float>(rawL[i]) - 64.0f) * gainL[i];
++					rRow[i] = std::max(0.0f, static_cast<float>(rawR[i]) - 64.0f) * gainR[i];
++					sumL += lRow[i];
++					sumR += rRow[i];
++				}
++				float meanL = sumL / static_cast<float>(w);
++				float meanR = sumR / static_cast<float>(w);
++				for (unsigned int i = 0; i < w; ++i) {
++					lRow[i] -= meanL;
++					rRow[i] -= meanR;
++				}
++
++				const unsigned int x0 = kMargin;
++				const unsigned int x1 = w - kMargin;
++				for (unsigned int x = x0; x < x1; ++x)
++					energySum += std::abs(lRow[x]) + std::abs(rRow[x]);
++				energyCount += (x1 - x0);
++
++				for (int s = -kMaxShift; s <= kMaxShift; ++s) {
++					float acc = 0.0f;
++					for (unsigned int x = x0; x < x1; ++x)
++						acc += std::abs(lRow[x] - rRow[static_cast<int>(x) + s]);
++					sad[s + kMaxShift] += acc;
++				}
++			}
++
++			finishSad(sad.data(), kMaxShift, energySum / std::max<uint64_t>(energyCount, 1),
++				  5.0, 0.12, cal, mode, slice, hflip, vflip, out);
++		}
++
++		return out;
++	}
++
++private:
++	static void unpackRaw10Slice(const uint8_t *rowBytes,
++				     uint32_t xStart, uint32_t xEnd,
++				     uint16_t *out)
++	{
++		uint32_t gStart = xStart / 4;
++		uint32_t gEnd = xEnd / 4;
++		uint16_t *dst = out;
++		for (uint32_t g = gStart; g < gEnd; ++g) {
++			const uint8_t *p = rowBytes + static_cast<std::size_t>(g) * 5;
++			uint8_t lsb = p[4];
++			dst[0] = static_cast<uint16_t>((p[0] << 2) | (lsb & 0x03U));
++			dst[1] = static_cast<uint16_t>((p[1] << 2) | ((lsb >> 2) & 0x03U));
++			dst[2] = static_cast<uint16_t>((p[2] << 2) | ((lsb >> 4) & 0x03U));
++			dst[3] = static_cast<uint16_t>((p[3] << 2) | ((lsb >> 6) & 0x03U));
++			dst += 4;
++		}
++	}
++
++	static void finishSad(const double *sad, int maxShift, double energy,
++			      double minEnergy, double minConf,
++			      const PdafCalibration &cal,
++			      const PdafModeSpec &mode,
++			      const PdafRoiSlice &slice,
++			      bool hflip, bool vflip,
++			      PdafResult &out)
++	{
++		const int count = 2 * maxShift + 1;
++		int bestIdx = 0;
++		double minVal = sad[0];
++		double maxVal = sad[0];
++		for (int i = 1; i < count; ++i) {
++			if (sad[i] < minVal) {
++				minVal = sad[i];
++				bestIdx = i;
++			}
++			if (sad[i] > maxVal)
++				maxVal = sad[i];
++		}
++
++		double phase = static_cast<double>(bestIdx - maxShift);
++		if (bestIdx > 0 && bestIdx < count - 1) {
++			double ym = sad[bestIdx - 1];
++			double y0 = sad[bestIdx];
++			double yp = sad[bestIdx + 1];
++			double denom = ym - 2.0 * y0 + yp;
++			if (denom > 1e-6)
++				phase += 0.5 * (ym - yp) / denom;
++		}
++		if (hflip)
++			phase = -phase;
++
++		double conf = maxVal > 1e-6 ? (maxVal - minVal) / maxVal : 0.0;
++		double nx = hflip ? (1.0 - slice.centerNx) : slice.centerNx;
++		double ny = vflip ? (1.0 - slice.centerNy) : slice.centerNy;
++		double dcc = cal.sampleDcc(nx, ny) * mode.dccScale;
++
++		out.phasePx = std::clamp(phase, -28.0, 28.0);
++		out.confidence = conf;
++		out.energy = energy;
++		out.dcc = dcc;
++		out.defocusSteps = out.phasePx * dcc;
++		out.valid = (energy >= minEnergy) && (conf >= minConf) &&
++			    (bestIdx > 0 && bestIdx < count - 1);
++	}
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 6709c2d..5089eb6 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -64,6 +64,7 @@
+ 
+ #include "qcom_camss.h"
+ #include "lsc_calibration.h"
++#include "pdaf_engine.h"
+ #include "fc4_engine.h"
+ #include "flicker_detector.h"
+ #include "lg_ae_motion.h"
+@@ -427,6 +428,20 @@ constexpr LscEepromSpec kImx520LscSpecs[] = {
+ 	{ 0x0010, 5100.0 },
+ };
+ 
++/*
++ * VFE WM1 in MODE_MIPI_RAW writes 128-bit AXI beats, so every line stride is
++ * 16-byte aligned (5040 B for 4032 px, 2528 B for 2016 px, 640 B for 504 px).
++ */
++constexpr PdafModeSpec kImx363PdafModes[] = {
++	{ { 4032, 3024 }, 1, 0x2b, 4032, 756, 5040, 1.0, PdafLayout::DualPdColLR, 0.0, 1.0 },
++	{ { 2016, 1136 }, 1, 0x2b, 2016, 284, 2528, 2.0, PdafLayout::DualPdColLR, 0.1243, 0.7513 },
++};
++
++constexpr PdafModeSpec kS5k3m5PdafModes[] = {
++	{ { 4032, 3024 }, 1, 0x30, 504, 752, 640, 1.0, PdafLayout::SparseS5k3m5Row8, 0.0, 1.0 },
++	{ { 2016, 1136 }, 1, 0x30, 504, 560, 640, 1.0, PdafLayout::SparseS5k3m5Row8, 0.1243, 0.7513 },
++};
++
+ ColorSpace normalizePixColorSpace(const std::optional<ColorSpace> &requested)
+ {
+ 	if (!requested)
+@@ -468,6 +483,9 @@ struct SensorProfile {
+ 	std::array<unsigned int, 2> (*lgAwbEepromOffsets)() = nullptr;
+ 	const LscEepromSpec *lscEepromSpecs = nullptr;
+ 	std::size_t lscEepromSpecCount = 0;
++	uint32_t pdafEepromOffset = 0;
++	const PdafModeSpec *pdafModes = nullptr;
++	std::size_t pdafModeCount = 0;
+ 	const AeLuxZone *aeLuxZones;
+ 	std::size_t aeLuxZoneCount;
+ 	const AeExposureKnee *aeExposureKnees;
+@@ -504,6 +522,9 @@ constexpr SensorProfile kS5k3m5Profile = {
+ 	.lgAwbEepromOffsets = s5k3m5LgAwbEepromOffsets,
+ 	.lscEepromSpecs = kS5k3m5LscSpecs,
+ 	.lscEepromSpecCount = std::size(kS5k3m5LscSpecs),
++	.pdafEepromOffset = 0x0b10,
++	.pdafModes = kS5k3m5PdafModes,
++	.pdafModeCount = std::size(kS5k3m5PdafModes),
+ 	.aeLuxZones = kAeLuxZones,
+ 	.aeLuxZoneCount = std::size(kAeLuxZones),
+ 	.aeExposureKnees = kAeExposureKnees,
+@@ -540,6 +561,9 @@ constexpr SensorProfile kImx363Profile = {
+ 	.lgAwbEepromOffsets = imx363LgAwbEepromOffsets,
+ 	.lscEepromSpecs = kImx363LscSpecs,
+ 	.lscEepromSpecCount = std::size(kImx363LscSpecs),
++	.pdafEepromOffset = 0x0a99,
++	.pdafModes = kImx363PdafModes,
++	.pdafModeCount = std::size(kImx363PdafModes),
+ 	.aeLuxZones = kImx363AeLuxZones,
+ 	.aeLuxZoneCount = std::size(kImx363AeLuxZones),
+ 	.aeExposureKnees = kImx363AeExposureKnees,
+@@ -993,6 +1017,9 @@ public:
+ 	void syncBpc();
+ 	void syncAbf(bool force = false);
+ 	void syncGtm(bool force = false);
++	void syncPdaf();
++	const PdafModeSpec *activePdafMode() const;
++	PdafResult measurePdaf();
+ 	void syncLsc(bool force = false);
+ 	float estimateLux() const;
+ 	int32_t activeFlickerPeriod() const;
+@@ -1217,6 +1244,10 @@ public:
+ 	bool hasBpc_ = false;
+ 	bool hasAbf_ = false;
+ 	bool hasGtm_ = false;
++	bool hasPdaf_ = false;
++	bool pdafActive_ = false;
++	std::optional<PdafCalibration> pdafCalibration_;
++	std::vector<uint8_t> pdafBuf_;
+ 	bool abfProgrammed_ = false;
+ 	bool abfProgrammedEnabled_ = false;
+ 	double abfProgrammedGain_ = 0.0;
+@@ -1240,6 +1271,7 @@ public:
+ 	enum class AfStage {
+ 		Idle,
+ 		Warmup,
++		Pdaf,
+ 		Coarse,
+ 		Fine,
+ 		Confirm,
+@@ -1247,6 +1279,11 @@ public:
+ 	};
+ 
+ 	bool afEnabled_ = false;
++	bool afUsedPdaf_ = false;
++	bool afPdafConfirmed_ = false;
++	unsigned int afPdafAttempts_ = 0;
++	unsigned int afPdafIdleCounter_ = 0;
++	unsigned int afPdafDefocusStreak_ = 0;
+ 	int32_t afMetering_ = controls::AfMeteringAuto;
+ 	std::vector<Rectangle> afWindows_;
+ 	std::array<double, QCOM_CAMSS_BF_ROIS> afWeights_{};
+@@ -1881,6 +1918,29 @@ int QcomCameraData::init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
+ 		}
+ 	}
+ 
++	if (profile_.pdafEepromOffset && profile_.pdafModes && profile_.pdafModeCount &&
++	    !nvmem.empty()) {
++		std::array<uint8_t, PdafCalibration::kEepromBlockBytes> block;
++		if (readFile(nvmem, profile_.pdafEepromOffset, &block) == 0) {
++			pdafCalibration_ = PdafCalibration::parseEepromBlock(block);
++			if (pdafCalibration_) {
++				LOG(QcomPipeline, Info)
++					<< "Loaded EEPROM PDAF calibration for " << sensorModel_
++					<< " (checksum " << utils::hex(pdafCalibration_->checksum())
++					<< ", center DCC " << std::setprecision(4)
++					<< pdafCalibration_->sampleDcc(0.5, 0.5)
++					<< ", q_shift " << pdafCalibration_->qShift() << ")";
++			} else {
++				LOG(QcomPipeline, Warning)
++					<< "Invalid PDAF EEPROM calibration at offset "
++					<< utils::hex(profile_.pdafEepromOffset) << " in " << nvmem;
++			}
++		} else {
++			LOG(QcomPipeline, Warning)
++				<< "Failed to read PDAF EEPROM calibration from " << nvmem;
++		}
++	}
++
+ 	ret = bindVfeSlot(0, pixEntity, videoEntity, rdiEntity, rawVideoEntity);
+ 	if (ret < 0) {
+ 		LOG(QcomPipeline, Error) << "Failed to bind initial VFE slot: " << ret;
+@@ -1965,6 +2025,7 @@ int QcomCameraData::init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
+ 	hasBpc_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_BPC);
+ 	hasAbf_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_ABF);
+ 	hasGtm_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_GTM);
++	hasPdaf_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_PDAF);
+ 
+ 	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
+ 	if (delays.exposureDelay != 2 || delays.gainDelay != 2) {
+@@ -3779,6 +3840,110 @@ void QcomCameraData::syncGtm(bool force)
+ 	gtmProgrammedEnabled_ = wantEnable;
+ }
+ 
++const PdafModeSpec *QcomCameraData::activePdafMode() const
++{
++	if (!afEnabled_ || !pdafCalibration_ || !profile_.pdafModes ||
++	    !profile_.pdafModeCount ||
++	    testPatternMode_ != controls::draft::TestPatternModeOff)
++		return nullptr;
++
++	for (std::size_t i = 0; i < profile_.pdafModeCount; ++i) {
++		if (profile_.pdafModes[i].sensorSize == configuredSensorSize_)
++			return &profile_.pdafModes[i];
++	}
++	return nullptr;
++}
++
++void QcomCameraData::syncPdaf()
++{
++	pdafActive_ = false;
++	if (!hasPdaf_ || !pix_ || !pix_->isOpen())
++		return;
++
++	const PdafModeSpec *mode = activePdafMode();
++	qcom_camss_pdaf_cfg cfg = {};
++	if (mode) {
++		cfg.enable = 1;
++		cfg.vc = mode->vc;
++		cfg.dt = mode->dt;
++		cfg.width = mode->width;
++		cfg.height = mode->height;
++		cfg.stride = mode->stride;
++	}
++
++	struct v4l2_ext_control control = {};
++	struct v4l2_ext_controls controls = {};
++	control.id = V4L2_CID_QCOM_CAMSS_PDAF;
++	control.size = sizeof(cfg);
++	control.ptr = &cfg;
++	controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++	controls.count = 1;
++	controls.controls = &control;
++	int ret = pix_->ioctl(VIDIOC_S_EXT_CTRLS, &controls);
++	if (ret) {
++		LOG(QcomPipeline, Warning) << "Failed to configure sideband PDAF: " << ret;
++		return;
++	}
++
++	pdafActive_ = (mode != nullptr);
++	if (pdafActive_) {
++		LOG(QcomPipeline, Info)
++			<< "Enabled sideband VC=" << static_cast<unsigned int>(mode->vc)
++			<< " DT=" << utils::hex(mode->dt) << " PDAF ("
++			<< mode->width << "x" << mode->height
++			<< ", stride " << mode->stride << ") for " << sensorModel_;
++	}
++}
++
++PdafResult QcomCameraData::measurePdaf()
++{
++	PdafResult result;
++	const PdafModeSpec *mode = activePdafMode();
++	if (!pdafActive_ || !mode || !pdafCalibration_ || !video_ || !video_->isOpen())
++		return result;
++
++	/* Map active AF window (or default center window) to normalized image ROI. */
++	double normX = 0.25, normY = 0.35, normW = 0.50, normH = 0.30;
++	if (afMetering_ == controls::AfMeteringWindows && !afWindows_.empty() &&
++	    statsInputSize_.width > 0 && statsInputSize_.height > 0) {
++		Rectangle win = afWindows_.front().boundedTo(analogCrop_);
++		if (win.width && win.height) {
++			win = win.transformedBetween(analogCrop_, Rectangle(statsInputSize_));
++			if (!!(transform_ & Transform::HFlip))
++				win.x = statsInputSize_.width - (win.x + win.width);
++			if (!!(transform_ & Transform::VFlip))
++				win.y = statsInputSize_.height - (win.y + win.height);
++			normX = static_cast<double>(win.x) / statsInputSize_.width;
++			normY = static_cast<double>(win.y) / statsInputSize_.height;
++			normW = static_cast<double>(win.width) / statsInputSize_.width;
++			normH = static_cast<double>(win.height) / statsInputSize_.height;
++		}
++	}
++
++	PdafRoiSlice slice = PdafEngine::planSlice(*mode, normX, normY, normW, normH);
++	if (!slice.copyLines)
++		return result;
++
++	pdafBuf_.resize(static_cast<std::size_t>(slice.copyLines) * mode->stride);
++	qcom_camss_pdaf_buf req = {};
++	req.version = QCOM_CAMSS_PDAF_VERSION;
++	req.offset_y = slice.offsetY;
++	req.copy_lines = slice.copyLines;
++	req.data = reinterpret_cast<uint64_t>(pdafBuf_.data());
++
++	int ret = video_->ioctl(VIDIOC_QCOM_CAMSS_GET_PDAF, &req);
++	if (ret)
++		return result;
++	if (req.width != mode->width || req.height != mode->height ||
++	    req.stride != mode->stride || req.copy_lines < slice.copyLines)
++		return result;
++
++	result = PdafEngine::compute(*pdafCalibration_, *mode, pdafBuf_.data(),
++				     slice, transform_);
++	result.sequence = req.sequence;
++	return result;
++}
++
+ void QcomCameraData::syncLsc(bool force)
+ {
+ 	if (!hasLsc_ || !pix_ || !pix_->isOpen())
+@@ -3910,9 +4075,15 @@ void QcomCameraData::startAfScan(uint64_t timestamp)
+ 	afBestStep_ = afModel_->afCodeToStep(afPosition_);
+ 	afBestScore_ = -1.0;
+ 	afFineSamples_ = 0;
++	afUsedPdaf_ = false;
++	afPdafConfirmed_ = false;
++	afPdafAttempts_ = 0;
++	afPdafDefocusStreak_ = 0;
+ 	afSearch_.reset();
+ 	afSceneChange_.reset();
+-	afNextEval_ = timestamp ? timestamp + kAfSettleFrames * frameDurationNs_ : 0;
++	afNextEval_ = timestamp
++		? (pdafActive_ ? timestamp : timestamp + kAfSettleFrames * frameDurationNs_)
++		: 0;
+ 	afState_ = controls::AfStateScanning;
+ 	afStage_ = AfStage::Warmup;
+ 	LOG(QcomPipeline, Debug) << "AF scan started at code " << afOriginalPosition_;
+@@ -3956,9 +4127,9 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 	}
+ 
+ 	if (afPaused_) {
+-		if (afStage_ == AfStage::Warmup || afStage_ == AfStage::Coarse ||
+-		    afStage_ == AfStage::Fine || afStage_ == AfStage::Confirm ||
+-		    afStage_ == AfStage::Restore)
++		if (afStage_ == AfStage::Warmup || afStage_ == AfStage::Pdaf ||
++		    afStage_ == AfStage::Coarse || afStage_ == AfStage::Fine ||
++		    afStage_ == AfStage::Confirm || afStage_ == AfStage::Restore)
+ 			return;
+ 	}
+ 
+@@ -3970,13 +4141,32 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 				LOG(QcomPipeline, Debug)
+ 					<< "AF scene stabilized after focus change";
+ 				startAfScan(timestamp);
++				return;
++			}
++			if (pdafActive_ && !afLowLight_ &&
++			    (++afPdafIdleCounter_ % 3U == 0)) {
++				PdafResult pd = measurePdaf();
++				double thresh = afModel_->fineStep(false) * 2.5;
++				if (pd.valid && pd.confidence >= 0.22 &&
++				    std::abs(pd.defocusSteps) >= thresh) {
++					if (++afPdafDefocusStreak_ >= 3U) {
++						LOG(QcomPipeline, Debug)
++							<< "PDAF defocus trigger: phase="
++							<< pd.phasePx << " conf=" << pd.confidence
++							<< " defocus=" << pd.defocusSteps;
++						startAfScan(timestamp);
++					}
++				} else {
++					afPdafDefocusStreak_ = 0;
++				}
+ 			}
+ 		}
+ 		return;
+ 	}
+ 
+ 	if (!afNextEval_) {
+-		afNextEval_ = timestamp + kAfSettleFrames * frameDurationNs_;
++		afNextEval_ = timestamp + (pdafActive_ ? frameDurationNs_
++						       : kAfSettleFrames * frameDurationNs_);
+ 		return;
+ 	}
+ 
+@@ -3993,6 +4183,131 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 		LOG(QcomPipeline, Debug) << "AF search luma "
+ 					 << aecLuma_.value_or(0.0)
+ 					 << " low light " << afLowLight_;
++
++		if (pdafActive_ && !afLowLight_) {
++			PdafResult pd = measurePdaf();
++			if (pd.valid) {
++				int curStep = static_cast<int>(afModel_->afCodeToStep(afPosition_));
++				int fineStep = static_cast<int>(afModel_->fineStep(false));
++				afStep_ = curStep;
++				afBestStep_ = curStep;
++				afBestScore_ = score;
++				afUsedPdaf_ = true;
++
++				LOG(QcomPipeline, Info)
++					<< "PDAF initial: step=" << curStep
++					<< " phase=" << std::setprecision(3) << pd.phasePx
++					<< " conf=" << pd.confidence
++					<< " dcc=" << pd.dcc
++					<< " defocus=" << pd.defocusSteps;
++
++				if (std::abs(pd.defocusSteps) <= fineStep * 0.6 && score > 0.0) {
++					afPdafConfirmed_ = true;
++					completeAfScan(true);
++					return;
++				}
++
++				double damping = std::abs(pd.defocusSteps) > 120.0 ? 0.95 : 1.0;
++				int delta = static_cast<int>(std::lround(pd.defocusSteps * damping));
++				int target = std::clamp<int>(curStep + delta,
++							     afModel_->nearStep(),
++							     afModel_->farStep());
++				if (target == curStep) {
++					afPdafConfirmed_ = true;
++					int start = std::max<int>(afModel_->nearStep(), curStep - fineStep);
++					afFineEndStep_ = std::min<int>(afModel_->farStep(), curStep + fineStep);
++					afStep_ = start;
++					if (startAfMove(afStep_))
++						return;
++					afNextEval_ = timestamp + kAfSettleNs;
++					afStage_ = AfStage::Fine;
++					return;
++				}
++
++				afStep_ = target;
++				afPdafAttempts_ = 1;
++				if (startAfMove(afStep_))
++					return;
++				afNextEval_ = timestamp + kAfSettleNs;
++				afStage_ = AfStage::Pdaf;
++				return;
++			}
++		}
++
++		afStep_ = afModel_->farStep();
++		if (startAfMove(afStep_))
++			return;
++		afNextEval_ = timestamp + kAfSettleNs;
++		afStage_ = AfStage::Coarse;
++		return;
++	}
++
++	if (afStage_ == AfStage::Pdaf) {
++		if (score > afBestScore_) {
++			afBestScore_ = score;
++			afBestStep_ = afStep_;
++		}
++
++		PdafResult pd = measurePdaf();
++		int fineStep = static_cast<int>(afModel_->fineStep(afLowLight_));
++		if (pd.valid) {
++			LOG(QcomPipeline, Debug)
++				<< "PDAF iter " << afPdafAttempts_
++				<< ": step=" << afStep_
++				<< " phase=" << std::setprecision(3) << pd.phasePx
++				<< " conf=" << pd.confidence
++				<< " defocus=" << pd.defocusSteps;
++
++			int residual = static_cast<int>(std::lround(pd.defocusSteps));
++			if (std::abs(pd.defocusSteps) <= fineStep * 0.7 && score > 0.0) {
++				afPdafConfirmed_ = true;
++				completeAfScan(true);
++				return;
++			}
++
++			if (std::abs(pd.defocusSteps) <= fineStep * 1.4 || afPdafAttempts_ >= 2) {
++				afPdafConfirmed_ = std::abs(pd.defocusSteps) <= fineStep * 1.8;
++				int center = std::clamp<int>(afStep_ + residual,
++							     afModel_->nearStep(),
++							     afModel_->farStep());
++				int start = std::max<int>(afModel_->nearStep(), center - fineStep);
++				afFineEndStep_ = std::min<int>(afModel_->farStep(), center + fineStep);
++				afStep_ = start;
++				if (startAfMove(afStep_))
++					return;
++				afNextEval_ = timestamp + kAfSettleNs;
++				afStage_ = AfStage::Fine;
++				return;
++			}
++
++			int delta = static_cast<int>(std::lround(pd.defocusSteps * 0.95));
++			int target = std::clamp<int>(afStep_ + delta,
++						     afModel_->nearStep(),
++						     afModel_->farStep());
++			if (target == afStep_) {
++				afPdafConfirmed_ = true;
++				int start = std::max<int>(afModel_->nearStep(), afStep_ - fineStep);
++				afFineEndStep_ = std::min<int>(afModel_->farStep(), afStep_ + fineStep);
++				afStep_ = start;
++				if (startAfMove(afStep_))
++					return;
++				afNextEval_ = timestamp + kAfSettleNs;
++				afStage_ = AfStage::Fine;
++				return;
++			}
++
++			afStep_ = target;
++			afPdafAttempts_++;
++			if (startAfMove(afStep_))
++				return;
++			afNextEval_ = timestamp + kAfSettleNs;
++			return;
++		}
++
++		/* Lost PDAF confidence mid-jump: fall back cleanly to full CDAF sweep. */
++		afUsedPdaf_ = false;
++		afPdafConfirmed_ = false;
++		afSearch_.reset();
+ 		afStep_ = afModel_->farStep();
+ 		if (startAfMove(afStep_))
+ 			return;
+@@ -4058,13 +4373,16 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 	if (afStage_ == AfStage::Confirm) {
+ 		LgAfResult result{ afFineSamples_, afSearch_.peakScore(),
+ 				   afSearch_.focusRange(), afSearch_.maximumRise() };
+-		bool success = score > 0.0 && lgAfScanSucceeded(
++		bool cdafOk = lgAfScanSucceeded(
+ 			result, afModel_->nearPosition() + afBestStep_,
+ 			afModel_->positionForDistance(200),
+ 			afModel_->positionForDistance(700));
++		bool success = score > 0.0 && ((afUsedPdaf_ && afPdafConfirmed_) || cdafOk);
+ 		LOG(QcomPipeline, Debug) << "AF result peak " << result.peakScore
+ 			<< " range " << result.focusRange << " rise " << result.maximumRise
+-			<< " fine samples " << result.fineSamples << " success " << success;
++			<< " fine samples " << result.fineSamples
++			<< " pdaf " << (afUsedPdaf_ && afPdafConfirmed_)
++			<< " success " << success;
+ 		completeAfScan(success);
+ 		return;
+ 	}
+@@ -4542,7 +4860,8 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 	if (hasOis_)
+ 		metadata.set(controls::draft::OpticalImageStabilizationMode, context.oisMode);
+ 	if (lastStatsSequence_ != UINT32_MAX &&
+-	    qcom::inputSequence(lastStatsSequence_) == sequence)
++	    (lastStatsSequence_ == sequence ||
++	     qcom::inputSequence(lastStatsSequence_) == sequence))
+ 		metadata.set(controls::FocusFoM,
+ 		     static_cast<int32_t>(std::clamp(focusScore() / 1000.0,
+ 						     0.0, 2147483647.0)));
+@@ -5043,6 +5362,7 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		data->syncAbf(true);
+ 		data->syncGtm(true);
+ 		data->syncLsc(true);
++		data->syncPdaf();
+ 		ret = data->applyIfe(0);
+ 		if (ret)
+ 			return ret;
+@@ -5107,6 +5427,10 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 	if (data->pixConfigured_)
+ 		data->video_->streamOff();
+ 	data->videoStarted_ = false;
++	data->pdafActive_ = false;
++	data->afUsedPdaf_ = false;
++	data->afPdafConfirmed_ = false;
++	data->afPdafDefocusStreak_ = 0;
+ 	data->resetTestPattern();
+ 	data->teardownLinks();
+ 	data->closeCaptureDevices();
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+index 9f35d3d..e47bf6c 100644
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -31,6 +31,17 @@ struct qcom_camss_bf_roi {
+ #define V4L2_CID_QCOM_CAMSS_BPC (V4L2_CID_USER_BASE + 0x1255)
+ #define V4L2_CID_QCOM_CAMSS_ABF (V4L2_CID_USER_BASE + 0x1256)
+ #define V4L2_CID_QCOM_CAMSS_GTM (V4L2_CID_USER_BASE + 0x1257)
++#define V4L2_CID_QCOM_CAMSS_PDAF (V4L2_CID_USER_BASE + 0x1258)
++
++struct qcom_camss_pdaf_cfg {
++	uint32_t enable;
++	uint8_t vc;
++	uint8_t dt;
++	uint16_t reserved;
++	uint32_t width;
++	uint32_t height;
++	uint32_t stride;
++};
+ 
+ #define QCOM_CAMSS_LSC_H_NUM 17
+ #define QCOM_CAMSS_LSC_V_NUM 13
+@@ -151,12 +162,29 @@ struct qcom_camss_stats {
+ 	uint32_t reserved1;
+ };
+ 
++#define QCOM_CAMSS_PDAF_VERSION 1
++
++struct qcom_camss_pdaf_buf {
++	uint32_t version;
++	uint32_t sequence;
++	uint64_t timestamp;
++	uint32_t width;
++	uint32_t height;
++	uint32_t stride;
++	uint32_t offset_y;
++	uint32_t copy_lines;
++	uint32_t reserved;
++	uint64_t data;
++};
++
+ #define VIDIOC_QCOM_CAMSS_GET_STATS \
+ 	_IOWR('V', BASE_VIDIOC_PRIVATE + 0, struct qcom_camss_stats)
+ #define VIDIOC_QCOM_CAMSS_GET_FRAME_SEQUENCE \
+ 	_IOR('V', BASE_VIDIOC_PRIVATE + 1, uint32_t)
+ #define VIDIOC_QCOM_CAMSS_GET_REQUEST_SEQUENCE \
+ 	_IOR('V', BASE_VIDIOC_PRIVATE + 2, uint32_t)
++#define VIDIOC_QCOM_CAMSS_GET_PDAF \
++	_IOWR('V', BASE_VIDIOC_PRIVATE + 3, struct qcom_camss_pdaf_buf)
+ #define V4L2_CID_QCOM_CAMSS_IFE_CONFIG \
+ 	(V4L2_CID_USER_BASE + 0x1250 + 0)
+ 
+-- 
+2.55.0
+

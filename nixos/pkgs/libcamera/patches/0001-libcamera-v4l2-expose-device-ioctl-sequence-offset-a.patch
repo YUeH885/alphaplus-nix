@@ -1,0 +1,83 @@
+From 0a2f9fdc41ba076ad6f5854c0e2d37dc00531e75 Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu23234@gmail.com>
+Date: Sat, 7 Nov 2026 13:33:34 +0800
+Subject: [PATCH] libcamera: v4l2: expose device ioctl, sequence offset, and
+ one-shot request notifier
+
+Expose V4L2Device::ioctl() for custom CAMSS statistics and IFE configuration
+calls, provide V4L2VideoDevice::sequenceOffset() to recover raw kernel SOF
+sequence numbers after first-frame normalization, and disable V4L2Request's
+poll notifier upon completion so completed requests do not re-trigger before
+reuse.
+---
+ include/libcamera/internal/v4l2_device.h      | 4 ++--
+ include/libcamera/internal/v4l2_videodevice.h | 1 +
+ src/libcamera/v4l2_request.cpp                | 1 +
+ src/libcamera/v4l2_videodevice.cpp            | 8 ++++++++
+ 4 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/include/libcamera/internal/v4l2_device.h b/include/libcamera/internal/v4l2_device.h
+index 8c4c59b..3f72b34 100644
+--- a/include/libcamera/internal/v4l2_device.h
++++ b/include/libcamera/internal/v4l2_device.h
+@@ -52,6 +52,8 @@ public:
+ 
+ 	void updateControlInfo();
+ 
++	int ioctl(unsigned long request, void *argp);
++
+ protected:
+ 	V4L2Device(const std::string &deviceNode);
+ 	~V4L2Device();
+@@ -59,8 +61,6 @@ protected:
+ 	int open(unsigned int flags);
+ 	int setFd(UniqueFD fd);
+ 
+-	int ioctl(unsigned long request, void *argp);
+-
+ 	int fd() const { return fd_.get(); }
+ 
+ 	template<typename T>
+diff --git a/include/libcamera/internal/v4l2_videodevice.h b/include/libcamera/internal/v4l2_videodevice.h
+index 10367e4..032940d 100644
+--- a/include/libcamera/internal/v4l2_videodevice.h
++++ b/include/libcamera/internal/v4l2_videodevice.h
+@@ -223,6 +223,7 @@ public:
+ 
+ 	int streamOn();
+ 	int streamOff();
++	unsigned int sequenceOffset() const { return firstFrame_.value(); }
+ 
+ 	void setDequeueTimeout(utils::Duration timeout);
+ 	Signal<> dequeueTimeout;
+diff --git a/src/libcamera/v4l2_request.cpp b/src/libcamera/v4l2_request.cpp
+index 291aa82..7648f3a 100644
+--- a/src/libcamera/v4l2_request.cpp
++++ b/src/libcamera/v4l2_request.cpp
+@@ -122,6 +122,7 @@ std::string V4L2Request::logPrefix() const
+  */
+ void V4L2Request::requestReady()
+ {
++	fdNotifier_.setEnabled(false);
+ 	requestDone.emit(this);
+ }
+ 
+diff --git a/src/libcamera/v4l2_videodevice.cpp b/src/libcamera/v4l2_videodevice.cpp
+index ca87598..0c25d27 100644
+--- a/src/libcamera/v4l2_videodevice.cpp
++++ b/src/libcamera/v4l2_videodevice.cpp
+@@ -1983,6 +1983,14 @@ FrameBuffer *V4L2VideoDevice::dequeueBuffer()
+  * \brief A Signal emitted when a framebuffer completes
+  */
+ 
++/**
++ * \fn unsigned int V4L2VideoDevice::sequenceOffset() const
++ * \brief Return the offset subtracted from captured buffer sequence numbers
++ *
++ * The offset is available after the first buffer has been dequeued and remains
++ * valid until the stream is stopped. Adding it to a buffer's metadata sequence
++ * recovers the kernel sequence used by frame-start events.
++ */
+ /**
+  * \brief Start the video stream
+  * \return 0 on success or a negative error code otherwise

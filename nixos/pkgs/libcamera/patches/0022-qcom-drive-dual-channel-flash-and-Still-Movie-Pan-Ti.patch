@@ -1,0 +1,237 @@
+From d92131d8d8eed30df61afac7053473d1756e587b Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu23234@gmail.com>
+Date: Sun, 22 Nov 2026 18:29:39 +0800
+Subject: [PATCH] qcom: drive dual-channel flash and Still/Movie Pan-Tilt OIS
+ modes
+
+---
+ src/libcamera/pipeline/qcom/qcom.cpp | 143 +++++++++++++++++++--------
+ 1 file changed, 100 insertions(+), 43 deletions(-)
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index e44326c..6ff3637 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -94,21 +94,27 @@ LOG_DEFINE_CATEGORY(QcomPipeline)
+ 
+ namespace {
+ 
++constexpr uint32_t kLc898124ep1CidOisMode = V4L2_CID_USER_BASE + 0x10f0;
++constexpr int32_t kLc898124ep1ModeMovie = 0;
++constexpr int32_t kLc898124ep1ModeStill = 1;
++constexpr int32_t kLc898124ep1ModeMoviePanTilt = 2;
++
+ class FlashDevice
+ {
+ public:
+-	explicit FlashDevice(MediaEntity *entity)
+-		: device_(entity)
++	explicit FlashDevice(MediaEntity *primary, MediaEntity *secondary = nullptr)
+ 	{
++		if (primary)
++			devices_.push_back(std::make_unique<V4L2Subdevice>(primary));
++		if (secondary)
++			devices_.push_back(std::make_unique<V4L2Subdevice>(secondary));
+ 	}
+ 
+ 	int open()
+ 	{
+-		int ret = device_.open();
+-		if (ret < 0)
+-			return ret;
++		if (devices_.empty())
++			return -ENODEV;
+ 
+-		const ControlInfoMap &info = device_.controls();
+ 		constexpr uint32_t required[] = {
+ 			V4L2_CID_FLASH_LED_MODE,
+ 			V4L2_CID_FLASH_INTENSITY,
+@@ -116,11 +122,21 @@ public:
+ 			V4L2_CID_FLASH_TIMEOUT,
+ 			V4L2_CID_FLASH_STROBE,
+ 		};
+-		for (uint32_t id : required) {
+-			if (!info.count(id)) {
+-				LOG(QcomPipeline, Error) << "Flash subdev missing control " << id;
++
++		for (auto &dev : devices_) {
++			int ret = dev->open();
++			if (ret < 0) {
+ 				close();
+-				return -EOPNOTSUPP;
++				return ret;
++			}
++
++			const ControlInfoMap &info = dev->controls();
++			for (uint32_t id : required) {
++				if (!info.count(id)) {
++					LOG(QcomPipeline, Error) << "Flash subdev missing control " << id;
++					close();
++					return -EOPNOTSUPP;
++				}
+ 			}
+ 		}
+ 		return 0;
+@@ -128,14 +144,15 @@ public:
+ 
+ 	void close()
+ 	{
+-		device_.close();
++		for (auto &dev : devices_)
++			dev->close();
+ 		torchOn_ = false;
+ 		strobeUntil_ = {};
+ 	}
+ 
+ 	void turnOff()
+ 	{
+-		if (device_.isOpen() && setMode(V4L2_FLASH_LED_MODE_NONE)) {
++		if (isOpen() && setMode(V4L2_FLASH_LED_MODE_NONE)) {
+ 			torchOn_ = false;
+ 			strobeUntil_ = {};
+ 		}
+@@ -157,22 +174,32 @@ public:
+ 			return false;
+ 		torchOn_ = false;
+ 
+-		const ControlInfoMap &info = device_.controls();
+-		const ControlInfo &timeoutInfo = info.at(V4L2_CID_FLASH_TIMEOUT);
+-		const int32_t timeoutUs = std::clamp<int32_t>(
+-			200000, timeoutInfo.min().get<int32_t>(), timeoutInfo.max().get<int32_t>());
+-		ControlList controls(info);
+-		controls.set(V4L2_CID_FLASH_INTENSITY, info.at(V4L2_CID_FLASH_INTENSITY).max());
+-		controls.set(V4L2_CID_FLASH_TIMEOUT, timeoutUs);
+-		if (!apply(controls))
+-			return false;
++		int32_t appliedTimeoutUs = 200000;
++		for (auto &dev : devices_) {
++			const ControlInfoMap &info = dev->controls();
++			const ControlInfo &timeoutInfo = info.at(V4L2_CID_FLASH_TIMEOUT);
++			const int32_t timeoutUs = std::clamp<int32_t>(
++				200000, timeoutInfo.min().get<int32_t>(),
++				timeoutInfo.max().get<int32_t>());
++			appliedTimeoutUs = std::min(appliedTimeoutUs, timeoutUs);
++
++			ControlList controls(info);
++			controls.set(V4L2_CID_FLASH_INTENSITY,
++				     info.at(V4L2_CID_FLASH_INTENSITY).max());
++			controls.set(V4L2_CID_FLASH_TIMEOUT, timeoutUs);
++			if (!apply(*dev, controls))
++				return false;
++		}
+ 
+-		ControlList strobe(info);
+-		strobe.set(V4L2_CID_FLASH_STROBE, 0);
+-		if (!apply(strobe))
+-			return false;
++		for (auto &dev : devices_) {
++			ControlList strobe(dev->controls());
++			strobe.set(V4L2_CID_FLASH_STROBE, 0);
++			if (!apply(*dev, strobe))
++				return false;
++		}
+ 
+-		strobeUntil_ = std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUs);
++		strobeUntil_ = std::chrono::steady_clock::now() +
++			       std::chrono::microseconds(appliedTimeoutUs);
+ 		return true;
+ 	}
+ 
+@@ -183,25 +210,38 @@ public:
+ 	}
+ 
+ private:
++	bool isOpen() const
++	{
++		return !devices_.empty() &&
++		       std::all_of(devices_.begin(), devices_.end(),
++				   [](const auto &dev) { return dev->isOpen(); });
++	}
++
+ 	bool setMode(int32_t mode)
+ 	{
+-		ControlList controls(device_.controls());
+-		controls.set(V4L2_CID_FLASH_LED_MODE, mode);
+-		if (mode == V4L2_FLASH_LED_MODE_TORCH)
+-			controls.set(V4L2_CID_FLASH_TORCH_INTENSITY,
+-				     device_.controls().at(V4L2_CID_FLASH_TORCH_INTENSITY).max());
+-		return apply(controls);
++		bool ok = true;
++		for (auto &dev : devices_) {
++			const ControlInfoMap &info = dev->controls();
++			ControlList controls(info);
++			controls.set(V4L2_CID_FLASH_LED_MODE, mode);
++			if (mode == V4L2_FLASH_LED_MODE_TORCH)
++				controls.set(V4L2_CID_FLASH_TORCH_INTENSITY,
++					     info.at(V4L2_CID_FLASH_TORCH_INTENSITY).max());
++			if (!apply(*dev, controls))
++				ok = false;
++		}
++		return ok;
+ 	}
+ 
+-	bool apply(ControlList &controls)
++	bool apply(V4L2Subdevice &dev, ControlList &controls)
+ 	{
+-		int ret = device_.setControls(&controls);
++		int ret = dev.setControls(&controls);
+ 		if (ret)
+ 			LOG(QcomPipeline, Error) << "Failed to set flash controls: " << ret;
+ 		return ret == 0;
+ 	}
+ 
+-	V4L2Subdevice device_;
++	std::vector<std::unique_ptr<V4L2Subdevice>> devices_;
+ 	bool torchOn_ = false;
+ 	std::chrono::steady_clock::time_point strobeUntil_{};
+ };
+@@ -2088,11 +2128,20 @@ int QcomCameraData::init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
+ 	ctrls[&controls::AnalogueGain] = ControlInfo(
+ 		static_cast<float>(gainMin_), static_cast<float>(gainMax_),
+ 		static_cast<float>(aeGain_));
+-	/* All rear sensors on this board share one flash controller. */
+-	MediaEntity *flash = media_->getEntityByName("white:flash");
+-	if (sensorModel_ != "imx520" && flash && flash->function() == MEDIA_ENT_F_FLASH &&
+-	    access(flash->deviceNode().c_str(), R_OK | W_OK) == 0)
+-		flash_ = std::make_unique<FlashDevice>(flash);
++	/* All rear sensors share both parallel PM8150L flash channels. */
++	auto usableFlash = [&](const char *name) -> MediaEntity * {
++		MediaEntity *ent = media_->getEntityByName(name);
++		if (ent && ent->function() == MEDIA_ENT_F_FLASH &&
++		    access(ent->deviceNode().c_str(), R_OK | W_OK) == 0)
++			return ent;
++		return nullptr;
++	};
++	if (sensorModel_ != "imx520") {
++		MediaEntity *whiteFlash = usableFlash("white:flash");
++		MediaEntity *yellowFlash = usableFlash("yellow:flash");
++		if (whiteFlash || yellowFlash)
++			flash_ = std::make_unique<FlashDevice>(whiteFlash, yellowFlash);
++	}
+ 	smartFlash_ = smartFlashTuningForSensor(sensorEntity->name());
+ 	if (flash_) {
+ 		ctrls[&controls::draft::FlashMode] = ControlInfo(
+@@ -4414,9 +4463,17 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ int QcomCameraData::setOisMode(int32_t mode)
+ {
+ 	V4L2Subdevice *ois = sensor_->ois();
+-	ControlList controls(ois->controls());
+-	controls.set(V4L2_CID_IMAGE_STABILIZATION,
+-		     mode == controls::draft::OpticalImageStabilizationModeOn ? 1 : 0);
++	const ControlInfoMap &oisCtrls = ois->controls();
++	ControlList controls(oisCtrls);
++	const bool enable = (mode == controls::draft::OpticalImageStabilizationModeOn);
++	if (oisCtrls.count(kLc898124ep1CidOisMode)) {
++		/* Use Still mode for full-resolution capture and Pan/Tilt for video. */
++		const bool isStill = (configuredSensorSize_ == profile_.fullInputSize);
++		controls.set(kLc898124ep1CidOisMode,
++			     isStill ? kLc898124ep1ModeStill
++				     : kLc898124ep1ModeMoviePanTilt);
++	}
++	controls.set(V4L2_CID_IMAGE_STABILIZATION, enable ? 1 : 0);
+ 	int ret = ois->setControls(&controls);
+ 	if (ret) {
+ 		LOG(QcomPipeline, Error) << "Failed to set OIS mode: " << ret;
+-- 
+2.55.0
+

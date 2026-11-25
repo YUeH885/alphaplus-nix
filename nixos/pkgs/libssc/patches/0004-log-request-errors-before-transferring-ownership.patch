@@ -1,0 +1,35 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] sensor: log request errors before handing them to GTask
+
+g_task_return_error takes ownership of the GError. Releasing the task
+can free that error, so logging error->message afterwards dereferences
+freed memory. This crashes SensorProxy when a disable request fails
+during SLPI recovery. Log both enable and disable failures before
+transferring the error.
+
+diff --git a/src/libssc-sensor.c b/src/libssc-sensor.c
+index 2c2d20c..6a66baa 100644
+--- a/src/libssc-sensor.c
++++ b/src/libssc-sensor.c
+@@ -121,9 +121,9 @@ sensor_close_ready (SSCClient *self, GAsyncResult *result, gpointer user_data)
+ 	GError *error = NULL;
+ 
+ 	if (!ssc_client_send_finish (self, result, &error)) {
++		g_debug ("Sensor disable request failed: %s", error->message);
+ 		g_task_return_error (task, error);
+ 		g_clear_object (&task);
+-		g_debug ("Sensor disable request failed: %s", error->message);
+ 		return;
+ 	}
+ 
+@@ -183,9 +183,9 @@ sensor_open_ready (SSCClient *self, GAsyncResult *result, gpointer user_data)
+ 	GError *error = NULL;
+ 
+ 	if (!ssc_client_send_finish (self, result, &error)) {
++		g_debug ("Sensor enable request failed: %s", error->message);
+ 		g_task_return_error (task, error);
+ 		g_clear_object (&task);
+-		g_debug ("Sensor enable request failed: %s", error->message);
+ 		return;
+ 	}
+ 

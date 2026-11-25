@@ -1,0 +1,66 @@
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 4a14c7e..fa25e05 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -872,6 +872,7 @@ public:
+ 		double green = 1.0;
+ 		double cct = 4250.0;
+ 		bool awbEnabled = true;
++		bool awbLocked = false;
+ 		std::array<float, 9> ccm = {
+ 			214.0f / 128, -93.0f / 128, 7.0f / 128,
+ 			-38.0f / 128, 170.0f / 128, -5.0f / 128,
+@@ -961,6 +962,7 @@ public:
+ 
+ 	/* AWB state. */
+ 	bool awbEnabled_ = true;
++	bool awbLocked_ = false;
+ 	double awbGainR_ = 1.0;
+ 	double awbGainB_ = 1.0;
+ 	double awbGainG_ = 1.0;
+@@ -1809,6 +1811,7 @@ void QcomCameraData::resetAwb()
+ void QcomCameraData::resetAwbProcessing()
+ {
+ 	awbFrame_ = 0;
++	awbLocked_ = false;
+ 	fc4Generation_++;
+ 	if (fc4Engine_)
+ 		fc4Engine_->reset(fc4Generation_);
+@@ -1989,6 +1992,7 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	context.ife.blue = config.wb_gain_q7[3] / 128.0;
+ 	context.ife.cct = colourTemperature_;
+ 	context.ife.awbEnabled = awbEnabled_;
++	context.ife.awbLocked = awbLocked_;
+ 	for (unsigned int i = 0; i < context.ife.ccm.size(); i++)
+ 		context.ife.ccm[i] = config.ccm_q7[i] / 128.0f;
+ 	ret = transferIfe(config, context.request.get(), false);
+@@ -2525,6 +2529,11 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 		float lux = *luxIndex_;
+ 		const QtiAwbFaceRectangle *face = faceRect_ ? &*faceRect_ : nullptr;
+ 		auto result = qtiAwb_->process({ awb_.data(), 14, width * height, lux, 0, face });
++		const auto &target = result.target.point;
++		const auto &filtered = result.filtered.point;
++		awbLocked_ = !result.filtered.startupActive && result.target.confidence > 0.0f &&
++			     std::abs(filtered.rg - target.rg) < 0.01f * target.rg &&
++			     std::abs(filtered.bg - target.bg) < 0.01f * target.bg;
+ 		colourTemperature_ = result.cct;
+ 		interpolateCcm(profile_, colourTemperature_, ccmQ7_);
+ 		setIfeWb(result.gains[0], result.gains[1], result.gains[2]);
+@@ -2642,6 +2651,8 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 		colourTemperature_ = result.filtered.cct;
+ 		interpolateCcm(profile_, colourTemperature_, ccmQ7_);
+ 	}
++	/* The rear AWB filter reports state 2 once both gain ratios converge. */
++	awbLocked_ = result.filtered.state == 2;
+ 	setIfeWb(result.rgb[0], result.rgb[1], result.rgb[2]);
+ 	LOG(QcomPipeline, Debug) << std::setprecision(9)
+ 		<< "LG AWB stats " << lastStatsSequence_ << " frame " << awbFrame_++
+@@ -3275,6 +3286,8 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 	metadata.set(controls::ColourCorrectionMatrix,
+ 		     Span<const float, 9>(appliedIfe.ccm));
+ 	metadata.set(controls::AwbEnable, appliedIfe.awbEnabled);
++	if (appliedIfe.awbEnabled)
++		metadata.set(controls::AwbLocked, appliedIfe.awbLocked);
+ 
+ 	if (afEnabled_) {
+ 		auto it = frameStates_.upper_bound(sequence);

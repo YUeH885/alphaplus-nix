@@ -1,0 +1,42 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] cli: label gyroscope samples with rotational velocity
+
+The CLI reports gyroscope samples in rad/s, but its JSON output labels
+them with angular acceleration and the unit rad/s^2. Restore the
+correct rotational velocity labels and units.
+
+diff --git a/data/ssc-sensor-gyroscope.proto b/data/ssc-sensor-gyroscope.proto
+index ef25ae7..6b2d9cb 100644
+--- a/data/ssc-sensor-gyroscope.proto
++++ b/data/ssc-sensor-gyroscope.proto
+@@ -19,7 +19,7 @@ syntax = "proto2";
+ 
+ /*
+  * Gyroscope Sensor specific response data.
+- * @velocity: velocity per axis in m/s: X-axis [0], Y-axis [1], Z-axis [2].
++ * @velocity: angular velocity per axis in rad/s: X-axis [0], Y-axis [1], Z-axis [2].
+  * @accuracy: how reliable the value is [0, 3]. Higher is more accurate, 0 is unreliable.
+  */
+ message SscGyroscopeResponse {
+diff --git a/src/libssc-cli.c b/src/libssc-cli.c
+index 5560862..d8d7d3e 100644
+--- a/src/libssc-cli.c
++++ b/src/libssc-cli.c
+@@ -150,7 +150,7 @@ gyroscope_close_cb (SSCSensorGyroscope *self)
+ 
+ static void gyroscope_measurement (SSCSensorGyroscope *sensor, gfloat velocity_x, gfloat velocity_y, gfloat velocity_z, gpointer user_data)
+ {
+-	g_printf ("Gyroscope sensor measurement: X=%f Y=%f Z=%f m/s\n", velocity_x, velocity_y, velocity_z);
++	g_printf ("Gyroscope sensor measurement: X=%f Y=%f Z=%f rad/s\n", velocity_x, velocity_y, velocity_z);
+ 	fflush(stdout);
+ }
+ 
+@@ -168,7 +168,7 @@ int main(int argc, char *argv[])
+ 	const GOptionEntry options[] = {
+ 		{ "version", 0, 0, G_OPTION_ARG_NONE, &print_version, "Print version information and exit.", NULL },
+ 		{ "debug", 'v', 0, G_OPTION_ARG_NONE, &debug, "Enable debug logs.", NULL },
+-		{ "sensor", 0, 0, G_OPTION_ARG_STRING, &sensor_str, "Enable a sensor. Supported sensors: 'proximity', 'light', 'accelerometer', 'magnetometer', 'compass'", NULL },
++		{ "sensor", 0, 0, G_OPTION_ARG_STRING, &sensor_str, "Enable a sensor. Supported sensors: 'proximity', 'light', 'accelerometer', 'magnetometer', 'compass', 'gyroscope'", NULL },
+ 		{ "timeout", 0, 0, G_OPTION_ARG_INT64, &timeout, "Number of seconds before this will timeout [default 10]", NULL },
+ 		{ NULL, 0, 0, G_OPTION_ARG_NONE, NULL, NULL, NULL }
+ 	};

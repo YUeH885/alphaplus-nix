@@ -1,0 +1,538 @@
+From 777002d1c3bd85e8644c748771df48fc842db583 Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu23234@gmail.com>
+Date: Sun, 22 Nov 2026 20:00:46 +0800
+Subject: [PATCH] qcom: add hardware FD501 face detection support
+
+---
+ src/libcamera/pipeline/qcom/fd_engine.h | 278 ++++++++++++++++++++++++
+ src/libcamera/pipeline/qcom/qcom.cpp    | 171 +++++++++++++--
+ 2 files changed, 427 insertions(+), 22 deletions(-)
+ create mode 100644 src/libcamera/pipeline/qcom/fd_engine.h
+
+diff --git a/src/libcamera/pipeline/qcom/fd_engine.h b/src/libcamera/pipeline/qcom/fd_engine.h
+new file mode 100644
+index 0000000..1c23cfc
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/fd_engine.h
+@@ -0,0 +1,278 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Asynchronous wrapper around the SM8150 Titan 175 hardware FD501 accelerator
++ * (/dev/qcom-fd) for real-time face detection on NV12 luma frames.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <condition_variable>
++#include <cstdint>
++#include <fcntl.h>
++#include <linux/ioctl.h>
++#include <linux/types.h>
++#include <mutex>
++#include <sys/ioctl.h>
++#include <thread>
++#include <unistd.h>
++#include <vector>
++
++#include <libcamera/geometry.h>
++
++namespace libcamera::qcom {
++
++namespace fd_uapi {
++
++constexpr unsigned int kMaxFaces = 35;
++constexpr uint32_t kFlagAllAngles = 1U << 0;
++
++struct qcom_fd_face {
++	__u16 center_x;
++	__u16 center_y;
++	__u16 size;
++	__u16 confidence;
++	__u16 roll;
++	__s16 pose;
++};
++
++struct qcom_fd_detect {
++	__u64 image_ptr;
++	__u32 width;
++	__u32 height;
++	__u32 stride;
++	__u32 min_face_size;
++	__u32 threshold;
++	__u32 flags;
++	__u32 face_count;
++	__u32 reserved;
++	struct qcom_fd_face faces[kMaxFaces];
++};
++
++constexpr unsigned long kIocDetect = _IOWR('F', 0x01, struct qcom_fd_detect);
++
++} /* namespace fd_uapi */
++
++struct HardwareFace {
++	Rectangle rect;
++	uint8_t score = 0;
++	int16_t pose = 0;
++	uint16_t roll = 0;
++};
++
++class HardwareFdEngine
++{
++public:
++	~HardwareFdEngine()
++	{
++		stop();
++	}
++
++	bool start()
++	{
++		std::lock_guard<std::mutex> lock(mutex_);
++		if (running_)
++			return fd_ >= 0;
++
++		fd_ = ::open("/dev/qcom-fd", O_RDWR | O_CLOEXEC);
++		if (fd_ < 0)
++			return false;
++
++		stopRequested_ = false;
++		hasPending_ = false;
++		running_ = true;
++		worker_ = std::thread(&HardwareFdEngine::workerLoop, this);
++		return true;
++	}
++
++	void stop()
++	{
++		{
++			std::lock_guard<std::mutex> lock(mutex_);
++			if (!running_)
++				return;
++			stopRequested_ = true;
++			hasPending_ = false;
++		}
++		cv_.notify_one();
++
++		if (worker_.joinable())
++			worker_.join();
++
++		std::lock_guard<std::mutex> lock(mutex_);
++		if (fd_ >= 0) {
++			::close(fd_);
++			fd_ = -1;
++		}
++		running_ = false;
++		results_.clear();
++		hasResults_ = false;
++	}
++
++	bool isRunning() const
++	{
++		std::lock_guard<std::mutex> lock(mutex_);
++		return running_;
++	}
++
++	void submitNv12(const uint8_t *yData, uint32_t srcW, uint32_t srcH,
++			uint32_t srcStride, const Rectangle &statsCrop,
++			const Size &statsSize, bool allAngles)
++	{
++		if (!yData || !srcW || !srcH || srcStride < srcW ||
++		    !statsCrop.width || !statsCrop.height ||
++		    !statsSize.width || !statsSize.height)
++			return;
++
++		/* Pick FD501 native 4:3 (320x240) or 16:9 (427x240) input mode. */
++		const uint32_t dstW = (srcW * 3 > srcH * 4) ? 427 : 320;
++		const uint32_t dstH = 240;
++
++		std::unique_lock<std::mutex> lock(mutex_);
++		if (!running_ || busy_)
++			return;
++
++		pendingY_.resize(dstW * dstH);
++		for (uint32_t y = 0; y < dstH; ++y) {
++			uint32_t sy = (y * srcH) / dstH;
++			const uint8_t *srcRow = yData + sy * srcStride;
++			uint8_t *dstRow = pendingY_.data() + y * dstW;
++			for (uint32_t x = 0; x < dstW; ++x)
++				dstRow[x] = srcRow[(x * srcW) / dstW];
++		}
++
++		pendingW_ = dstW;
++		pendingH_ = dstH;
++		pendingCrop_ = statsCrop;
++		pendingStatsSize_ = statsSize;
++		pendingAllAngles_ = allAngles;
++		hasPending_ = true;
++		lock.unlock();
++		cv_.notify_one();
++	}
++
++	bool latestResults(std::vector<HardwareFace> &out) const
++	{
++		std::lock_guard<std::mutex> lock(mutex_);
++		if (!hasResults_)
++			return false;
++		out = results_;
++		return true;
++	}
++
++private:
++	void workerLoop()
++	{
++		std::vector<uint8_t> workY;
++		while (true) {
++			uint32_t width = 0;
++			uint32_t height = 0;
++			Rectangle crop;
++			Size statsSize;
++			bool allAngles = false;
++			int devFd = -1;
++
++			{
++				std::unique_lock<std::mutex> lock(mutex_);
++				cv_.wait(lock, [this]() {
++					return stopRequested_ || hasPending_;
++				});
++				if (stopRequested_)
++					break;
++
++				workY.swap(pendingY_);
++				width = pendingW_;
++				height = pendingH_;
++				crop = pendingCrop_;
++				statsSize = pendingStatsSize_;
++				allAngles = pendingAllAngles_;
++				devFd = fd_;
++				hasPending_ = false;
++				busy_ = true;
++			}
++
++			fd_uapi::qcom_fd_detect req{};
++			req.image_ptr = reinterpret_cast<uintptr_t>(workY.data());
++			req.width = width;
++			req.height = height;
++			req.stride = width;
++			req.min_face_size = 20;
++			req.threshold = 5;
++			req.flags = allAngles ? fd_uapi::kFlagAllAngles : 0;
++
++			std::vector<HardwareFace> detected;
++			if (devFd >= 0 && ::ioctl(devFd, fd_uapi::kIocDetect, &req) == 0) {
++				const uint32_t count = std::min<uint32_t>(req.face_count, fd_uapi::kMaxFaces);
++				detected.reserve(count);
++				const double scaleX = static_cast<double>(crop.width) / width;
++				const double scaleY = static_cast<double>(crop.height) / height;
++
++				for (uint32_t i = 0; i < count; ++i) {
++					const auto &f = req.faces[i];
++					if (f.size == 0)
++						continue;
++
++					const double half = f.size * 0.5;
++					int32_t x0 = crop.x + static_cast<int32_t>(std::lround((f.center_x - half) * scaleX));
++					int32_t y0 = crop.y + static_cast<int32_t>(std::lround((f.center_y - half) * scaleY));
++					int32_t x1 = crop.x + static_cast<int32_t>(std::lround((f.center_x + half) * scaleX));
++					int32_t y1 = crop.y + static_cast<int32_t>(std::lround((f.center_y + half) * scaleY));
++
++					x0 = std::clamp<int32_t>(x0, 0, static_cast<int32_t>(statsSize.width));
++					y0 = std::clamp<int32_t>(y0, 0, static_cast<int32_t>(statsSize.height));
++					x1 = std::clamp<int32_t>(x1, x0, static_cast<int32_t>(statsSize.width));
++					y1 = std::clamp<int32_t>(y1, y0, static_cast<int32_t>(statsSize.height));
++					if (x1 <= x0 || y1 <= y0)
++						continue;
++
++					HardwareFace face;
++					face.rect = Rectangle(x0, y0, static_cast<unsigned int>(x1 - x0),
++							      static_cast<unsigned int>(y1 - y0));
++					face.score = static_cast<uint8_t>(std::clamp<int>((f.confidence * 100) / 1500, 1, 100));
++					face.pose = f.pose;
++					face.roll = f.roll;
++					detected.push_back(face);
++				}
++
++				/* Order largest face first so AWB/AF face-priority picks the primary subject. */
++				std::sort(detected.begin(), detected.end(),
++					  [](const HardwareFace &a, const HardwareFace &b) {
++						  uint64_t areaA = static_cast<uint64_t>(a.rect.width) * a.rect.height;
++						  uint64_t areaB = static_cast<uint64_t>(b.rect.width) * b.rect.height;
++						  if (areaA != areaB)
++							  return areaA > areaB;
++						  return a.score > b.score;
++					  });
++			}
++
++			{
++				std::lock_guard<std::mutex> lock(mutex_);
++				results_ = std::move(detected);
++				hasResults_ = true;
++				busy_ = false;
++			}
++		}
++	}
++
++	mutable std::mutex mutex_;
++	std::condition_variable cv_;
++	std::thread worker_;
++	int fd_ = -1;
++	bool running_ = false;
++	bool stopRequested_ = false;
++	bool hasPending_ = false;
++	bool busy_ = false;
++
++	std::vector<uint8_t> pendingY_;
++	uint32_t pendingW_ = 0;
++	uint32_t pendingH_ = 0;
++	Rectangle pendingCrop_;
++	Size pendingStatsSize_;
++	bool pendingAllAngles_ = false;
++
++	std::vector<HardwareFace> results_;
++	bool hasResults_ = false;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 6ff3637..8111f29 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -56,6 +56,7 @@
+ #include "libcamera/internal/device_enumerator.h"
+ #include "libcamera/internal/formats.h"
+ #include "libcamera/internal/framebuffer.h"
++#include "libcamera/internal/mapped_framebuffer.h"
+ #include "libcamera/internal/media_device.h"
+ #include "libcamera/internal/pipeline_handler.h"
+ #include "libcamera/internal/request.h"
+@@ -65,6 +66,7 @@
+ #include "qcom_camss.h"
+ #include "lsc_calibration.h"
+ #include "pdaf_engine.h"
++#include "fd_engine.h"
+ #include "fc4_engine.h"
+ #include "flicker_detector.h"
+ #include "lg_ae_motion.h"
+@@ -1252,6 +1254,10 @@ public:
+ 	int32_t faceDetectMode_ = controls::draft::FaceDetectModeOff;
+ 	uint8_t reportedFaceScore_ = 0;
+ 	std::vector<LgAwbFaceInput> lgFaces_;
++	qcom::HardwareFdEngine fdEngine_;
++	std::vector<qcom::HardwareFace> hwFaces_;
++	bool externalFacesActive_ = false;
++	uint32_t fdFrameCounter_ = 0;
+ 	std::unique_ptr<LgAwbPipeline> lgAwb_;
+ 	std::unique_ptr<LgAwbFlatInput> lgFlat_;
+ 	FC4Engine *fc4Engine_ = nullptr;
+@@ -4090,6 +4096,18 @@ void QcomCameraData::updateAfWeights()
+ 				afWeights_[i] += overlap.width * overlap.height;
+ 			}
+ 		}
++	} else if (afMetering_ == controls::AfMeteringAuto && afWindows_.empty() &&
++		   faceDetectMode_ != controls::draft::FaceDetectModeOff &&
++		   !hwFaces_.empty()) {
++		/* Bias auto-focus weights toward the primary hardware-detected face. */
++		const Rectangle &face = hwFaces_.front().rect;
++		fallbackCenter = face.center();
++		for (unsigned int i = 0; i < afWeights_.size(); ++i) {
++			Rectangle region{ static_cast<int>(roiLeft + cell.width * (i % 5)),
++					  static_cast<int>(roiTop + cell.height * (i / 5)), cell };
++			Rectangle overlap = region.boundedTo(face);
++			afWeights_[i] += overlap.width * overlap.height;
++		}
+ 	}
+ 	double area = std::accumulate(afWeights_.begin(), afWeights_.end(), 0.0);
+ 	if (!area) {
+@@ -4738,8 +4756,32 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		}
+ 	}
+ 
+-	if (controls.contains(controls::draft::FaceDetectMode.id()))
+-		faceDetectMode_ = *controls.get(controls::draft::FaceDetectMode);
++	if (controls.contains(controls::draft::FaceDetectMode.id())) {
++		int32_t mode = *controls.get(controls::draft::FaceDetectMode);
++		if (mode != faceDetectMode_) {
++			faceDetectMode_ = mode;
++			if (faceDetectMode_ == controls::draft::FaceDetectModeOff) {
++				fdEngine_.stop();
++				hwFaces_.clear();
++				externalFacesActive_ = false;
++				fdFrameCounter_ = 0;
++				faceRect_.reset();
++				lgFaces_.clear();
++				if (afEnabled_)
++					updateAfWeights();
++			}
++		}
++	}
++
++	if (faceDetectMode_ != controls::draft::FaceDetectModeOff &&
++	    controls.contains(controls::draft::FaceDetectFaceRectangles.id())) {
++		externalFacesActive_ = true;
++		hwFaces_.clear();
++		fdEngine_.stop();
++	} else if (faceDetectMode_ != controls::draft::FaceDetectModeOff &&
++		   !externalFacesActive_ && !fdEngine_.isRunning()) {
++		fdEngine_.start();
++	}
+ 
+ 	if (qtiAwb_ && faceDetectMode_ != controls::draft::FaceDetectModeOff &&
+ 	    controls.contains(controls::draft::FaceDetectFaceRectangles.id())) {
+@@ -4935,28 +4977,42 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 		     static_cast<int32_t>(std::clamp(focusScore() / 1000.0,
+ 						     0.0, 2147483647.0)));
+ 
+-	if (qtiAwb_ && faceDetectMode_ != controls::draft::FaceDetectModeOff) {
+-		metadata.set(controls::draft::FaceDetectMode, faceDetectMode_);
+-		if (faceRect_ && reportedFaceScore_ > 0) {
+-			Rectangle r(
+-				static_cast<int32_t>(std::round(faceRect_->x * statsInputSize_.width)),
+-				static_cast<int32_t>(std::round(faceRect_->y * statsInputSize_.height)),
+-				static_cast<int32_t>(std::round(faceRect_->width * statsInputSize_.width)),
+-				static_cast<int32_t>(std::round(faceRect_->height * statsInputSize_.height)));
+-			metadata.set(controls::draft::FaceDetectFaceRectangles, Span<const Rectangle>(&r, 1));
+-			metadata.set(controls::draft::FaceDetectFaceScores, Span<const uint8_t>(&reportedFaceScore_, 1));
+-		}
+-	} else if (lgAwb_ && faceDetectMode_ != controls::draft::FaceDetectModeOff) {
++	if ((qtiAwb_ || lgAwb_) && faceDetectMode_ != controls::draft::FaceDetectModeOff) {
+ 		metadata.set(controls::draft::FaceDetectMode, faceDetectMode_);
+-		if (!lgFaces_.empty() && reportedFaceScore_ > 0) {
+-			std::vector<Rectangle> rects;
+-			std::vector<uint8_t> scores;
+-			for (const auto &f : lgFaces_) {
+-				rects.emplace_back(f.x, f.y, f.width, f.height);
+-				scores.push_back(reportedFaceScore_);
++		if (!externalFacesActive_) {
++			if (!hwFaces_.empty()) {
++				std::vector<Rectangle> rects;
++				std::vector<uint8_t> scores;
++				rects.reserve(hwFaces_.size());
++				scores.reserve(hwFaces_.size());
++				for (const auto &f : hwFaces_) {
++					rects.push_back(f.rect);
++					scores.push_back(f.score);
++				}
++				metadata.set(controls::draft::FaceDetectFaceRectangles, Span<const Rectangle>(rects));
++				metadata.set(controls::draft::FaceDetectFaceScores, Span<const uint8_t>(scores));
++			}
++		} else if (qtiAwb_) {
++			if (faceRect_ && reportedFaceScore_ > 0) {
++				Rectangle r(
++					static_cast<int32_t>(std::round(faceRect_->x * statsInputSize_.width)),
++					static_cast<int32_t>(std::round(faceRect_->y * statsInputSize_.height)),
++					static_cast<int32_t>(std::round(faceRect_->width * statsInputSize_.width)),
++					static_cast<int32_t>(std::round(faceRect_->height * statsInputSize_.height)));
++				metadata.set(controls::draft::FaceDetectFaceRectangles, Span<const Rectangle>(&r, 1));
++				metadata.set(controls::draft::FaceDetectFaceScores, Span<const uint8_t>(&reportedFaceScore_, 1));
++			}
++		} else if (lgAwb_) {
++			if (!lgFaces_.empty() && reportedFaceScore_ > 0) {
++				std::vector<Rectangle> rects;
++				std::vector<uint8_t> scores;
++				for (const auto &f : lgFaces_) {
++					rects.emplace_back(f.x, f.y, f.width, f.height);
++					scores.push_back(reportedFaceScore_);
++				}
++				metadata.set(controls::draft::FaceDetectFaceRectangles, Span<const Rectangle>(rects));
++				metadata.set(controls::draft::FaceDetectFaceScores, Span<const uint8_t>(scores));
+ 			}
+-			metadata.set(controls::draft::FaceDetectFaceRectangles, Span<const Rectangle>(rects));
+-			metadata.set(controls::draft::FaceDetectFaceScores, Span<const uint8_t>(scores));
+ 		}
+ 	}
+ }
+@@ -4996,6 +5052,69 @@ void QcomCameraData::imageBufferReady(FrameBuffer *buffer)
+ 			pipe->completeRequest(request);
+ 		return;
+ 	}
++
++	if (faceDetectMode_ != controls::draft::FaceDetectModeOff &&
++	    !externalFacesActive_ && pixConfigured_) {
++		if (!fdEngine_.isRunning())
++			fdEngine_.start();
++
++		if (fdEngine_.latestResults(hwFaces_)) {
++			if (qtiAwb_) {
++				if (!hwFaces_.empty() && statsInputSize_.width > 0 && statsInputSize_.height > 0) {
++					const Rectangle &f = hwFaces_.front().rect;
++					float invW = 1.0f / static_cast<float>(statsInputSize_.width);
++					float invH = 1.0f / static_cast<float>(statsInputSize_.height);
++					float nx = std::clamp(static_cast<float>(f.x) * invW, 0.0f, 1.0f);
++					float ny = std::clamp(static_cast<float>(f.y) * invH, 0.0f, 1.0f);
++					float nw = std::clamp(static_cast<float>(f.width) * invW, 0.0f, 1.0f - nx);
++					float nh = std::clamp(static_cast<float>(f.height) * invH, 0.0f, 1.0f - ny);
++					faceRect_ = QtiAwbFaceRectangle{ nx, ny, nw, nh };
++				} else {
++					faceRect_.reset();
++				}
++			}
++			if (lgAwb_) {
++				lgFaces_.clear();
++				for (const auto &f : hwFaces_) {
++					lgFaces_.push_back({ static_cast<uint32_t>(std::max(0, f.rect.x)),
++							     static_cast<uint32_t>(std::max(0, f.rect.y)),
++							     static_cast<uint32_t>(f.rect.width),
++							     static_cast<uint32_t>(f.rect.height) });
++				}
++			}
++			if (afEnabled_ && afMetering_ == controls::AfMeteringAuto && afWindows_.empty())
++				updateAfWeights();
++		}
++
++		if (fdEngine_.isRunning() && (++fdFrameCounter_ % 3) == 1) {
++			MappedFrameBuffer mapped(buffer, MappedFrameBuffer::MapFlag::Read);
++			if (mapped.isValid() && !mapped.planes().empty()) {
++				const StreamConfiguration &cfg = stream_.configuration();
++				const uint32_t srcW = cfg.size.width;
++				const uint32_t srcH = cfg.size.height;
++				const uint32_t srcStride = cfg.stride;
++				if (mapped.planes()[0].size() >= static_cast<size_t>(srcStride) * srcH) {
++					Rectangle fdCrop(
++						activeScaler_.compose_width
++							? static_cast<int>(std::lround(static_cast<double>(activeScaler_.left) * statsInputSize_.width / activeScaler_.compose_width))
++							: 0,
++						activeScaler_.compose_height
++							? static_cast<int>(std::lround(static_cast<double>(activeScaler_.top) * statsInputSize_.height / activeScaler_.compose_height))
++							: 0,
++						activeScaler_.compose_width
++							? static_cast<unsigned int>(std::lround(static_cast<double>(scalerOutput_.width) * statsInputSize_.width / activeScaler_.compose_width))
++							: statsInputSize_.width,
++						activeScaler_.compose_height
++							? static_cast<unsigned int>(std::lround(static_cast<double>(scalerOutput_.height) * statsInputSize_.height / activeScaler_.compose_height))
++							: statsInputSize_.height);
++					fdEngine_.submitNv12(mapped.planes()[0].data(), srcW, srcH, srcStride,
++							     fdCrop, statsInputSize_,
++							     faceDetectMode_ == controls::draft::FaceDetectModeFull);
++				}
++			}
++		}
++	}
++
+ 	fetchStats();
+ 	updateMetadata(request, sequence);
+ 
+@@ -5397,6 +5516,10 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->faceDetectMode_ = controls::draft::FaceDetectModeOff;
+ 	data->faceRect_.reset();
+ 	data->lgFaces_.clear();
++	data->hwFaces_.clear();
++	data->externalFacesActive_ = false;
++	data->fdFrameCounter_ = 0;
++	data->fdEngine_.stop();
+ 	data->afMode_ = controls::AfModeContinuous;
+ 	data->afMetering_ = controls::AfMeteringAuto;
+ 	data->afWindows_.clear();
+@@ -5520,6 +5643,10 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 	data->resetTestPattern();
+ 	data->teardownLinks();
+ 	data->closeCaptureDevices();
++	data->fdEngine_.stop();
++	data->hwFaces_.clear();
++	data->externalFacesActive_ = false;
++	data->fdFrameCounter_ = 0;
+ 	data->frameContexts_.clear();
+ 	data->lastStatsSequence_ = UINT32_MAX;
+ 	data->aeLocked_ = false;
+-- 
+2.55.0
+

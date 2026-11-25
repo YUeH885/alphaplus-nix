@@ -1,0 +1,363 @@
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 036abfa..4a14c7e 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -890,7 +890,8 @@ public:
+ 		std::unique_ptr<V4L2Request> request;
+ 		IfeState ife;
+ 		ControlList sensor;
+-		bool aeEnabled;
++		bool autoExposure;
++		bool autoGain;
+ 		bool aeLocked;
+ 		float exposureValue;
+ 		int32_t aeState;
+@@ -916,7 +917,8 @@ public:
+ 	/* AE state. */
+ 	int32_t flickerMode_ = controls::FlickerOff;
+ 	int32_t flickerPeriod_ = 0;
+-	bool aeEnabled_ = true;
++	bool autoExposure_ = true;
++	bool autoGain_ = true;
+ 	bool aeLocked_ = false;
+ 	float lockedIndex_ = 0.0f;
+ 	int lockedEvStep_ = 0;
+@@ -1032,6 +1034,15 @@ private:
+ 	void setIfeWb(double gainR, double gainG, double gainB);
+ 	void setManualAwb(double gainR, double gainB, std::optional<int32_t> cct);
+ 	void fetchStats();
++	struct AeLimits {
++		double minExposure;
++		double maxExposure;
++		double minGain;
++		double maxGain;
++	};
++	bool aeEnabled() const { return autoExposure_ || autoGain_; }
++	AeLimits aeLimits() const;
++	std::pair<double, double> allocateExposure(double energy, const AeLimits &limits) const;
+ 	bool updateAe(uint32_t sequence, double luma, float appliedIndex, double appliedGain);
+ 	std::optional<double> meteringLuma(bool applyWeights) const;
+ 	std::optional<double> measuredLuma() const;
+@@ -1437,6 +1448,10 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 
+ 	ControlInfoMap::Map ctrls;
+ 	ctrls[&controls::AeEnable] = ControlInfo(false, true, true);
++	ctrls[&controls::ExposureTimeMode] = ControlInfo(controls::ExposureTimeModeValues,
++						       controls::ExposureTimeModeAuto);
++	ctrls[&controls::AnalogueGainMode] = ControlInfo(controls::AnalogueGainModeValues,
++						       controls::AnalogueGainModeAuto);
+ 	ctrls[&controls::AeFlickerMode] = ControlInfo(
+ 		{ { ControlValue(controls::FlickerOff), ControlValue(controls::FlickerManual) } },
+ 		ControlValue(controls::FlickerOff));
+@@ -1908,25 +1923,18 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	}
+ 
+ 	bool firingMainFlash = flash_ && flashMode_ == controls::draft::FlashModeSingle;
+-	if (firingMainFlash && aeEnabled_) {
+-		float minIdx = aeExposureIndex(profile_, exposureMin_ * lineDurationNs_ * gainMin_);
+-		float maxIdx = aeExposureIndex(profile_, exposureMax_ * lineDurationNs_ * gainMax_);
+-		float flashIndex = (preflashState_ == PreflashState::Settled)
+-				   ? mainFlashIndex_
+-				   : std::clamp(static_cast<float>(luxIndex_.value_or(280.0)) - static_cast<float>(profile_.aeLuxLogScale * std::log10(9.0f)),
+-						minIdx, maxIdx);
+-		double corrected = aeExposureForIndex(profile_, flashIndex);
+-		double allocatedGain, allocatedExposure;
+-		aeAllocateExposure(profile_, corrected, allocatedGain, allocatedExposure);
+-		double exposureMinNs = exposureMin_ * lineDurationNs_;
+-		double exposureMaxNs = exposureMax_ * lineDurationNs_;
+-		allocatedGain = std::clamp(allocatedGain, gainMin_, gainMax_);
+-		allocatedExposure = std::clamp(corrected / allocatedGain,
+-					       exposureMinNs, exposureMaxNs);
+-		allocatedGain = std::clamp(corrected / allocatedExposure,
+-					   gainMin_, gainMax_);
+-		aeExposure_ = allocatedExposure / lineDurationNs_;
+-		aeGain_ = allocatedGain;
++	if (firingMainFlash && aeEnabled()) {
++		const AeLimits limits = aeLimits();
++		const float minIdx = aeExposureIndex(profile_, limits.minExposure * limits.minGain);
++		const float maxIdx = aeExposureIndex(profile_, limits.maxExposure * limits.maxGain);
++		const float flashIndex = preflashState_ == PreflashState::Settled
++			? mainFlashIndex_
++			: std::clamp(static_cast<float>(luxIndex_.value_or(280.0)) -
++				     static_cast<float>(profile_.aeLuxLogScale * std::log10(9.0f)),
++				     minIdx, maxIdx);
++		const auto [exposure, gain] = allocateExposure(aeExposureForIndex(profile_, flashIndex), limits);
++		aeExposure_ = exposure / lineDurationNs_;
++		aeGain_ = gain;
+ 	}
+ 
+ 	auto [targetExposure, targetGain] = firingMainFlash
+@@ -1942,12 +1950,13 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	context.sensor.set(V4L2_CID_VBLANK, frameLines - sensorHeight_);
+ 	context.frameDurationLimits = { frameDurationUs(frameLengthLimits_[0]),
+ 					frameDurationUs(frameLengthLimits_[1]) };
+-	context.aeEnabled = aeEnabled_;
++	context.autoExposure = autoExposure_;
++	context.autoGain = autoGain_;
+ 	context.flickerMode = flickerMode_;
+ 	context.flickerPeriod = flickerPeriod_;
+ 	context.aeLocked = aeLocked_;
+-	context.exposureValue = aeEnabled_ ? aeEvValue(aeEvStep_) : 0.0f;
+-	if (!aeEnabled_) {
++	context.exposureValue = aeEnabled() ? aeEvValue(aeEvStep_) : 0.0f;
++	if (!aeEnabled()) {
+ 		context.aeState = controls::AeStateIdle;
+ 	} else if (preflashState_ == PreflashState::EnterSkip || preflashState_ == PreflashState::Settling) {
+ 		context.aeState = controls::AeStateSearching;
+@@ -2184,7 +2193,7 @@ void QcomCameraData::fetchStats()
+ 	}
+ 	aecLuma_ = measuredLuma();
+ 
+-	bool aeSettled = !aeEnabled_ || aeLocked_;
++	bool aeSettled = !aeEnabled() || aeLocked_;
+ 	if (aecLuma_) {
+ 		uint32_t sequence = qcom::inputSequence(request.sequence);
+ 		double exposure = request.exposure_lines * lineDurationNs_;
+@@ -2193,7 +2202,7 @@ void QcomCameraData::fetchStats()
+ 		double lux = aeLuxIndex(profile_, appliedIndex, *aecLuma_);
+ 		luxIndex_ = luxIndex_ ? *luxIndex_ * profile_.aeLuxFilterFactor +
+ 				       lux * (1.0 - profile_.aeLuxFilterFactor) : lux;
+-		if (aeEnabled_)
++		if (aeEnabled())
+ 			aeSettled = updateAe(sequence, *aecLuma_, appliedIndex, gain);
+ 	}
+ 	aeSettled_ = aeSettled;
+@@ -2280,6 +2289,28 @@ std::optional<double> QcomCameraData::measuredLuma() const
+ 	return *global > 0.0 ? histMean * *metered / *global : histMean;
+ }
+ 
++QcomCameraData::AeLimits QcomCameraData::aeLimits() const
++{
++	const double exposure = std::clamp(aeExposure_, static_cast<double>(exposureMin_),
++					   static_cast<double>(exposureMax_)) * lineDurationNs_;
++	return {
++		autoExposure_ ? exposureMin_ * lineDurationNs_ : exposure,
++		autoExposure_ ? exposureMax_ * lineDurationNs_ : exposure,
++		autoGain_ ? gainMin_ : aeGain_,
++		autoGain_ ? gainMax_ : aeGain_,
++	};
++}
++
++std::pair<double, double> QcomCameraData::allocateExposure(double energy, const AeLimits &limits) const
++{
++	double gain, exposure;
++	aeAllocateExposure(profile_, energy, gain, exposure);
++	gain = std::clamp(gain, limits.minGain, limits.maxGain);
++	exposure = std::clamp(energy / gain, limits.minExposure, limits.maxExposure);
++	gain = std::clamp(energy / exposure, limits.minGain, limits.maxGain);
++	return { exposure, gain };
++}
++
+ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex, double appliedGain)
+ {
+ 	float luxTarget = aeTargetForLux(profile_, *luxIndex_);
+@@ -2305,8 +2336,11 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 	double requested = previousExposure * lineDurationNs_ *
+ 		gainFromCode(profile_, previousGain);
+ 	float currentIndex = aeExposureIndex(profile_, requested);
+-	float minimumIndex = aeExposureIndex(profile_, exposureMin_ * lineDurationNs_ * gainMin_);
+-	float maximumIndex = aeExposureIndex(profile_, exposureMax_ * lineDurationNs_ * gainMax_);
++	const AeLimits limits = aeLimits();
++	const double minimumEnergy = limits.minExposure * limits.minGain;
++	const double maximumEnergy = limits.maxExposure * limits.maxGain;
++	float minimumIndex = aeExposureIndex(profile_, minimumEnergy);
++	float maximumIndex = aeExposureIndex(profile_, maximumEnergy);
+ 	if (aeLocked_) {
+ 		float evDelta = aeEvOffset(aeEvStep_, profile_.aeLuxLogScale) -
+ 				aeEvOffset(lockedEvStep_, profile_.aeLuxLogScale);
+@@ -2318,22 +2352,12 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 
+ 		double corrected = aeExposureForIndex(profile_, activeIndex);
+ 		if (activeIndex == minimumIndex)
+-			corrected = exposureMin_ * lineDurationNs_ * gainMin_;
++			corrected = minimumEnergy;
+ 		else if (activeIndex == maximumIndex)
+-			corrected = exposureMax_ * lineDurationNs_ * gainMax_;
+-		double allocatedGain, allocatedExposure;
+-		aeAllocateExposure(profile_, corrected, allocatedGain, allocatedExposure);
+-
+-		double exposureMinNs = exposureMin_ * lineDurationNs_;
+-		double exposureMaxNs = exposureMax_ * lineDurationNs_;
+-		allocatedGain = std::clamp(allocatedGain, gainMin_, gainMax_);
+-		allocatedExposure = std::clamp(corrected / allocatedGain,
+-					       exposureMinNs, exposureMaxNs);
+-		allocatedGain = std::clamp(corrected / allocatedExposure,
+-					   gainMin_, gainMax_);
+-
+-		aeExposure_ = allocatedExposure / lineDurationNs_;
+-		aeGain_ = allocatedGain;
++			corrected = maximumEnergy;
++		const auto [exposure, gain] = allocateExposure(corrected, limits);
++		aeExposure_ = exposure / lineDurationNs_;
++		aeGain_ = gain;
+ 
+ 		LOG(QcomPipeline, Debug) << "AE locked luma " << luma << " target " << target
+ 					 << " index " << *luxIndex_ << " exposure "
+@@ -2368,25 +2392,16 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 	double corrected = aeExposureForIndex(profile_, result.index);
+ 	/* Preserve exact control limits when their float indices are rounded. */
+ 	if (result.index == minimumIndex)
+-		corrected = exposureMin_ * lineDurationNs_ * gainMin_;
++		corrected = minimumEnergy;
+ 	else if (result.index == maximumIndex)
+-		corrected = exposureMax_ * lineDurationNs_ * gainMax_;
+-	double allocatedGain, allocatedExposure;
+-	aeAllocateExposure(profile_, corrected, allocatedGain, allocatedExposure);
+-
+-	double exposureMinNs = exposureMin_ * lineDurationNs_;
+-	double exposureMaxNs = exposureMax_ * lineDurationNs_;
+-	allocatedGain = std::clamp(allocatedGain, gainMin_, gainMax_);
+-	allocatedExposure = std::clamp(corrected / allocatedGain,
+-				       exposureMinNs, exposureMaxNs);
+-	allocatedGain = std::clamp(corrected / allocatedExposure,
+-				   gainMin_, gainMax_);
++		corrected = maximumEnergy;
++	auto [allocatedExposure, allocatedGain] = allocateExposure(corrected, limits);
+ 
+ 	/* Motion AEC Shutter Control:
+ 	 * Restrict to IMX363 binned/viewfinder modes (modes 2/12) matching OEM 0xfb90 gating.
+ 	 */
+ 	bool isApplicableMode = isMotionApplicable(sensorModel_, inputSize_, profile_.nativeInputSize);
+-	if (isApplicableMode && aeEnabled_ && !aeLocked_) {
++	if (isApplicableMode && autoExposure_ && autoGain_) {
+ 		float bgGr[3072];
+ 		uint32_t validRegions = 0;
+ 		const uint32_t *awbData = awb_.data();
+@@ -2446,8 +2461,6 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 					<< " energy " << adj.actualEnergy << " ratio " << adj.energyRatio;
+ 			}
+ 		}
+-	} else if (!aeEnabled_ || aeLocked_) {
+-		aeMotion_.reset();
+ 	}
+ 
+ 	aeExposure_ = allocatedExposure / lineDurationNs_;
+@@ -2914,7 +2927,7 @@ int QcomCameraData::setOisMode(int32_t mode)
+ 
+ std::pair<double, double> QcomCameraData::quantizedExposureForFlicker(double exposure, double gain) const
+ {
+-	if (!aeEnabled_ || flickerMode_ != controls::FlickerManual || !flickerPeriod_)
++	if (!autoExposure_ || flickerMode_ != controls::FlickerManual || !flickerPeriod_)
+ 		return { exposure, gain };
+ 
+ 	double period = flickerPeriod_ * 1000.0 / lineDurationNs_;
+@@ -2926,7 +2939,9 @@ std::pair<double, double> QcomCameraData::quantizedExposureForFlicker(double exp
+ 	double quantized = std::clamp(std::round(periods * period),
+ 				      static_cast<double>(exposureMin_),
+ 				      static_cast<double>(exposureMax_));
+-	double adjustedGain = std::clamp(gain * exposure / quantized, gainMin_, gainMax_);
++	double adjustedGain = autoGain_
++		? std::clamp(gain * exposure / quantized, gainMin_, gainMax_)
++		: gain;
+ 	return { quantized, adjustedGain };
+ }
+ 
+@@ -2982,44 +2997,38 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		updateAfWeights();
+ 		afWindowUpdated = true;
+ 	}
+-	if (controls.contains(controls::AeEnable.id())) {
+-		bool enabled = *controls.get(controls::AeEnable);
+-		bool resumeAuto = enabled && !aeEnabled_;
+-		if (enabled != aeEnabled_) {
+-			aeEnabled_ = enabled;
+-			aeMotion_.reset();
+-		}
+-		if (resumeAuto && aeLocked_) {
+-			int32_t expLines = std::lround(aeExposure_);
+-			int32_t gainCode = gainToCode(profile_, aeGain_);
+-			double total = expLines * lineDurationNs_ * gainFromCode(profile_, gainCode);
+-			lockedIndex_ = aeExposureIndex(profile_, total);
+-			lockedEvStep_ = aeEvStep_;
+-		}
+-		if (!aeEnabled_) {
+-			if (controls.contains(controls::ExposureTime.id())) {
+-				int32_t us = *controls.get(controls::ExposureTime);
+-				aeExposure_ = std::clamp(us * 1000.0 / lineDurationNs_,
+-							 static_cast<double>(exposureMin_),
+-							 static_cast<double>(exposureMax_));
+-			}
+-			if (controls.contains(controls::AnalogueGain.id()))
+-				aeGain_ = std::clamp(static_cast<double>(*controls.get(controls::AnalogueGain)),
+-						     static_cast<double>(gainMin_),
+-						     static_cast<double>(gainMax_));
+-		}
+-	} else if (!aeEnabled_) {
+-		if (controls.contains(controls::ExposureTime.id())) {
+-			int32_t us = *controls.get(controls::ExposureTime);
+-			aeExposure_ = std::clamp(us * 1000.0 / lineDurationNs_,
+-						 static_cast<double>(exposureMin_),
+-						 static_cast<double>(exposureMax_));
+-		}
+-		if (controls.contains(controls::AnalogueGain.id())) {
+-			aeGain_ = std::clamp(static_cast<double>(*controls.get(controls::AnalogueGain)),
+-					     static_cast<double>(gainMin_),
+-					     static_cast<double>(gainMax_));
+-		}
++	bool autoExposure = autoExposure_;
++	bool autoGain = autoGain_;
++	if (auto enable = controls.get(controls::AeEnable))
++		autoExposure = autoGain = *enable;
++	if (auto mode = controls.get(controls::ExposureTimeMode))
++		autoExposure = *mode == controls::ExposureTimeModeAuto;
++	if (auto mode = controls.get(controls::AnalogueGainMode))
++		autoGain = *mode == controls::AnalogueGainModeAuto;
++
++	bool resumeAuto = (autoExposure || autoGain) && !aeEnabled();
++	if (autoExposure != autoExposure_ || autoGain != autoGain_) {
++		autoExposure_ = autoExposure;
++		autoGain_ = autoGain;
++		aeMotion_.reset();
++		aeSettled_ = false;
++	}
++	if (!autoExposure_) {
++		if (auto exposure = controls.get(controls::ExposureTime))
++			aeExposure_ = std::clamp(*exposure * 1000.0 / lineDurationNs_,
++						static_cast<double>(exposureMin_),
++						static_cast<double>(exposureMax_));
++	}
++	if (!autoGain_) {
++		if (auto gain = controls.get(controls::AnalogueGain))
++			aeGain_ = std::clamp(static_cast<double>(*gain), gainMin_, gainMax_);
++	}
++	if (resumeAuto && aeLocked_) {
++		const int32_t expLines = std::lround(aeExposure_);
++		const int32_t gainCode = gainToCode(profile_, aeGain_);
++		const double total = expLines * lineDurationNs_ * gainFromCode(profile_, gainCode);
++		lockedIndex_ = aeExposureIndex(profile_, total);
++		lockedEvStep_ = aeEvStep_;
+ 	}
+ 
+ 	if (controls.contains(controls::draft::AeLock.id())) {
+@@ -3041,7 +3050,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		}
+ 	}
+ 
+-	if (aeEnabled_ && controls.contains(controls::ExposureValue.id()))
++	if (aeEnabled() && controls.contains(controls::ExposureValue.id()))
+ 		aeEvStep_ = aeEvStep(*controls.get(controls::ExposureValue));
+ 
+ 	if (flash_) {
+@@ -3285,7 +3294,11 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 	if (!sensor_->testPatternModes().empty())
+ 		metadata.set(controls::draft::TestPatternMode, context.testPatternMode);
+ 
+-	metadata.set(controls::AeEnable, context.aeEnabled);
++	metadata.set(controls::AeEnable, context.autoExposure || context.autoGain);
++	metadata.set(controls::ExposureTimeMode, context.autoExposure ? controls::ExposureTimeModeAuto
++								     : controls::ExposureTimeModeManual);
++	metadata.set(controls::AnalogueGainMode, context.autoGain ? controls::AnalogueGainModeAuto
++								 : controls::AnalogueGainModeManual);
+ 	metadata.set(controls::draft::AeLock, context.aeLocked);
+ 	metadata.set(controls::ExposureValue, context.exposureValue);
+ 	metadata.set(controls::AeState, context.aeState);
+@@ -3507,7 +3520,8 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->histogramTarget_.reset();
+ 	data->aecLuma_.reset();
+ 	data->aeTargetLuma_.reset();
+-	data->aeEnabled_ = true;
++	data->autoExposure_ = true;
++	data->autoGain_ = true;
+ 	data->aeEvStep_ = 0;
+ 	data->flickerMode_ = controls::FlickerOff;
+ 	data->flickerPeriod_ = 0;

@@ -1,0 +1,166 @@
+From 6a9bfc2681f38840959b6a85cd4e919228f8ca1c Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu@localhost>
+Date: Tue, 24 Nov 2026 14:50:17 +0800
+Subject: [PATCH] qcom: calibrate exposure-start timestamps and FC4 stability
+
+---
+ src/libcamera/pipeline/qcom/qcom.cpp | 84 ++++++++++++++++++++--------
+ 1 file changed, 62 insertions(+), 22 deletions(-)
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 9afd26e..7a69093 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -1352,8 +1352,8 @@ public:
+ 	FC4Engine *fc4Engine_ = nullptr;
+ 	uint64_t fc4Generation_ = 1;
+ 	uint32_t fc4StableCount_ = 0;
+-	int currAeStep_ = 0;
+-	int targetAeStep_ = 0;
++	std::optional<float> fc4RefLuma_;
++	std::optional<std::array<float, 2>> fc4RefBgRatio_;
+ 	std::optional<std::array<float, 4>> latestIqm_;
+ 	uint32_t lastIqmSequence_ = 0;
+ 	Size inputSize_{};
+@@ -2703,8 +2703,8 @@ void QcomCameraData::resetAwbProcessing()
+ 	if (fc4Engine_)
+ 		fc4Engine_->reset(sensorModel_, fc4Generation_);
+ 	fc4StableCount_ = 0;
+-	currAeStep_ = 0;
+-	targetAeStep_ = 0;
++	fc4RefLuma_.reset();
++	fc4RefBgRatio_.reset();
+ 	latestIqm_ = std::nullopt;
+ 	latestFilteredOutdoorProb_ = 0.0f;
+ 	aeTargetLuma_.reset();
+@@ -3210,8 +3210,18 @@ int QcomCameraData::completeIfe(FrameBuffer *buffer, uint32_t sequence)
+ 	int64_t offset = boottimeOffsetNs();
+ 	if (offset < 0)
+ 		return static_cast<int>(offset);
+-	buffer->request()->_d()->metadata().set(controls::SensorTimestamp,
+-					      config.sensor_timestamp + static_cast<uint64_t>(offset));
++	/*
++	 * CAMIF SOF is latched when row-0 readout begins (exposure end);
++	 * subtract applied integration time to report first-row exposure start.
++	 */
++	uint64_t exposureNs = 0;
++	if (context.sensor.contains(V4L2_CID_EXPOSURE)) {
++		int32_t lines = context.sensor.get(V4L2_CID_EXPOSURE).get<int32_t>();
++		exposureNs = static_cast<uint64_t>(std::max<int64_t>(0, std::llround(lines * lineDurationNs_)));
++	}
++	uint64_t boottimeSofNs = config.sensor_timestamp + static_cast<uint64_t>(offset);
++	uint64_t exposureStartNs = boottimeSofNs > exposureNs ? boottimeSofNs - exposureNs : 0;
++	buffer->request()->_d()->metadata().set(controls::SensorTimestamp, exposureStartNs);
+ 	return 0;
+ }
+ 
+@@ -3511,8 +3521,6 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 		LOG(QcomPipeline, Debug) << "AE locked luma " << luma << " target " << target
+ 					 << " index " << *luxIndex_ << " exposure "
+ 					 << aeExposure_ << " gain " << aeGain_;
+-		currAeStep_ = std::lround(currentIndex / profile_.aeUnitStep);
+-		targetAeStep_ = std::lround(targetIndex / profile_.aeUnitStep);
+ 		return true;
+ 	}
+ 	uint32_t nextRequest;
+@@ -3529,8 +3537,6 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 		aggressiveness };
+ 	auto result = aeConvergeFast(convergence, currentIndex, appliedIndex, targetIndex,
+ 				     minimumIndex, maximumIndex, latency);
+-	currAeStep_ = std::lround(result.index / profile_.aeUnitStep);
+-	targetAeStep_ = std::lround(targetIndex / profile_.aeUnitStep);
+ 	LOG(QcomPipeline, Debug) << std::setprecision(9)
+ 		<< "AE convergence frame " << sequence << " current " << currentIndex
+ 		<< " applied " << appliedIndex << " target " << targetIndex
+@@ -3736,12 +3742,34 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 	float curLuma = static_cast<float>(aecLuma_.value_or(0.0) / kAeTargetScale);
+ 	float tgtLuma = static_cast<float>(aeTargetLuma_.value_or(curLuma));
+ 	float lumaTol = static_cast<float>(profile_.aeToleranceSteps);
+-	bool isStable = (currAeStep_ == targetAeStep_) &&
+-			(std::abs(curLuma - tgtLuma) <= lumaTol);
+-	if (isStable)
+-		fc4StableCount_++;
+-	else
++	double sumR = 0.0, sumG = 0.0, sumB = 0.0;
++	for (const auto &cell : lgBg_.rgb) {
++		if (cell[1] > 1.0f) {
++			sumR += cell[0];
++			sumG += cell[1];
++			sumB += cell[2];
++		}
++	}
++	bool validBg = sumG > 1.0;
++	float bgR = validBg ? static_cast<float>(sumR / sumG) : 0.0f;
++	float bgB = validBg ? static_cast<float>(sumB / sumG) : 0.0f;
++
++	/*
++	 * Gate full FC4 throttling on settled AE + steady scene luma/chromaticity rather
++	 * than exact AE step equality, which deadbands never reach and which starves
++	 * rail-saturated low-light frames at 60/120 fps.
++	 */
++	if (!aeSettled) {
+ 		fc4StableCount_ = 0;
++	} else if (!fc4RefLuma_) {
++		fc4StableCount_ = 1;
++	} else {
++		bool sameLuma = std::abs(curLuma - *fc4RefLuma_) <= lumaTol;
++		bool sameColor = !validBg || !fc4RefBgRatio_ ||
++				 (std::abs(bgR - (*fc4RefBgRatio_)[0]) <= 0.03f &&
++				  std::abs(bgB - (*fc4RefBgRatio_)[1]) <= 0.03f);
++		fc4StableCount_ = (sameLuma && sameColor) ? (fc4StableCount_ + 1) : 1;
++	}
+ 
+ 	if (fc4Engine_ && lgAwb_) {
+ 		FC4Snapshot snap;
+@@ -3755,7 +3783,11 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 		snap.targetLuma = tgtLuma;
+ 		snap.bgRgb = lgBg_.rgb;
+ 		snap.calibration = awbCalibration_;
+-		fc4Engine_->submitSnapshot(snap);
++		if (fc4Engine_->submitSnapshot(snap) && snap.stableCount <= 30) {
++			fc4RefLuma_ = curLuma;
++			if (validBg)
++				fc4RefBgRatio_ = std::array<float, 2>{ bgR, bgB };
++		}
+ 
+ 		auto res = fc4Engine_->popResult(sensorModel_, fc4Generation_);
+ 		if (res) {
+@@ -5684,12 +5716,20 @@ void QcomCameraData::rawBufferReady(FrameBuffer *buffer)
+ 	if (buffer->metadata().status == FrameMetadata::FrameSuccess &&
+ 	    !request->findBuffer(&stream_)) {
+ 		ControlList &metadata = request->_d()->metadata();
+-		int64_t offset = boottimeOffsetNs();
+-		if (offset >= 0)
+-			metadata.set(controls::SensorTimestamp,
+-				     buffer->metadata().timestamp + static_cast<uint64_t>(offset));
+ 		int32_t exposure = std::clamp(static_cast<int32_t>(std::lround(aeExposure_)),
+ 					      exposureMin_, exposureMax_);
++		int64_t offset = boottimeOffsetNs();
++		if (offset >= 0) {
++			/* Raw WM_DONE timestamp is EOF (= SOF + readout); shift back to row-0 exposure start. */
++			uint64_t boottimeEofNs = buffer->metadata().timestamp + static_cast<uint64_t>(offset);
++			uint64_t readoutNs = static_cast<uint64_t>(
++				std::max<int64_t>(0, std::llround(inputSize_.height * lineDurationNs_)));
++			uint64_t exposureNs = static_cast<uint64_t>(
++				std::max<int64_t>(0, std::llround(exposure * lineDurationNs_)));
++			uint64_t totalShiftNs = readoutNs + exposureNs;
++			uint64_t exposureStartNs = boottimeEofNs > totalShiftNs ? boottimeEofNs - totalShiftNs : 0;
++			metadata.set(controls::SensorTimestamp, exposureStartNs);
++		}
+ 		metadata.set(controls::ExposureTime,
+ 			     static_cast<int32_t>(exposure * lineDurationNs_ / 1000.0));
+ 		metadata.set(controls::AnalogueGain, static_cast<float>(aeGain_));
+@@ -6095,8 +6135,8 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	if (data->pixConfigured_)
+ 		data->syncBfRoi();
+ 	data->fc4StableCount_ = 0;
+-	data->currAeStep_ = 0;
+-	data->targetAeStep_ = 0;
++	data->fc4RefLuma_.reset();
++	data->fc4RefBgRatio_.reset();
+ 	data->latestFilteredOutdoorProb_ = 0.0f;
+ 	data->aeMotion_.reset();
+ 	data->frameStates_.clear();
+-- 
+2.55.0
+

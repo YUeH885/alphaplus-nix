@@ -1,0 +1,1096 @@
+diff --git a/src/libcamera/pipeline/qcom/flicker_detector.h b/src/libcamera/pipeline/qcom/flicker_detector.h
+new file mode 100644
+index 0000000..f3bc79c
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/flicker_detector.h
+@@ -0,0 +1,452 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Spatio-temporal 50 Hz / 60 Hz rolling-shutter flicker detector driven by
++ * CAMSS 64x48 AWB Bayer Grid statistics.
++ */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++
++namespace libcamera::qcom {
++
++class FlickerDetector
++{
++public:
++	static constexpr unsigned int kCols = 64;
++	static constexpr unsigned int kRows = 48;
++	static constexpr unsigned int kRegionWords = 12;
++	static constexpr std::size_t kWindowFrames = 16;
++	static constexpr int32_t kPeriod50HzUs = 10000;
++	static constexpr int32_t kPeriod60HzUs = 8333;
++
++	void reset()
++	{
++		frames_.clear();
++		hasPrevAsym_ = false;
++		prevAsym_.fill(0.0);
++		detectedPeriod_ = 0;
++		candidatePeriod_ = 0;
++		candidateStreak_ = 0;
++		missStreak_ = 0;
++		framesSinceEval_ = 0;
++	}
++
++	int32_t detectedPeriod() const { return detectedPeriod_; }
++
++	/*
++	 * Feed one 64x48 AWB BG frame and update detectedPeriod().
++	 * rowDurationNs is the rolling-shutter readout time covered by one BG row.
++	 */
++	int32_t update(const uint32_t *awbBg, uint64_t timestampNs,
++		       double rowDurationNs, double exposureNs)
++	{
++		if (!awbBg || rowDurationNs <= 0.0 || exposureNs <= 0.0)
++			return detectedPeriod_;
++
++		FrameSample sample{};
++		if (!extractSample(awbBg, timestampNs, exposureNs, sample))
++			return detectedPeriod_;
++
++		if (!frames_.empty()) {
++			const uint64_t prevTs = frames_.back().timestampNs;
++			if (timestampNs <= prevTs || timestampNs - prevTs > 250000000ULL) {
++				frames_.clear();
++				hasPrevAsym_ = false;
++			}
++		}
++
++		/*
++		 * Left/right row asymmetry cancels horizontally uniform AC flicker
++		 * while detecting scene motion or panning.
++		 */
++		std::array<double, kRows> asym{};
++		for (unsigned int r = 0; r < kRows; ++r) {
++			const double denom = sample.left[r] + sample.right[r];
++			asym[r] = denom > 1e-6 ? (sample.left[r] - sample.right[r]) / denom : 0.0;
++		}
++		if (hasPrevAsym_) {
++			double mad = 0.0;
++			for (unsigned int r = 0; r < kRows; ++r)
++				mad += std::abs(asym[r] - prevAsym_[r]);
++			mad /= kRows;
++			if (mad > 0.08) {
++				frames_.clear();
++				framesSinceEval_ = 0;
++			}
++		}
++		prevAsym_ = asym;
++		hasPrevAsym_ = true;
++
++		frames_.push_back(sample);
++		if (frames_.size() > kWindowFrames)
++			frames_.pop_front();
++
++		if (frames_.size() < kWindowFrames)
++			return detectedPeriod_;
++
++		if (++framesSinceEval_ < 4 && frames_.size() == kWindowFrames && detectedPeriod_ != 0)
++			return detectedPeriod_;
++		framesSinceEval_ = 0;
++
++		evaluate(rowDurationNs);
++		return detectedPeriod_;
++	}
++
++private:
++	struct FrameSample {
++		uint64_t timestampNs = 0;
++		double exposureNs = 0.0;
++		std::array<double, kRows> mean{};
++		std::array<double, kRows> left{};
++		std::array<double, kRows> right{};
++	};
++
++	struct SpectrumMetrics {
++		double power = 0.0;
++		double amplitude = 0.0;
++		double coherence = 0.0;
++	};
++
++	static bool extractSample(const uint32_t *awbBg, uint64_t timestampNs,
++				  double exposureNs, FrameSample &out)
++	{
++		uint64_t totalCount = 0;
++		uint64_t satCount = 0;
++		double frameSum = 0.0;
++		double leftMean = 0.0;
++		double rightMean = 0.0;
++
++		for (unsigned int r = 0; r < kRows; ++r) {
++			uint64_t lSum = 0, lCnt = 0;
++			uint64_t rSum = 0, rCnt = 0;
++			for (unsigned int c = 0; c < kCols; ++c) {
++				const uint32_t *reg = awbBg + (r * kCols + c) * kRegionWords;
++				const uint64_t grSum = reg[2] & 0x3fffffffU;
++				const uint64_t gbSum = reg[3] & 0x3fffffffU;
++				const uint64_t grCnt = reg[5] & 0xffffU;
++				const uint64_t gbCnt = (reg[5] >> 16) & 0xffffU;
++				const uint64_t sGrCnt = reg[11] & 0xffffU;
++				const uint64_t sGbCnt = (reg[11] >> 16) & 0xffffU;
++				const uint64_t gCnt = grCnt + gbCnt;
++				const uint64_t gSum = grSum + gbSum;
++
++				totalCount += gCnt + sGrCnt + sGbCnt;
++				satCount += sGrCnt + sGbCnt;
++				if (c < kCols / 2) {
++					lSum += gSum;
++					lCnt += gCnt;
++				} else {
++					rSum += gSum;
++					rCnt += gCnt;
++				}
++			}
++			if (!lCnt || !rCnt)
++				return false;
++			out.left[r] = static_cast<double>(lSum) / lCnt;
++			out.right[r] = static_cast<double>(rSum) / rCnt;
++			out.mean[r] = static_cast<double>(lSum + rSum) / (lCnt + rCnt);
++			frameSum += out.mean[r];
++			leftMean += out.left[r];
++			rightMean += out.right[r];
++		}
++
++		if (!totalCount || satCount * 4 > totalCount)
++			return false;
++
++		frameSum /= kRows;
++		leftMean /= kRows;
++		rightMean /= kRows;
++		if (frameSum < 16.0 || leftMean < 8.0 || rightMean < 8.0)
++			return false;
++
++		for (unsigned int r = 0; r < kRows; ++r) {
++			out.mean[r] /= frameSum;
++			out.left[r] /= leftMean;
++			out.right[r] /= rightMean;
++		}
++		out.timestampNs = timestampNs;
++		out.exposureNs = exposureNs;
++		return true;
++	}
++
++	static double exposureSensitivity(double freqHz, double exposureSec)
++	{
++		const double x = M_PI * freqHz * exposureSec;
++		if (x < 1e-6)
++			return 1.0;
++		return std::abs(std::sin(x) / x);
++	}
++
++	static double hann(std::size_t i, std::size_t n)
++	{
++		if (n <= 1)
++			return 1.0;
++		return 0.5 * (1.0 - std::cos(2.0 * M_PI * static_cast<double>(i) / (n - 1)));
++	}
++
++	static void detrendQuadratic(std::array<double, kRows> &v)
++	{
++		/* Orthogonal least-squares fit on centered x in [-1, 1]. */
++		double s0 = 0.0, s2 = 0.0, s4 = 0.0;
++		double y0 = 0.0, y1 = 0.0, y2 = 0.0;
++		for (unsigned int r = 0; r < kRows; ++r) {
++			const double x = 2.0 * static_cast<double>(r) / (kRows - 1) - 1.0;
++			const double x2 = x * x;
++			s0 += 1.0;
++			s2 += x2;
++			s4 += x2 * x2;
++			y0 += v[r];
++			y1 += x * v[r];
++			y2 += x2 * v[r];
++		}
++		const double det = s0 * s4 - s2 * s2;
++		const double c0 = (s4 * y0 - s2 * y2) / det;
++		const double c1 = y1 / s2;
++		const double c2 = (s0 * y2 - s2 * y0) / det;
++		for (unsigned int r = 0; r < kRows; ++r) {
++			const double x = 2.0 * static_cast<double>(r) / (kRows - 1) - 1.0;
++			v[r] -= c0 + c1 * x + c2 * x * x;
++		}
++	}
++
++	double temporalPhaseLockMetric(double freqHz) const
++	{
++		const uint64_t t0 = frames_.front().timestampNs;
++		double re = 0.0, im = 0.0;
++		for (const auto &f : frames_) {
++			const double t = static_cast<double>(f.timestampNs - t0) * 1e-9;
++			const double angle = 2.0 * M_PI * freqHz * t;
++			re += std::cos(angle);
++			im += std::sin(angle);
++		}
++		return std::hypot(re, im) / static_cast<double>(frames_.size());
++	}
++
++	SpectrumMetrics temporalSpectrum(double freqHz, double rowDurationSec,
++					 const std::array<double, kRows> &meanBar,
++					 const std::array<double, kRows> &leftBar,
++					 const std::array<double, kRows> &rightBar) const
++	{
++		const uint64_t t0 = frames_.front().timestampNs;
++		const std::size_t w = frames_.size();
++		double reM = 0.0, imM = 0.0;
++		double reL = 0.0, imL = 0.0;
++		double reR = 0.0, imR = 0.0;
++		double weightSum = 0.0;
++
++		for (std::size_t k = 0; k < w; ++k) {
++			const double wk = hann(k, w);
++			const double tk = static_cast<double>(frames_[k].timestampNs - t0) * 1e-9;
++			for (unsigned int r = 0; r < kRows; ++r) {
++				const double wr = wk * hann(r, kRows);
++				const double phase = 2.0 * M_PI * freqHz * (tk + r * rowDurationSec);
++				const double c = std::cos(phase);
++				const double s = -std::sin(phase);
++
++				const double dm = (frames_[k].mean[r] - meanBar[r]) / std::max(meanBar[r], 0.1);
++				const double dl = (frames_[k].left[r] - leftBar[r]) / std::max(leftBar[r], 0.1);
++				const double dr = (frames_[k].right[r] - rightBar[r]) / std::max(rightBar[r], 0.1);
++
++				reM += wr * dm * c;
++				imM += wr * dm * s;
++				reL += wr * dl * c;
++				imL += wr * dl * s;
++				reR += wr * dr * c;
++				imR += wr * dr * s;
++				weightSum += wr;
++			}
++		}
++
++		if (weightSum <= 0.0)
++			return {};
++
++		reM /= weightSum;
++		imM /= weightSum;
++		reL /= weightSum;
++		imL /= weightSum;
++		reR /= weightSum;
++		imR /= weightSum;
++
++		const double ampM = std::hypot(reM, imM);
++		const double ampL = std::hypot(reL, imL);
++		const double ampR = std::hypot(reR, imR);
++		const double coherence = (reL * reR + imL * imR) / (ampL * ampR + 1e-12);
++		return { ampM * ampM, ampM, coherence };
++	}
++
++	static SpectrumMetrics spatialSpectrum(double freqHz, double rowDurationSec,
++					       const std::array<double, kRows> &detrendM,
++					       const std::array<double, kRows> &detrendL,
++					       const std::array<double, kRows> &detrendR)
++	{
++		double reM = 0.0, imM = 0.0;
++		double reL = 0.0, imL = 0.0;
++		double reR = 0.0, imR = 0.0;
++		double weightSum = 0.0;
++
++		for (unsigned int r = 0; r < kRows; ++r) {
++			const double wr = hann(r, kRows);
++			const double phase = 2.0 * M_PI * freqHz * (r * rowDurationSec);
++			const double c = std::cos(phase);
++			const double s = -std::sin(phase);
++			reM += wr * detrendM[r] * c;
++			imM += wr * detrendM[r] * s;
++			reL += wr * detrendL[r] * c;
++			imL += wr * detrendL[r] * s;
++			reR += wr * detrendR[r] * c;
++			imR += wr * detrendR[r] * s;
++			weightSum += wr;
++		}
++
++		if (weightSum <= 0.0)
++			return {};
++
++		reM /= weightSum;
++		imM /= weightSum;
++		reL /= weightSum;
++		imL /= weightSum;
++		reR /= weightSum;
++		imR /= weightSum;
++
++		const double ampM = std::hypot(reM, imM);
++		const double ampL = std::hypot(reL, imL);
++		const double ampR = std::hypot(reR, imR);
++		const double coherence = (reL * reR + imL * imR) / (ampL * ampR + 1e-12);
++		return { ampM * ampM, ampM, coherence };
++	}
++
++	void evaluate(double rowDurationNs)
++	{
++		const double rowDurationSec = rowDurationNs * 1e-9;
++		const std::size_t w = frames_.size();
++
++		double avgExpSec = 0.0;
++		std::array<double, kRows> meanBar{};
++		std::array<double, kRows> leftBar{};
++		std::array<double, kRows> rightBar{};
++		for (const auto &f : frames_) {
++			avgExpSec += f.exposureNs * 1e-9;
++			for (unsigned int r = 0; r < kRows; ++r) {
++				meanBar[r] += f.mean[r];
++				leftBar[r] += f.left[r];
++				rightBar[r] += f.right[r];
++			}
++		}
++		avgExpSec /= w;
++		for (unsigned int r = 0; r < kRows; ++r) {
++			meanBar[r] /= w;
++			leftBar[r] /= w;
++			rightBar[r] /= w;
++		}
++
++		std::array<double, kRows> detrendM = meanBar;
++		std::array<double, kRows> detrendL = leftBar;
++		std::array<double, kRows> detrendR = rightBar;
++		detrendQuadratic(detrendM);
++		detrendQuadratic(detrendL);
++		detrendQuadratic(detrendR);
++
++		static constexpr double kNoiseFreqs[] = { 75.0, 85.0, 110.0, 135.0, 150.0 };
++		double temporalNoise = 0.0;
++		for (double nf : kNoiseFreqs)
++			temporalNoise += temporalSpectrum(nf, rowDurationSec, meanBar, leftBar, rightBar).power;
++		temporalNoise /= std::size(kNoiseFreqs);
++
++		/*
++		 * For 1D spatial analysis, place noise probes well outside the Hann
++		 * main lobe (width ~2 / T_readout) so 100/120 Hz energy does not leak
++		 * into the background estimate.
++		 */
++		const double frameReadoutSec = rowDurationSec * kRows;
++		const double spatialBaseHz = frameReadoutSec > 0.0 ? 1.0 / frameReadoutSec : 100.0;
++		double spatialNoise = 0.0;
++		for (unsigned int k = 0; k < 4; ++k) {
++			const double nf = 120.0 + (3.0 + k) * spatialBaseHz;
++			spatialNoise += spatialSpectrum(nf, rowDurationSec, detrendM, detrendL, detrendR).power;
++		}
++		spatialNoise /= 4.0;
++
++		struct Candidate {
++			double freqHz;
++			int32_t periodUs;
++			double score;
++			bool sensitive;
++		};
++		std::array<Candidate, 2> candidates = { {
++			{ 100.0, kPeriod50HzUs, 0.0, true },
++			{ 120.0, kPeriod60HzUs, 0.0, true },
++		} };
++
++		for (auto &cand : candidates) {
++			const double sens = exposureSensitivity(cand.freqHz, avgExpSec);
++			cand.sensitive = sens >= 0.18;
++			if (!cand.sensitive)
++				continue;
++
++			const double phaseLock = temporalPhaseLockMetric(cand.freqHz);
++			if (phaseLock < 0.70) {
++				const auto spec = temporalSpectrum(cand.freqHz, rowDurationSec,
++								   meanBar, leftBar, rightBar);
++				const double snr = spec.power / (temporalNoise + 1e-10);
++				if (snr >= 8.0 && spec.coherence >= 0.50 && spec.amplitude >= 0.004)
++					cand.score = snr * spec.coherence;
++			} else if (rowDurationSec * kRows * cand.freqHz >= 0.85) {
++				/*
++				 * When flicker is phase-locked to frame rate (e.g. 120 Hz at
++				 * 60 fps), require strong horizontal left/right coherence across
++				 * the averaged frame to reject static scene structure.
++				 */
++				const auto spec = spatialSpectrum(cand.freqHz, rowDurationSec,
++								  detrendM, detrendL, detrendR);
++				const double snr = spec.power / (spatialNoise + 1e-10);
++				if (snr >= 12.0 && spec.coherence >= 0.85 && spec.amplitude >= 0.012)
++					cand.score = snr * spec.coherence;
++			}
++		}
++
++		int32_t winner = 0;
++		if (candidates[0].score > 0.0 && candidates[0].score > 1.5 * candidates[1].score)
++			winner = candidates[0].periodUs;
++		else if (candidates[1].score > 0.0 && candidates[1].score > 1.5 * candidates[0].score)
++			winner = candidates[1].periodUs;
++
++		if (winner != 0) {
++			missStreak_ = 0;
++			if (winner == candidatePeriod_) {
++				candidateStreak_++;
++			} else {
++				candidatePeriod_ = winner;
++				candidateStreak_ = 1;
++			}
++			if (candidateStreak_ >= 3)
++				detectedPeriod_ = winner;
++		} else {
++			/* Hold an existing lock while quantized exposure suppresses its ripple. */
++			const bool lockedSuppressed =
++				(detectedPeriod_ == kPeriod50HzUs && !candidates[0].sensitive) ||
++				(detectedPeriod_ == kPeriod60HzUs && !candidates[1].sensitive);
++			if (!lockedSuppressed) {
++				candidatePeriod_ = 0;
++				candidateStreak_ = 0;
++				if (++missStreak_ >= 4)
++					detectedPeriod_ = 0;
++			}
++		}
++	}
++
++	std::deque<FrameSample> frames_;
++	bool hasPrevAsym_ = false;
++	std::array<double, kRows> prevAsym_{};
++	int32_t detectedPeriod_ = 0;
++	int32_t candidatePeriod_ = 0;
++	unsigned int candidateStreak_ = 0;
++	unsigned int missStreak_ = 0;
++	unsigned int framesSinceEval_ = 0;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 7771474..c1d2d87 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -62,6 +62,7 @@
+ 
+ #include "qcom_camss.h"
+ #include "fc4_engine.h"
++#include "flicker_detector.h"
+ #include "lg_ae_motion.h"
+ #include "lg_awb_dnn_tuning.h"
+ #include "awb_front.h"
+@@ -398,6 +399,7 @@ struct SensorProfile {
+ 	const Size *outputSizes;
+ 	std::size_t outputSizeCount;
+ 	Size defaultOutputSize;
++	double fNumber;
+ 	GainModel gainModel;
+ 	const CcmEntry *ccmEntries;
+ 	std::size_t ccmEntryCount;
+@@ -430,6 +432,7 @@ constexpr SensorProfile kS5k3m5Profile = {
+ 	.outputSizes = kOutputSizes,
+ 	.outputSizeCount = std::size(kOutputSizes),
+ 	.defaultOutputSize = kNativeSize,
++	.fNumber = 2.4,
+ 	.gainModel = GainModel::Linear32,
+ 	.ccmEntries = kCcmEntries,
+ 	.ccmEntryCount = std::size(kCcmEntries),
+@@ -461,6 +464,7 @@ constexpr SensorProfile kImx363Profile = {
+ 	.outputSizes = kOutputSizes,
+ 	.outputSizeCount = std::size(kOutputSizes),
+ 	.defaultOutputSize = kNativeSize,
++	.fNumber = 1.5,
+ 	.gainModel = GainModel::SonyInverse512,
+ 	.ccmEntries = kImx363CcmEntries,
+ 	.ccmEntryCount = std::size(kImx363CcmEntries),
+@@ -492,6 +496,7 @@ constexpr SensorProfile kImx351Profile = {
+ 	.outputSizes = kImx351OutputSizes,
+ 	.outputSizeCount = std::size(kImx351OutputSizes),
+ 	.defaultOutputSize = kNativeSize,
++	.fNumber = 1.9,
+ 	.gainModel = GainModel::SonyInverse1024,
+ 	.ccmEntries = kImx351CcmEntries,
+ 	.ccmEntryCount = std::size(kImx351CcmEntries),
+@@ -523,6 +528,7 @@ constexpr SensorProfile kImx520Profile = {
+ 	.outputSizes = kImx520OutputSizes,
+ 	.outputSizeCount = std::size(kImx520OutputSizes),
+ 	.defaultOutputSize = { 1632, 924 },
++	.fNumber = 1.7,
+ 	.gainModel = GainModel::SonyInverse1024,
+ 	.ccmEntries = kImx520CcmEntries,
+ 	.ccmEntryCount = std::size(kImx520CcmEntries),
+@@ -696,6 +702,31 @@ void interpolateCcm(const SensorProfile &profile, double cct,
+ 					       t * (upper.q7[j] - lower.q7[j]));
+ }
+ 
++std::optional<int32_t> awbModePresetCct(int32_t mode)
++{
++	switch (mode) {
++	case controls::AwbIncandescent:
++		return 2850;
++	case controls::AwbTungsten:
++		return 3200;
++	case controls::AwbFluorescent:
++		return 4000;
++	case controls::AwbIndoor:
++		return 3500;
++	case controls::AwbDaylight:
++		return 5500;
++	case controls::AwbCloudy:
++		return 7000;
++	default:
++		return std::nullopt;
++	}
++}
++
++bool isSupportedAwbMode(int32_t mode)
++{
++	return mode == controls::AwbAuto || awbModePresetCct(mode).has_value();
++}
++
+ uint64_t monotonicNs()
+ {
+ 	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+@@ -816,6 +847,10 @@ public:
+ 	void setScalerCrop(const Rectangle &crop);
+ 	Rectangle scalerCropRectangle() const;
+ 	Rectangle minScalerCropRectangle() const;
++	void syncBfRoi();
++	float estimateLux() const;
++	int32_t activeFlickerPeriod() const;
++	void applyAwbTemperature(int32_t cct);
+ 	void resetAwb();
+ 	void resetAwbProcessing();
+ 	int recordFrameState();
+@@ -878,6 +913,7 @@ public:
+ 		double cct = 4250.0;
+ 		bool awbEnabled = true;
+ 		bool awbLocked = false;
++		int32_t awbMode = controls::AwbAuto;
+ 		std::array<float, 9> ccm = {
+ 			214.0f / 128, -93.0f / 128, 7.0f / 128,
+ 			-38.0f / 128, 170.0f / 128, -5.0f / 128,
+@@ -903,6 +939,7 @@ public:
+ 		int32_t aeState;
+ 		int32_t flickerMode;
+ 		int32_t flickerPeriod;
++		int32_t flickerDetected;
+ 		std::array<int64_t, 2> frameDurationLimits;
+ 		int64_t frameDuration = 0;
+ 		Rectangle scalerCrop;
+@@ -924,6 +961,8 @@ public:
+ 	/* AE state. */
+ 	int32_t flickerMode_ = controls::FlickerOff;
+ 	int32_t flickerPeriod_ = 0;
++	int32_t flickerDetected_ = 0;
++	FlickerDetector flickerDetector_;
+ 	bool autoExposure_ = true;
+ 	bool autoGain_ = true;
+ 	bool aeLocked_ = false;
+@@ -969,6 +1008,7 @@ public:
+ 	/* AWB state. */
+ 	bool awbEnabled_ = true;
+ 	bool awbLocked_ = false;
++	int32_t awbMode_ = controls::AwbAuto;
+ 	double awbGainR_ = 1.0;
+ 	double awbGainB_ = 1.0;
+ 	double awbGainG_ = 1.0;
+@@ -1001,6 +1041,10 @@ public:
+ 	Size statsInputSize_;
+ 	Rectangle analogCrop_;
+ 	bool hasScalerCrop_ = false;
++	bool hasBfRoi_ = false;
++	bool bfRoiProgrammed_ = false;
++	qcom_camss_bf_roi activeBfRoi_ = {};
++	qcom_camss_bf_roi programmedBfRoi_ = {};
+ 	Size scalerOutput_;
+ 	qcom_camss_ife_crop defaultScaler_ = {};
+ 	qcom_camss_ife_crop activeScaler_ = {};
+@@ -1428,6 +1472,7 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 	}
+ 
+ 	hasScalerCrop_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_IFE_CROP);
++	hasBfRoi_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_BF_ROI);
+ 	video_->bufferReady.connect(this, &QcomCameraData::imageBufferReady);
+ 
+ 	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
+@@ -1465,7 +1510,8 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 	ctrls[&controls::AnalogueGainMode] = ControlInfo(controls::AnalogueGainModeValues,
+ 						       controls::AnalogueGainModeAuto);
+ 	ctrls[&controls::AeFlickerMode] = ControlInfo(
+-		{ { ControlValue(controls::FlickerOff), ControlValue(controls::FlickerManual) } },
++		{ { ControlValue(controls::FlickerOff), ControlValue(controls::FlickerManual),
++		    ControlValue(controls::FlickerAuto) } },
+ 		ControlValue(controls::FlickerOff));
+ 	ctrls[&controls::AeFlickerPeriod] = ControlInfo(0, 1000000, 0);
+ 	ctrls[&controls::FrameDurationLimits] = frameDurationInfo_;
+@@ -1507,8 +1553,18 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 	}
+ 	ctrls[&controls::AwbEnable] = ControlInfo(false, true, true);
+ 	ctrls[&controls::ColourGains] = ControlInfo(0.25f, 8.0f, 1.0f);
+-	if (qtiAwb_ || lgAwb_)
++	if (qtiAwb_ || lgAwb_) {
++		ctrls[&controls::AwbMode] = ControlInfo(
++			{ { ControlValue(controls::AwbAuto),
++			    ControlValue(controls::AwbIncandescent),
++			    ControlValue(controls::AwbTungsten),
++			    ControlValue(controls::AwbFluorescent),
++			    ControlValue(controls::AwbIndoor),
++			    ControlValue(controls::AwbDaylight),
++			    ControlValue(controls::AwbCloudy) } },
++			ControlValue(controls::AwbAuto));
+ 		ctrls[&controls::ColourTemperature] = ControlInfo(1500, 12000, 5000);
++	}
+ 	if (qtiAwb_ || lgAwb_) {
+ 		ctrls[&controls::draft::FaceDetectMode] = ControlInfo(
+ 			{ { ControlValue(controls::draft::FaceDetectModeOff),
+@@ -1810,6 +1866,11 @@ int QcomCameraData::setFormats(const Size &size, bool updateControls)
+ 		return -EINVAL;
+ 
+ 	ret = refreshSensorInfo(updateControls);
++	if (!ret) {
++		bfRoiProgrammed_ = false;
++		programmedBfRoi_ = {};
++		syncBfRoi();
++	}
+ 	if (!ret && updateControls && hasScalerCrop_) {
+ 		const Rectangle maxCrop = scalerCropRectangle();
+ 		const Rectangle minCrop = minScalerCropRectangle();
+@@ -1861,7 +1922,7 @@ void QcomCameraData::resetAwbProcessing()
+ 		lgBg_ = {};
+ 		lgFaces_.clear();
+ 		reportedFaceScore_ = 0;
+-		if (awbEnabled_) {
++		if (awbEnabled_ && awbMode_ == controls::AwbAuto) {
+ 			setIfeWb(awbInitialGains_[0], awbInitialGains_[1], awbInitialGains_[2]);
+ 			colourTemperature_ = awbInitialCct_;
+ 			interpolateCcm(profile_, colourTemperature_, ccmQ7_);
+@@ -1871,7 +1932,7 @@ void QcomCameraData::resetAwbProcessing()
+ 		qtiAwb_->reset();
+ 		faceRect_.reset();
+ 		reportedFaceScore_ = 0;
+-		if (awbEnabled_) {
++		if (awbEnabled_ && awbMode_ == controls::AwbAuto) {
+ 			auto initial = profile_.awbConfiguration().initial;
+ 			auto gains = qtiAwb_->initialGains();
+ 			setIfeWb(gains[0], gains[1], gains[2]);
+@@ -1879,6 +1940,52 @@ void QcomCameraData::resetAwbProcessing()
+ 			interpolateCcm(profile_, initial.cct, ccmQ7_);
+ 		}
+ 	}
++	if (awbEnabled_) {
++		if (auto preset = awbModePresetCct(awbMode_)) {
++			applyAwbTemperature(*preset);
++			awbLocked_ = true;
++		}
++	}
++}
++
++void QcomCameraData::applyAwbTemperature(int32_t cct)
++{
++	cct = std::clamp(cct, 1500, 12000);
++	if (qtiAwb_) {
++		auto manualGains = qtiAwb_->manualGains(cct);
++		setManualAwb(manualGains[0], manualGains[1], cct);
++	} else if (lgAwb_) {
++		const auto &colour = lgAwb_->grayCore().colour();
++		auto ratios = lgAwbRatiosForTemperature(colour, cct);
++		if (ratios.red > 0.0f && ratios.blue > 0.0f)
++			setManualAwb(1.0 / ratios.red, 1.0 / ratios.blue, cct);
++	}
++}
++
++float QcomCameraData::estimateLux() const
++{
++	if (!luxIndex_)
++		return 0.0f;
++
++	/* Convert QTI inverse log lux index using each lens f-number at ISO 50 base. */
++	constexpr double kCalibrationConstant = 250.0;
++	constexpr double kBaseIso = 50.0;
++	const double minTotalSec = profileTotalExposure(profile_.aeExposureKnees[0]) * 1e-9;
++	if (minTotalSec <= 0.0)
++		return 0.0f;
++	const double luxAtZero = kCalibrationConstant * profile_.fNumber * profile_.fNumber /
++				 (kBaseIso * minTotalSec);
++	const double lux = luxAtZero * std::pow(10.0, -(*luxIndex_) / profile_.aeLuxLogScale);
++	return static_cast<float>(std::clamp(lux, 0.0, 1e6));
++}
++
++int32_t QcomCameraData::activeFlickerPeriod() const
++{
++	if (flickerMode_ == controls::FlickerManual)
++		return flickerPeriod_;
++	if (flickerMode_ == controls::FlickerAuto)
++		return flickerDetected_;
++	return 0;
+ }
+ 
+ void QcomCameraData::setManualAwb(double gainR, double gainB, std::optional<int32_t> cct)
+@@ -2068,6 +2175,7 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	context.autoGain = autoGain_;
+ 	context.flickerMode = flickerMode_;
+ 	context.flickerPeriod = flickerPeriod_;
++	context.flickerDetected = flickerMode_ == controls::FlickerAuto ? flickerDetected_ : 0;
+ 	context.aeLocked = aeLocked_;
+ 	context.exposureValue = aeEnabled() ? aeEvValue(aeEvStep_) : 0.0f;
+ 	if (!aeEnabled()) {
+@@ -2104,6 +2212,7 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	context.ife.cct = colourTemperature_;
+ 	context.ife.awbEnabled = awbEnabled_;
+ 	context.ife.awbLocked = awbLocked_;
++	context.ife.awbMode = awbMode_;
+ 	if (hasScalerCrop_)
+ 		context.scalerCrop = scalerCropRectangle();
+ 	for (unsigned int i = 0; i < context.ife.ccm.size(); i++)
+@@ -2319,11 +2428,18 @@ void QcomCameraData::fetchStats()
+ 		double lux = aeLuxIndex(profile_, appliedIndex, *aecLuma_);
+ 		luxIndex_ = luxIndex_ ? *luxIndex_ * profile_.aeLuxFilterFactor +
+ 				       lux * (1.0 - profile_.aeLuxFilterFactor) : lux;
++		if (flickerMode_ == controls::FlickerAuto && sensorHeight_ > 0) {
++			const double rowDurationNs =
++				(static_cast<double>(sensorHeight_) / QCOM_CAMSS_AWB_BG_V_NUM) *
++				lineDurationNs_;
++			flickerDetected_ = flickerDetector_.update(
++				awb_.data(), request.timestamp, rowDurationNs, exposure);
++		}
+ 		if (aeEnabled())
+ 			aeSettled = updateAe(sequence, *aecLuma_, appliedIndex, gain);
+ 	}
+ 	aeSettled_ = aeSettled;
+-	if (awbEnabled_)
++	if (awbEnabled_ && awbMode_ == controls::AwbAuto)
+ 		updateAwb(aeSettled);
+ 	if (afEnabled_)
+ 		updateAf(request.timestamp, aeSettled);
+@@ -2539,9 +2655,8 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 		/* Baseline AE exposure knee tables are tuned for fixed 60Hz (steps of 1/120s = 8333us).
+ 		 * Motion frequency is bound to frequency 2 (60Hz) matching baseline AE allocation.
+ 		 */
+-		const int frequency = flickerMode_ == controls::FlickerManual &&
+-				      flickerPeriod_ && flickerPeriod_ != 8333
+-					      ? 0 : kMotionFrequency;
++		const int32_t period = activeFlickerPeriod();
++		const int frequency = period && period != 8333 ? 0 : kMotionFrequency;
+ 		float curGain = static_cast<float>(appliedGain);
+ 		float iqmOutdoor = latestFilteredOutdoorProb_;
+ 		/* Standard single-exposure Bayer streaming has no secondary short exposure (slRatio = 0.0f).
+@@ -2781,6 +2896,107 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 
+ }
+ 
++void QcomCameraData::syncBfRoi()
++{
++	if (statsInputSize_.width < 208 || statsInputSize_.height < 104) {
++		activeBfRoi_ = {};
++		updateAfWeights();
++		return;
++	}
++
++	const uint16_t fullLeft = 64;
++	const uint16_t fullTop = 32;
++	const uint16_t fullWidth = static_cast<uint16_t>((statsInputSize_.width - 128) & ~1U);
++	const uint16_t fullHeight = static_cast<uint16_t>((statsInputSize_.height - 64) & ~1U);
++
++	auto mapAnalogRect = [this](Rectangle r) -> std::optional<Rectangle> {
++		r = r.boundedTo(analogCrop_);
++		if (!r.width || !r.height)
++			return std::nullopt;
++		r = r.transformedBetween(analogCrop_, Rectangle(statsInputSize_));
++		if (!!(transform_ & Transform::HFlip))
++			r.x = statsInputSize_.width - (r.x + r.width);
++		if (!!(transform_ & Transform::VFlip))
++			r.y = statsInputSize_.height - (r.y + r.height);
++		return r;
++	};
++
++	std::optional<Rectangle> target;
++	if (afMetering_ == controls::AfMeteringWindows && !afWindows_.empty()) {
++		int minX = statsInputSize_.width, minY = statsInputSize_.height;
++		int maxX = 0, maxY = 0;
++		for (const Rectangle &window : afWindows_) {
++			if (auto mapped = mapAnalogRect(window)) {
++				minX = std::min(minX, mapped->x);
++				minY = std::min(minY, mapped->y);
++				maxX = std::max(maxX, mapped->x + static_cast<int>(mapped->width));
++				maxY = std::max(maxY, mapped->y + static_cast<int>(mapped->height));
++			}
++		}
++		if (maxX > minX && maxY > minY)
++			target = Rectangle(minX, minY, maxX - minX, maxY - minY);
++	} else if (hasScalerCrop_ &&
++		   (activeScaler_.compose_width != defaultScaler_.compose_width ||
++		    activeScaler_.compose_height != defaultScaler_.compose_height ||
++		    activeScaler_.left != defaultScaler_.left ||
++		    activeScaler_.top != defaultScaler_.top)) {
++		target = mapAnalogRect(scalerCropRectangle());
++	}
++
++	qcom_camss_bf_roi hwRoi = {};
++	qcom_camss_bf_roi effective = { fullLeft, fullTop, fullWidth, fullHeight };
++	if (hasBfRoi_ && target) {
++		const int validLeft = fullLeft;
++		const int validTop = fullTop;
++		const int validRight = fullLeft + fullWidth;
++		const int validBottom = fullTop + fullHeight;
++		int w = std::clamp<int>(target->width, 80, fullWidth) & ~1;
++		int h = std::clamp<int>(target->height, 40, fullHeight) & ~1;
++		int x = std::clamp<int>(target->x + static_cast<int>(target->width) / 2 - w / 2,
++					validLeft, validRight - w) & ~1;
++		int y = std::clamp<int>(target->y + static_cast<int>(target->height) / 2 - h / 2,
++					validTop, validBottom - h) & ~1;
++		if (x < validLeft)
++			x = validLeft;
++		if (y < validTop)
++			y = validTop;
++		if (x + w > validRight)
++			w = (validRight - x) & ~1;
++		if (y + h > validBottom)
++			h = (validBottom - y) & ~1;
++		if (w >= 80 && h >= 40) {
++			effective = { static_cast<uint16_t>(x), static_cast<uint16_t>(y),
++				      static_cast<uint16_t>(w), static_cast<uint16_t>(h) };
++			if (effective.left != fullLeft || effective.top != fullTop ||
++			    effective.width != fullWidth || effective.height != fullHeight)
++				hwRoi = effective;
++		}
++	}
++
++	activeBfRoi_ = effective;
++	if (hasBfRoi_ && pix_ && pix_->isOpen() &&
++	    (!bfRoiProgrammed_ ||
++	     std::memcmp(&hwRoi, &programmedBfRoi_, sizeof(hwRoi)) != 0)) {
++		struct v4l2_ext_control control = {};
++		struct v4l2_ext_controls controls = {};
++		control.id = V4L2_CID_QCOM_CAMSS_BF_ROI;
++		control.size = sizeof(hwRoi);
++		control.ptr = &hwRoi;
++		controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++		controls.count = 1;
++		controls.controls = &control;
++		int ret = pix_->ioctl(VIDIOC_S_EXT_CTRLS, &controls);
++		if (ret) {
++			LOG(QcomPipeline, Warning) << "Failed to program BF ROI: " << ret;
++			activeBfRoi_ = { fullLeft, fullTop, fullWidth, fullHeight };
++		} else {
++			programmedBfRoi_ = hwRoi;
++			bfRoiProgrammed_ = true;
++		}
++	}
++	updateAfWeights();
++}
++
+ void QcomCameraData::updateAfWeights()
+ {
+ 	afWeights_.fill(0.0);
+@@ -2789,11 +3005,15 @@ void QcomCameraData::updateAfWeights()
+ 		return;
+ 	}
+ 
++	const unsigned int roiLeft = activeBfRoi_.width ? activeBfRoi_.left : 64;
++	const unsigned int roiTop = activeBfRoi_.height ? activeBfRoi_.top : 32;
++	const unsigned int roiWidth = activeBfRoi_.width ? activeBfRoi_.width : (statsInputSize_.width - 128);
++	const unsigned int roiHeight = activeBfRoi_.height ? activeBfRoi_.height : (statsInputSize_.height - 64);
++	const Size cell{ (roiWidth / 5) & ~1U, (roiHeight / 5) & ~1U };
++
+ 	std::optional<Point> fallbackCenter;
+ 	if (afMetering_ == controls::AfMeteringWindows && !afWindows_.empty()) {
+ 		/* Match the BF layout programmed by vfe_stats_bf_dmi(). */
+-		const Size cell{ ((statsInputSize_.width - 128) / 5) & ~1U,
+-				 ((statsInputSize_.height - 64) / 5) & ~1U };
+ 		for (Rectangle window : afWindows_) {
+ 			window = window.boundedTo(analogCrop_);
+ 			if (!window.width || !window.height)
+@@ -2808,8 +3028,8 @@ void QcomCameraData::updateAfWeights()
+ 				fallbackCenter = window.center();
+ 
+ 			for (unsigned int i = 0; i < afWeights_.size(); ++i) {
+-				Rectangle region{ static_cast<int>(64 + cell.width * (i % 5)),
+-						  static_cast<int>(32 + cell.height * (i / 5)), cell };
++				Rectangle region{ static_cast<int>(roiLeft + cell.width * (i % 5)),
++						  static_cast<int>(roiTop + cell.height * (i / 5)), cell };
+ 				Rectangle overlap = region.boundedTo(window);
+ 				afWeights_[i] += overlap.width * overlap.height;
+ 			}
+@@ -2819,12 +3039,10 @@ void QcomCameraData::updateAfWeights()
+ 	if (!area) {
+ 		unsigned int best = QCOM_CAMSS_BF_ROIS / 2;
+ 		if (fallbackCenter) {
+-			const Size cell{ ((statsInputSize_.width - 128) / 5) & ~1U,
+-					 ((statsInputSize_.height - 64) / 5) & ~1U };
+ 			double bestDist = std::numeric_limits<double>::max();
+ 			for (unsigned int i = 0; i < afWeights_.size(); ++i) {
+-				Rectangle region{ static_cast<int>(64 + cell.width * (i % 5)),
+-						  static_cast<int>(32 + cell.height * (i / 5)), cell };
++				Rectangle region{ static_cast<int>(roiLeft + cell.width * (i % 5)),
++						  static_cast<int>(roiTop + cell.height * (i / 5)), cell };
+ 				Point center = region.center();
+ 				double dx = center.x - fallbackCenter->x;
+ 				double dy = center.y - fallbackCenter->y;
+@@ -3051,10 +3269,11 @@ int QcomCameraData::setOisMode(int32_t mode)
+ 
+ std::pair<double, double> QcomCameraData::quantizedExposureForFlicker(double exposure, double gain) const
+ {
+-	if (!autoExposure_ || flickerMode_ != controls::FlickerManual || !flickerPeriod_)
++	const int32_t periodUs = activeFlickerPeriod();
++	if (!autoExposure_ || !periodUs)
+ 		return { exposure, gain };
+ 
+-	double period = flickerPeriod_ * 1000.0 / lineDurationNs_;
++	double period = periodUs * 1000.0 / lineDurationNs_;
+ 	if (exposure < period || exposureMax_ < period)
+ 		return { exposure, gain };
+ 
+@@ -3104,10 +3323,16 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 	if (auto limits = controls.get(controls::FrameDurationLimits))
+ 		setFrameDurationLimits(*limits);
+ 	if (auto mode = controls.get(controls::AeFlickerMode)) {
+-		if (*mode == controls::FlickerOff || *mode == controls::FlickerManual)
+-			flickerMode_ = *mode;
+-		else
++		if (*mode == controls::FlickerOff || *mode == controls::FlickerManual ||
++		    *mode == controls::FlickerAuto) {
++			if (*mode != flickerMode_) {
++				flickerMode_ = *mode;
++				flickerDetector_.reset();
++				flickerDetected_ = 0;
++			}
++		} else {
+ 			LOG(QcomPipeline, Warning) << "Ignoring unsupported AeFlickerMode " << *mode;
++		}
+ 	}
+ 	if (auto period = controls.get(controls::AeFlickerPeriod))
+ 		flickerPeriod_ = std::clamp(*period, 0, 1000000);
+@@ -3122,7 +3347,6 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		if (*metering == controls::AfMeteringAuto ||
+ 		    *metering == controls::AfMeteringWindows) {
+ 			afMetering_ = *metering;
+-			updateAfWeights();
+ 			afWindowUpdated = true;
+ 		} else {
+ 			LOG(QcomPipeline, Warning) << "Ignoring unsupported AfMetering " << *metering;
+@@ -3130,7 +3354,6 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 	}
+ 	if (auto windows = controls.get(controls::AfWindows)) {
+ 		afWindows_.assign(windows->begin(), windows->end());
+-		updateAfWeights();
+ 		afWindowUpdated = true;
+ 	}
+ 	bool autoExposure = autoExposure_;
+@@ -3239,13 +3462,41 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 			return ret;
+ 	}
+ 
+-	if (auto crop = controls.get(controls::ScalerCrop); hasScalerCrop_ && crop)
++	if (auto crop = controls.get(controls::ScalerCrop); hasScalerCrop_ && crop) {
+ 		setScalerCrop(*crop);
++		afWindowUpdated = true;
++	}
++	if (afWindowUpdated)
++		syncBfRoi();
+ 
++	bool awbEnableChanged = false;
+ 	if (controls.contains(controls::AwbEnable.id())) {
+ 		bool enabled = *controls.get(controls::AwbEnable);
+ 		if (enabled != awbEnabled_) {
+ 			awbEnabled_ = enabled;
++			awbEnableChanged = true;
++		}
++	}
++	bool awbModeChanged = false;
++	if (auto mode = controls.get(controls::AwbMode); (qtiAwb_ || lgAwb_) && mode) {
++		if (isSupportedAwbMode(*mode)) {
++			if (*mode != awbMode_) {
++				awbMode_ = *mode;
++				awbModeChanged = true;
++			}
++		} else {
++			LOG(QcomPipeline, Warning) << "Ignoring unsupported AwbMode " << *mode;
++		}
++	}
++	if (awbEnableChanged || (awbEnabled_ && awbModeChanged)) {
++		if (awbEnabled_) {
++			if (auto preset = awbModePresetCct(awbMode_)) {
++				applyAwbTemperature(*preset);
++				awbLocked_ = true;
++			} else {
++				resetAwbProcessing();
++			}
++		} else {
+ 			resetAwbProcessing();
+ 		}
+ 	}
+@@ -3256,15 +3507,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		if (auto gains = controls.get(controls::ColourGains)) {
+ 			setManualAwb((*gains)[0], (*gains)[1], cct);
+ 		} else if (cct) {
+-			if (qtiAwb_) {
+-				auto manualGains = qtiAwb_->manualGains(*cct);
+-				setManualAwb(manualGains[0], manualGains[1], cct);
+-			} else if (lgAwb_) {
+-				const auto &colour = lgAwb_->grayCore().colour();
+-				auto ratios = lgAwbRatiosForTemperature(colour, *cct);
+-				if (ratios.red > 0.0f && ratios.blue > 0.0f)
+-					setManualAwb(1.0 / ratios.red, 1.0 / ratios.blue, cct);
+-			}
++			applyAwbTemperature(*cct);
+ 		}
+ 	}
+ 
+@@ -3416,8 +3659,12 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 	metadata.set(controls::ColourCorrectionMatrix,
+ 		     Span<const float, 9>(appliedIfe.ccm));
+ 	metadata.set(controls::AwbEnable, appliedIfe.awbEnabled);
++	if (qtiAwb_ || lgAwb_)
++		metadata.set(controls::AwbMode, appliedIfe.awbMode);
+ 	if (appliedIfe.awbEnabled)
+ 		metadata.set(controls::AwbLocked, appliedIfe.awbLocked);
++	if (luxIndex_)
++		metadata.set(controls::Lux, estimateLux());
+ 
+ 	if (afEnabled_) {
+ 		auto it = frameStates_.upper_bound(sequence);
+@@ -3447,6 +3694,8 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 	metadata.set(controls::AeState, context.aeState);
+ 	metadata.set(controls::AeFlickerMode, context.flickerMode);
+ 	metadata.set(controls::AeFlickerPeriod, context.flickerPeriod);
++	if (context.flickerMode == controls::FlickerAuto)
++		metadata.set(controls::AeFlickerDetected, context.flickerDetected);
+ 	metadata.set(controls::draft::FlashMode, context.flashMode);
+ 	metadata.set(controls::draft::FlashState, context.flashState);
+ 	metadata.set(controls::draft::AePrecaptureTrigger, context.precaptureTrigger);
+@@ -3669,11 +3918,14 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->aeEvStep_ = 0;
+ 	data->flickerMode_ = controls::FlickerOff;
+ 	data->flickerPeriod_ = 0;
++	data->flickerDetected_ = 0;
++	data->flickerDetector_.reset();
+ 	data->aeLocked_ = false;
+ 	data->lockedIndex_ = 0.0f;
+ 	data->lockedEvStep_ = 0;
+ 	data->aeSettled_ = false;
+ 	data->awbEnabled_ = true;
++	data->awbMode_ = controls::AwbAuto;
+ 	data->faceDetectMode_ = controls::draft::FaceDetectModeOff;
+ 	data->faceRect_.reset();
+ 	data->lgFaces_.clear();
+@@ -3686,7 +3938,9 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->afState_ = controls::AfStateIdle;
+ 	data->afStage_ = QcomCameraData::AfStage::Idle;
+ 	data->testPatternMode_ = controls::draft::TestPatternModeOff;
+-	data->updateAfWeights();
++	data->bfRoiProgrammed_ = false;
++	data->programmedBfRoi_ = {};
++	data->syncBfRoi();
+ 	data->fc4StableCount_ = 0;
+ 	data->currAeStep_ = 0;
+ 	data->targetAeStep_ = 0;
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+index 78f54e6..b7e33e8 100644
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -17,6 +17,15 @@ struct qcom_camss_ife_crop {
+ 	uint16_t top;
+ };
+ 
++#define V4L2_CID_QCOM_CAMSS_BF_ROI (V4L2_CID_USER_BASE + 0x1252)
++
++struct qcom_camss_bf_roi {
++	uint16_t left;
++	uint16_t top;
++	uint16_t width;
++	uint16_t height;
++};
++
+ #define QCOM_CAMSS_IFE_CONFIG_BLACK_LEVEL (1U << 0)
+ #define QCOM_CAMSS_IFE_CONFIG_WHITE_BALANCE (1U << 1)
+ #define QCOM_CAMSS_IFE_CONFIG_CCM (1U << 2)

@@ -1,0 +1,25 @@
+[Unit]
+Description=LM-G820N GNSS Location Daemon
+After=alphaplus-remoteproc-boot.service rmtfs.service tqftpserv.service
+Wants=alphaplus-remoteproc-boot.service rmtfs.service tqftpserv.service
+Before=geoclue.service
+
+[Service]
+Type=notify
+User=_gnss
+Group=geoclue
+SupplementaryGroups=_gnss
+RuntimeDirectory=alphaplus-gnss
+RuntimeDirectoryMode=0750
+StateDirectory=alphaplus-gnss
+StateDirectoryMode=0750
+Environment=ALPHAPLUS_GNSSD_ARGS=
+EnvironmentFile=-/etc/default/alphaplus-gnssd
+ExecStart=/usr/bin/alphaplus-gnssd $ALPHAPLUS_GNSSD_ARGS
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+TimeoutStartSec=15s
+
+[Install]
+WantedBy=multi-user.target

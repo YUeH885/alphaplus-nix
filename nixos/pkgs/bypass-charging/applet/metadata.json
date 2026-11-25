@@ -1,0 +1,16 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Category": "Utilities",
+        "Description": "Toggle direct AC bypass charging",
+        "EnabledByDefault": true,
+        "Icon": "battery-full-charged-symbolic",
+        "Id": "org.alphaplus.bypasscharging",
+        "License": "GPL-2.0+",
+        "Name": "Bypass Charging",
+        "Version": "1.0.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": true,
+    "X-Plasma-NotificationAreaCategory": "Hardware"
+}

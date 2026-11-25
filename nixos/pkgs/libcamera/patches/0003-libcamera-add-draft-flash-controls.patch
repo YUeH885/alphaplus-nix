@@ -1,0 +1,78 @@
+diff --git a/src/libcamera/control_ids_draft.yaml b/src/libcamera/control_ids_draft.yaml
+index 03309ee..878c267 100644
+--- a/src/libcamera/control_ids_draft.yaml
++++ b/src/libcamera/control_ids_draft.yaml
+@@ -8,6 +8,14 @@
+ # set through Request::controls() and returned out through Request::metadata().
+ vendor: draft
+ controls:
++  - AeLock:
++      type: bool
++      direction: inout
++      description: |
++        Control for AE lock. Currently identical to ANDROID_CONTROL_AE_LOCK.
++
++        Whether the camera device will lock automatic exposure algorithm.
++
+   - AePrecaptureTrigger:
+       type: int32_t
+       direction: inout
+@@ -30,6 +38,58 @@ controls:
+             The camera will cancel any active or completed metering sequence.
+             The AE algorithm is reset to its initial state.
+ 
++  - FlashMode:
++      type: int32_t
++      direction: inout
++      description: |
++        Control to select flash mode. Currently identical to ANDROID_FLASH_MODE.
++      enum:
++        - name: FlashModeOff
++          value: 0
++          description: Flash will not fire.
++        - name: FlashModeSingle
++          value: 1
++          description: Flash will fire for a single still capture.
++        - name: FlashModeTorch
++          value: 2
++          description: Flash will constantly emit light (torch mode).
++
++  - FlashState:
++      type: int32_t
++      direction: out
++      description: |
++        Control to report current flash state. Currently identical to ANDROID_FLASH_STATE.
++      enum:
++        - name: FlashStateUnavailable
++          value: 0
++          description: Flash is not available on this camera.
++        - name: FlashStateCharging
++          value: 1
++          description: Flash is charging and not ready.
++        - name: FlashStateReady
++          value: 2
++          description: Flash is ready to fire.
++        - name: FlashStateFlashFired
++          value: 3
++          description: Flash has fired for this capture.
++        - name: FlashStatePartial
++          value: 4
++          description: Flash fired at lower power.
++
++  - OpticalImageStabilizationMode:
++      type: int32_t
++      direction: inout
++      description: |
++        Control to select optical image stabilization mode. Currently identical to
++        ANDROID_LENS_OPTICAL_STABILIZATION_MODE.
++      enum:
++        - name: OpticalImageStabilizationModeOff
++          value: 0
++          description: Optical image stabilization will not be active.
++        - name: OpticalImageStabilizationModeOn
++          value: 1
++          description: Optical image stabilization will be active.
++
+   - NoiseReductionMode:
+       type: int32_t
+       direction: inout

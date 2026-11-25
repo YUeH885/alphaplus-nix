@@ -1,0 +1,1222 @@
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index c1d2d87..6c3ae1d 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -49,10 +49,12 @@
+ #include <libcamera/property_ids.h>
+ #include <libcamera/stream.h>
+ 
++#include "libcamera/internal/bayer_format.h"
+ #include "libcamera/internal/camera.h"
+ #include "libcamera/internal/camera_lens.h"
+ #include "libcamera/internal/camera_sensor.h"
+ #include "libcamera/internal/device_enumerator.h"
++#include "libcamera/internal/formats.h"
+ #include "libcamera/internal/framebuffer.h"
+ #include "libcamera/internal/media_device.h"
+ #include "libcamera/internal/pipeline_handler.h"
+@@ -377,6 +379,20 @@ constexpr Size kImx351OutputSizes[] = {
+ 	{ 1440, 1080 }, { 1280, 960 }, { 1280, 720 },
+ 	{ 1008, 568 }, { 640, 480 }, { 640, 360 },
+ };
++constexpr Size kQuadRawSizes[] = {
++	{ 4032, 3024 },
++	{ 2016, 1136 },
++};
++constexpr Size kImx351RawSizes[] = {
++	{ 4656, 3492 },
++	{ 2328, 1312 },
++};
++constexpr Size kImx520RawSizes[] = {
++	{ 3280, 2460 },
++	{ 3280, 1848 },
++	{ 1640, 1232 },
++	{ 1640, 924 },
++};
+ constexpr unsigned int kBufferCount = 4;
+ 
+ constexpr uint64_t kAfSettleNs = 50ULL * 1000 * 1000;
+@@ -399,6 +415,8 @@ struct SensorProfile {
+ 	const Size *outputSizes;
+ 	std::size_t outputSizeCount;
+ 	Size defaultOutputSize;
++	const Size *rawSizes;
++	std::size_t rawSizeCount;
+ 	double fNumber;
+ 	GainModel gainModel;
+ 	const CcmEntry *ccmEntries;
+@@ -432,6 +450,8 @@ constexpr SensorProfile kS5k3m5Profile = {
+ 	.outputSizes = kOutputSizes,
+ 	.outputSizeCount = std::size(kOutputSizes),
+ 	.defaultOutputSize = kNativeSize,
++	.rawSizes = kQuadRawSizes,
++	.rawSizeCount = std::size(kQuadRawSizes),
+ 	.fNumber = 2.4,
+ 	.gainModel = GainModel::Linear32,
+ 	.ccmEntries = kCcmEntries,
+@@ -464,6 +484,8 @@ constexpr SensorProfile kImx363Profile = {
+ 	.outputSizes = kOutputSizes,
+ 	.outputSizeCount = std::size(kOutputSizes),
+ 	.defaultOutputSize = kNativeSize,
++	.rawSizes = kQuadRawSizes,
++	.rawSizeCount = std::size(kQuadRawSizes),
+ 	.fNumber = 1.5,
+ 	.gainModel = GainModel::SonyInverse512,
+ 	.ccmEntries = kImx363CcmEntries,
+@@ -496,6 +518,8 @@ constexpr SensorProfile kImx351Profile = {
+ 	.outputSizes = kImx351OutputSizes,
+ 	.outputSizeCount = std::size(kImx351OutputSizes),
+ 	.defaultOutputSize = kNativeSize,
++	.rawSizes = kImx351RawSizes,
++	.rawSizeCount = std::size(kImx351RawSizes),
+ 	.fNumber = 1.9,
+ 	.gainModel = GainModel::SonyInverse1024,
+ 	.ccmEntries = kImx351CcmEntries,
+@@ -528,6 +552,8 @@ constexpr SensorProfile kImx520Profile = {
+ 	.outputSizes = kImx520OutputSizes,
+ 	.outputSizeCount = std::size(kImx520OutputSizes),
+ 	.defaultOutputSize = { 1632, 924 },
++	.rawSizes = kImx520RawSizes,
++	.rawSizeCount = std::size(kImx520RawSizes),
+ 	.fNumber = 1.7,
+ 	.gainModel = GainModel::SonyInverse1024,
+ 	.ccmEntries = kImx520CcmEntries,
+@@ -733,6 +759,63 @@ uint64_t monotonicNs()
+ 		utils::clock::now().time_since_epoch()).count();
+ }
+ 
++int64_t boottimeOffsetNs()
++{
++	uint64_t bestSpan = UINT64_MAX;
++	int64_t offset = 0;
++	for (unsigned int attempt = 0; attempt < 5; ++attempt) {
++		struct timespec bootTime;
++		uint64_t before = monotonicNs();
++		if (clock_gettime(CLOCK_BOOTTIME, &bootTime))
++			return -errno;
++		uint64_t after = monotonicNs();
++		uint64_t span = after >= before ? after - before : UINT64_MAX;
++		if (span < bestSpan) {
++			bestSpan = span;
++			int64_t bootNs = static_cast<int64_t>(bootTime.tv_sec) * 1000000000LL +
++					 bootTime.tv_nsec;
++			int64_t mid = static_cast<int64_t>(before + span / 2);
++			offset = std::max<int64_t>(0, bootNs - mid);
++			if (bestSpan < 20000)
++				break;
++		}
++	}
++	return offset;
++}
++
++Size selectPixInputSize(const SensorProfile &profile, const std::string &sensorModel,
++			const Size &pixSize)
++{
++	if (profile.fullResolutionOutput && pixSize == profile.outputSizes[0])
++		return profile.fullInputSize;
++	if (pixSize.width * 3 == pixSize.height * 4) {
++		if (sensorModel == "imx520")
++			return { 1640, 1232 };
++		if (profile.fullResolutionOutput)
++			return profile.fullInputSize;
++	}
++	return profile.nativeInputSize;
++}
++
++Size closestSize(Span<const Size> sizes, const Size &requested)
++{
++	auto distance = [&requested](const Size &candidate) {
++		double dx = static_cast<double>(candidate.width) / requested.width - 1.0;
++		double dy = static_cast<double>(candidate.height) / requested.height - 1.0;
++		return dx * dx + dy * dy;
++	};
++	return *std::min_element(sizes.begin(), sizes.end(),
++				 [&distance](const Size &a, const Size &b) {
++					 return distance(a) < distance(b);
++				 });
++}
++
++bool isRawPixelFormat(PixelFormat format)
++{
++	const PixelFormatInfo &info = PixelFormatInfo::info(format);
++	return info.isValid() && info.colourEncoding == PixelFormatInfo::ColourEncodingRAW;
++}
++
+ template<std::size_t Size>
+ int readFile(const std::filesystem::path &path, off_t offset,
+ 	     std::array<uint8_t, Size> *data)
+@@ -840,7 +923,8 @@ public:
+ 	int openAncillaryDevices();
+ 	void closeAncillaryDevices();
+ 	void setFc4Engine(FC4Engine *engine) { fc4Engine_ = engine; }
+-	int setFormats(const Size &size, bool updateControls = true);
++	PixelFormat rawFormatForTransform(Transform transform) const;
++	int setFormats(bool updateControls = true);
+ 	int openCaptureDevices();
+ 	void closeCaptureDevices();
+ 	int refreshSensorInfo(bool updateControls = true);
+@@ -858,8 +942,10 @@ public:
+ 	qcom_camss_ife_config ifeConfiguration() const;
+ 	int transferIfe(qcom_camss_ife_config &config, const V4L2Request *request, bool read);
+ 	int queueFrameBuffer(FrameBuffer *buffer);
++	int queueRawBuffer(FrameBuffer *buffer, bool pixQueued);
+ 	int completeIfe(FrameBuffer *buffer, uint32_t sequence);
+ 	void imageBufferReady(FrameBuffer *buffer);
++	void rawBufferReady(FrameBuffer *buffer);
+ 	int processControls(const ControlList &controls);
+ 	void resetTestPattern();
+ 	int setOisMode(int32_t mode);
+@@ -875,17 +961,27 @@ public:
+ 		unsigned int frameSize;
+ 	};
+ 	std::map<Size, FormatGeometry> formatCache_;
++	std::map<Size, FormatGeometry> rawFormatCache_;
+ 	Stream stream_;
++	Stream rawStream_;
+ 	std::unique_ptr<CameraSensor> sensor_;
+ 	std::unique_ptr<V4L2Subdevice> pix_;
+ 	Transform transform_ = Transform::Identity;
+ 	std::unique_ptr<V4L2VideoDevice> video_;
++	std::unique_ptr<V4L2VideoDevice> rawVideo_;
+ 
+ 	std::shared_ptr<MediaDevice> media_;
+ 	const SensorProfile &profile_;
+ 	std::vector<MediaEntity *> path_;
+ 	std::vector<MediaLink *> links_;
+ 	MediaEntity *pixEntity_ = nullptr;
++	MediaEntity *rdiEntity_ = nullptr;
++	MediaLink *rdiLink_ = nullptr;
++	bool pixConfigured_ = true;
++	bool rawConfigured_ = false;
++	Size configuredPixSize_;
++	Size configuredSensorSize_;
++	PixelFormat configuredRawFormat_;
+ 
+ 	/* Statistics buffers. */
+ 	std::vector<uint32_t> awb_;
+@@ -905,7 +1001,10 @@ public:
+ 	ControlInfo frameDurationInfo_;
+ 	uint64_t lensSetTimestamp_ = 0;
+ 	bool videoStarted_ = false;
++	bool rawStarted_ = false;
++	bool rawPendingStart_ = false;
+ 	FrameBuffer *failedBuffer_ = nullptr;
++	FrameBuffer *failedRawBuffer_ = nullptr;
+ 	struct IfeState {
+ 		double red = 1.0;
+ 		double blue = 1.0;
+@@ -1130,6 +1229,10 @@ public:
+ 	Status validate() override;
+ 
+ 	Transform transform_ = Transform::Identity;
++	std::optional<unsigned int> pixIndex_;
++	std::optional<unsigned int> rawIndex_;
++	Size sensorSize_;
++	PixelFormat rawFormat_;
+ 
+ private:
+ 	QcomCameraData *data_;
+@@ -1168,61 +1271,128 @@ CameraConfiguration::Status QcomCameraConfiguration::validate()
+ {
+ 	Status status = Valid;
+ 
++	pixIndex_.reset();
++	rawIndex_.reset();
++
+ 	if (config_.empty())
+ 		return Invalid;
+ 
+-	/* A single hardware NV12 stream is supported. */
+-	if (config_.size() > 1) {
+-		config_.resize(1);
++	Orientation requestedOrientation = orientation;
++	transform_ = data_->sensor_->computeTransform(&orientation);
++	if (orientation != requestedOrientation)
+ 		status = Adjusted;
+-	}
+-
+-	StreamConfiguration &cfg = config_[0];
+ 
+-	if (cfg.pixelFormat != formats::NV12) {
+-		cfg.pixelFormat = formats::NV12;
++	std::vector<StreamConfiguration> kept;
++	for (const StreamConfiguration &cfg : config_) {
++		const bool raw = isRawPixelFormat(cfg.pixelFormat) && data_->rawVideo_ != nullptr;
++		if (raw) {
++			if (rawIndex_) {
++				status = Adjusted;
++				continue;
++			}
++			rawIndex_ = kept.size();
++			kept.push_back(cfg);
++		} else {
++			if (pixIndex_) {
++				status = Adjusted;
++				continue;
++			}
++			pixIndex_ = kept.size();
++			kept.push_back(cfg);
++		}
++	}
++	if (kept.size() != config_.size()) {
++		config_ = std::move(kept);
+ 		status = Adjusted;
+ 	}
++	if (config_.empty())
++		return Invalid;
+ 
+ 	const SensorProfile &profile = data_->profile_;
+-	Size size = profile.defaultOutputSize;
+-	if (cfg.size.width && cfg.size.height) {
+-		Span<const Size> sizes(profile.outputSizes, profile.outputSizeCount);
+-		auto distance = [&cfg](const Size &candidate) {
+-			double dx = static_cast<double>(candidate.width) / cfg.size.width - 1.0;
+-			double dy = static_cast<double>(candidate.height) / cfg.size.height - 1.0;
+-			return dx * dx + dy * dy;
+-		};
+-		size = *std::min_element(sizes.begin(), sizes.end(),
+-					 [&distance](const Size &a, const Size &b) {
+-						 return distance(a) < distance(b);
+-					 });
+-	}
+-	if (cfg.size != size) {
+-		cfg.size = size;
+-		status = Adjusted;
+-	}
++	if (pixIndex_) {
++		StreamConfiguration &cfg = config_[*pixIndex_];
++		if (cfg.pixelFormat != formats::NV12) {
++			cfg.pixelFormat = formats::NV12;
++			status = Adjusted;
++		}
+ 
+-	Orientation requestedOrientation = orientation;
+-	transform_ = data_->sensor_->computeTransform(&orientation);
+-	if (orientation != requestedOrientation)
+-		status = Adjusted;
++		Size size = profile.defaultOutputSize;
++		if (cfg.size.width && cfg.size.height) {
++			Span<const Size> sizes(profile.outputSizes, profile.outputSizeCount);
++			size = closestSize(sizes, cfg.size);
++		}
++		if (cfg.size != size) {
++			cfg.size = size;
++			status = Adjusted;
++		}
+ 
+-	cfg.bufferCount = kBufferCount;
+-	if (cfg.colorSpace != ColorSpace::Sycc) {
+-		cfg.colorSpace = ColorSpace::Sycc;
+-		status = Adjusted;
+-	}
++		if (cfg.bufferCount != kBufferCount) {
++			cfg.bufferCount = kBufferCount;
++			status = Adjusted;
++		}
++		if (cfg.colorSpace != ColorSpace::Sycc) {
++			cfg.colorSpace = ColorSpace::Sycc;
++			status = Adjusted;
++		}
+ 
+-	auto it = data_->formatCache_.find(cfg.size);
+-	if (it == data_->formatCache_.end()) {
+-		LOG(QcomPipeline, Error)
+-			<< "VFE PIX does not support NV12 " << cfg.size;
+-		return Invalid;
++		auto it = data_->formatCache_.find(cfg.size);
++		if (it == data_->formatCache_.end()) {
++			LOG(QcomPipeline, Error)
++				<< "VFE PIX does not support NV12 " << cfg.size;
++			return Invalid;
++		}
++
++		cfg.stride = it->second.stride;
++		cfg.frameSize = it->second.frameSize;
++		sensorSize_ = selectPixInputSize(profile, data_->sensorModel_, cfg.size);
+ 	}
+ 
+-	cfg.stride = it->second.stride;
+-	cfg.frameSize = it->second.frameSize;
++	if (rawIndex_) {
++		StreamConfiguration &cfg = config_[*rawIndex_];
++		rawFormat_ = data_->rawFormatForTransform(transform_);
++		if (!rawFormat_.isValid())
++			return Invalid;
++		if (cfg.pixelFormat != rawFormat_) {
++			cfg.pixelFormat = rawFormat_;
++			status = Adjusted;
++		}
++
++		Size rawSize;
++		if (pixIndex_) {
++			/* Concurrent RDI RAW taps the same CSID stream as PIX. */
++			rawSize = sensorSize_;
++		} else {
++			rawSize = profile.fullInputSize;
++			if (cfg.size.width && cfg.size.height) {
++				Span<const Size> rawSizes(profile.rawSizes, profile.rawSizeCount);
++				rawSize = closestSize(rawSizes, cfg.size);
++			}
++			sensorSize_ = rawSize;
++		}
++		if (cfg.size != rawSize) {
++			cfg.size = rawSize;
++			status = Adjusted;
++		}
++
++		if (cfg.bufferCount != kBufferCount) {
++			cfg.bufferCount = kBufferCount;
++			status = Adjusted;
++		}
++		if (cfg.colorSpace != ColorSpace::Raw) {
++			cfg.colorSpace = ColorSpace::Raw;
++			status = Adjusted;
++		}
++
++		auto it = data_->rawFormatCache_.find(cfg.size);
++		if (it == data_->rawFormatCache_.end()) {
++			LOG(QcomPipeline, Error)
++				<< "VFE RDI does not support RAW " << cfg.size;
++			return Invalid;
++		}
++
++		cfg.stride = it->second.stride;
++		cfg.frameSize = it->second.frameSize;
++	}
+ 
+ 	return status;
+ }
+@@ -1280,6 +1450,12 @@ int QcomCameraData::findPath(MediaEntity *sensor, MediaEntity *target)
+ 	return 0;
+ }
+ 
++PixelFormat QcomCameraData::rawFormatForTransform(Transform transform) const
++{
++	BayerFormat bayer(sensor_->bayerOrder(transform), 10, BayerFormat::Packing::CSI2);
++	return bayer.toPixelFormat();
++}
++
+ int QcomCameraData::setupLinks()
+ {
+ 	/* Other clients may have changed the links since enumeration. */
+@@ -1288,10 +1464,18 @@ int QcomCameraData::setupLinks()
+ 		return ret;
+ 
+ 	for (MediaLink *link : links_) {
++		if (link->sink()->entity() == pixEntity_ && !pixConfigured_)
++			continue;
+ 		if (link->flags() & MEDIA_LNK_FL_ENABLED)
+ 			continue;
+ 
+-		int ret = link->setEnabled(true);
++		ret = link->setEnabled(true);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (rawConfigured_ && rdiLink_ && !(rdiLink_->flags() & MEDIA_LNK_FL_ENABLED)) {
++		ret = rdiLink_->setEnabled(true);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+@@ -1435,6 +1619,37 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 		return -ENODEV;
+ 	}
+ 
++	rdiEntity_ = media_->getEntityByName("msm_vfe0_rdi0");
++	if (rdiEntity_ && path_.size() >= 2) {
++		MediaEntity *csidEntity = path_[path_.size() - 2];
++		for (const MediaPad *pad : csidEntity->pads()) {
++			if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
++				continue;
++			for (MediaLink *link : pad->links()) {
++				if (link->sink()->entity() == rdiEntity_) {
++					rdiLink_ = link;
++					break;
++				}
++			}
++			if (rdiLink_)
++				break;
++		}
++		MediaEntity *rawVideoEntity = nullptr;
++		for (const MediaPad *pad : rdiEntity_->pads()) {
++			if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
++				continue;
++			for (MediaLink *link : pad->links()) {
++				MediaEntity *next = link->sink()->entity();
++				if (next->function() == MEDIA_ENT_F_IO_V4L) {
++					rawVideoEntity = next;
++					break;
++				}
++			}
++		}
++		if (rdiLink_ && rawVideoEntity)
++			rawVideo_ = V4L2VideoDevice::fromEntityName(media_.get(), rawVideoEntity->name());
++	}
++
+ 	ret = openCaptureDevices();
+ 	if (ret < 0)
+ 		return ret;
+@@ -1471,6 +1686,36 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 		return -EINVAL;
+ 	}
+ 
++	if (rawVideo_) {
++		const PixelFormat rawFmt = rawFormatForTransform(Transform::Identity);
++		const V4L2PixelFormat rawFourcc = rawVideo_->toV4L2PixelFormat(rawFmt);
++		for (std::size_t i = 0; i < profile_.rawSizeCount; ++i) {
++			V4L2DeviceFormat format;
++			format.fourcc = rawFourcc;
++			format.size = profile_.rawSizes[i];
++			format.colorSpace = ColorSpace::Raw;
++			if (rawVideo_->tryFormat(&format) == 0 &&
++			    format.fourcc == rawFourcc &&
++			    format.size == profile_.rawSizes[i]) {
++				rawFormatCache_[profile_.rawSizes[i]] = {
++					format.planes[0].bpl,
++					format.planes[0].size,
++				};
++			}
++		}
++		if (rawFormatCache_.empty()) {
++			rawVideo_.reset();
++			rdiEntity_ = nullptr;
++			rdiLink_ = nullptr;
++		} else {
++			rawVideo_->bufferReady.connect(this, &QcomCameraData::rawBufferReady);
++		}
++	}
++
++	configuredPixSize_ = profile_.defaultOutputSize;
++	configuredSensorSize_ = selectPixInputSize(profile_, sensorModel_, configuredPixSize_);
++	configuredRawFormat_ = rawFormatForTransform(Transform::Identity);
++
+ 	hasScalerCrop_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_IFE_CROP);
+ 	hasBfRoi_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_BF_ROI);
+ 	video_->bufferReady.connect(this, &QcomCameraData::imageBufferReady);
+@@ -1745,32 +1990,37 @@ int QcomCameraData::openCaptureDevices()
+ 		return ret;
+ 
+ 	ret = video_->open();
+-	if (ret < 0)
++	if (ret < 0) {
+ 		pix_->close();
+-	return ret;
++		return ret;
++	}
++
++	if (rawVideo_) {
++		ret = rawVideo_->open();
++		if (ret < 0) {
++			video_->close();
++			pix_->close();
++			return ret;
++		}
++	}
++	return 0;
+ }
+ 
+ void QcomCameraData::closeCaptureDevices()
+ {
++	if (rawVideo_)
++		rawVideo_->close();
+ 	video_->close();
+ 	pix_->close();
+ }
+ 
+-int QcomCameraData::setFormats(const Size &size, bool updateControls)
++int QcomCameraData::setFormats(bool updateControls)
+ {
+ 	int ret = setupLinks();
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	Size inputSize = profile_.nativeInputSize;
+-	if (profile_.fullResolutionOutput && size == profile_.outputSizes[0]) {
+-		inputSize = profile_.fullInputSize;
+-	} else if (size.width * 3 == size.height * 4) {
+-		if (sensorModel_ == "imx520")
+-			inputSize = { 1640, 1232 };
+-		else if (profile_.fullResolutionOutput)
+-			inputSize = profile_.fullInputSize;
+-	}
++	const Size inputSize = configuredSensorSize_;
+ 	inputSize_ = inputSize;
+ 	V4L2SubdeviceFormat format;
+ 	format.code = profile_.mediaBusCode;
+@@ -1780,11 +2030,17 @@ int QcomCameraData::setFormats(const Size &size, bool updateControls)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	const V4L2SubdeviceFormat sensorBusFormat = format;
++	V4L2SubdeviceFormat pixOutputFormat = format;
++
+ 	for (unsigned int i = 0; i < links_.size(); i++) {
+ 		MediaLink *link = links_[i];
+ 		MediaPad *sink = link->sink();
+ 
+-		if (sink->entity()->function() != MEDIA_ENT_F_IO_V4L) {
++		if (sink->entity() == pixEntity_) {
++			if (!pixConfigured_)
++				continue;
++
+ 			V4L2Subdevice subdev(sink->entity());
+ 			ret = subdev.open();
+ 			if (ret < 0)
+@@ -1802,38 +2058,57 @@ int QcomCameraData::setFormats(const Size &size, bool updateControls)
+ 				return -EINVAL;
+ 			}
+ 
+-			if (sink->entity() == pixEntity_) {
+-				Rectangle compose{ size.expandedToAspectRatio(format.size).alignedUpTo(2, 2) };
+-				ret = subdev.setSelection(sink->index(),
+-							  V4L2_SEL_TGT_COMPOSE,
+-							  &compose);
+-				if (ret < 0)
+-					return ret;
+-
+-				if (compose.width < size.width || compose.height < size.height)
+-					return -EINVAL;
+-
+-				Rectangle crop{ static_cast<int>((compose.width - size.width) / 2),
+-						static_cast<int>((compose.height - size.height) / 2),
+-						size };
+-				ret = subdev.setSelection(1, V4L2_SEL_TGT_CROP, &crop);
+-				if (ret < 0)
+-					return ret;
+-
+-				scalerOutput_ = crop.size();
+-				defaultScaler_ = { static_cast<uint16_t>(compose.width),
+-						   static_cast<uint16_t>(compose.height),
+-						   static_cast<uint16_t>(crop.x),
+-						   static_cast<uint16_t>(crop.y) };
+-				activeScaler_ = defaultScaler_;
+-
+-				V4L2SubdeviceFormat sourceFormat = format;
+-				sourceFormat.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
+-				sourceFormat.size = size;
+-				ret = subdev.setFormat(1, &sourceFormat);
+-				if (ret < 0)
+-					return ret;
+-				format = sourceFormat;
++			const Size &size = configuredPixSize_;
++			Rectangle compose{ size.expandedToAspectRatio(format.size).alignedUpTo(2, 2) };
++			ret = subdev.setSelection(sink->index(),
++						  V4L2_SEL_TGT_COMPOSE,
++						  &compose);
++			if (ret < 0)
++				return ret;
++
++			if (compose.width < size.width || compose.height < size.height)
++				return -EINVAL;
++
++			Rectangle crop{ static_cast<int>((compose.width - size.width) / 2),
++					static_cast<int>((compose.height - size.height) / 2),
++					size };
++			ret = subdev.setSelection(1, V4L2_SEL_TGT_CROP, &crop);
++			if (ret < 0)
++				return ret;
++
++			scalerOutput_ = crop.size();
++			defaultScaler_ = { static_cast<uint16_t>(compose.width),
++					   static_cast<uint16_t>(compose.height),
++					   static_cast<uint16_t>(crop.x),
++					   static_cast<uint16_t>(crop.y) };
++			activeScaler_ = defaultScaler_;
++
++			V4L2SubdeviceFormat sourceFormat = format;
++			sourceFormat.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
++			sourceFormat.size = size;
++			ret = subdev.setFormat(1, &sourceFormat);
++			if (ret < 0)
++				return ret;
++			pixOutputFormat = sourceFormat;
++			continue;
++		}
++
++		if (sink->entity()->function() != MEDIA_ENT_F_IO_V4L) {
++			V4L2Subdevice subdev(sink->entity());
++			ret = subdev.open();
++			if (ret < 0)
++				return ret;
++
++			V4L2SubdeviceFormat sinkFormat = format;
++			ret = subdev.setFormat(sink->index(), &sinkFormat);
++			if (ret < 0)
++				return ret;
++
++			if (sinkFormat.code != format.code ||
++			    sinkFormat.size != format.size) {
++				LOG(QcomPipeline, Error)
++					<< "Format mismatch at " << sink->entity()->name();
++				return -EINVAL;
+ 			}
+ 		}
+ 
+@@ -1852,26 +2127,63 @@ int QcomCameraData::setFormats(const Size &size, bool updateControls)
+ 		}
+ 	}
+ 
+-	V4L2DeviceFormat videoFormat;
+-	videoFormat.fourcc = video_->toV4L2PixelFormat(formats::NV12);
+-	videoFormat.size = format.size;
+-	videoFormat.colorSpace = ColorSpace::Sycc;
++	if (pixConfigured_) {
++		V4L2DeviceFormat videoFormat;
++		videoFormat.fourcc = video_->toV4L2PixelFormat(formats::NV12);
++		videoFormat.size = pixOutputFormat.size;
++		videoFormat.colorSpace = ColorSpace::Sycc;
+ 
+-	ret = video_->setFormat(&videoFormat);
+-	if (ret < 0)
+-		return ret;
++		ret = video_->setFormat(&videoFormat);
++		if (ret < 0)
++			return ret;
+ 
+-	if (videoFormat.fourcc != video_->toV4L2PixelFormat(formats::NV12) ||
+-	    videoFormat.size != format.size)
+-		return -EINVAL;
++		if (videoFormat.fourcc != video_->toV4L2PixelFormat(formats::NV12) ||
++		    videoFormat.size != pixOutputFormat.size)
++			return -EINVAL;
++	}
++
++	if (rawConfigured_) {
++		if (!rdiEntity_ || !rawVideo_)
++			return -ENODEV;
++
++		V4L2Subdevice rdiSubdev(rdiEntity_);
++		ret = rdiSubdev.open();
++		if (ret < 0)
++			return ret;
++
++		V4L2SubdeviceFormat rdiFormat = sensorBusFormat;
++		ret = rdiSubdev.setFormat(0, &rdiFormat);
++		if (ret < 0)
++			return ret;
++		if (rdiFormat.code != sensorBusFormat.code ||
++		    rdiFormat.size != sensorBusFormat.size)
++			return -EINVAL;
++
++		ret = rdiSubdev.setFormat(1, &rdiFormat);
++		if (ret < 0)
++			return ret;
++
++		V4L2DeviceFormat rawDeviceFormat;
++		rawDeviceFormat.fourcc = rawVideo_->toV4L2PixelFormat(configuredRawFormat_);
++		rawDeviceFormat.size = rdiFormat.size;
++		rawDeviceFormat.colorSpace = ColorSpace::Raw;
++
++		ret = rawVideo_->setFormat(&rawDeviceFormat);
++		if (ret < 0)
++			return ret;
++
++		if (rawDeviceFormat.fourcc != rawVideo_->toV4L2PixelFormat(configuredRawFormat_) ||
++		    rawDeviceFormat.size != rdiFormat.size)
++			return -EINVAL;
++	}
+ 
+ 	ret = refreshSensorInfo(updateControls);
+-	if (!ret) {
++	if (!ret && pixConfigured_) {
+ 		bfRoiProgrammed_ = false;
+ 		programmedBfRoi_ = {};
+ 		syncBfRoi();
+ 	}
+-	if (!ret && updateControls && hasScalerCrop_) {
++	if (!ret && pixConfigured_ && updateControls && hasScalerCrop_) {
+ 		const Rectangle maxCrop = scalerCropRectangle();
+ 		const Rectangle minCrop = minScalerCropRectangle();
+ 		properties_.set(properties::ScalerCropMaximum, maxCrop);
+@@ -2232,14 +2544,27 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	ret = context.request->queue();
+ 	if (!ret && !videoStarted_) {
+ 		ret = video_->streamOn();
+-		if (!ret)
++		if (!ret) {
+ 			videoStarted_ = true;
++			if (rawPendingStart_ && rawVideo_ && !rawStarted_) {
++				ret = rawVideo_->streamOn();
++				if (!ret) {
++					rawStarted_ = true;
++					rawPendingStart_ = false;
++				}
++			}
++		}
+ 	}
+ 	if (ret) {
+ 		LOG(QcomPipeline, Error) << "Failed to queue IFE request: " << ret;
+ 		if (firingMainFlash && flash_->isTorchOn())
+ 			flash_->turnOff();
+ 		/* The pipeline base class cancels the request that returns an error. */
++		if (rawVideo_ && (rawStarted_ || rawPendingStart_)) {
++			rawVideo_->streamOff();
++			rawStarted_ = false;
++			rawPendingStart_ = false;
++		}
+ 		failedBuffer_ = buffer;
+ 		int cancel = video_->streamOff();
+ 		failedBuffer_ = nullptr;
+@@ -2258,6 +2583,53 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	return 0;
+ }
+ 
++int QcomCameraData::queueRawBuffer(FrameBuffer *buffer, bool pixQueued)
++{
++	if (!rawVideo_ || failedRawBuffer_)
++		return -ESHUTDOWN;
++
++	if (!pixConfigured_) {
++		int32_t exposure = std::clamp(static_cast<int32_t>(std::lround(aeExposure_)),
++					      exposureMin_, exposureMax_);
++		int32_t frameLines = std::max(frameLengthLimits_[0], exposure + exposureMargin_);
++		ControlList sensorCtrls(sensor_->controls());
++		sensorCtrls.set(V4L2_CID_EXPOSURE, exposure);
++		sensorCtrls.set(V4L2_CID_ANALOGUE_GAIN, gainToCode(profile_, aeGain_));
++		sensorCtrls.set(V4L2_CID_VBLANK, frameLines - sensorHeight_);
++		int ret = sensor_->device()->setControls(&sensorCtrls);
++		if (ret)
++			return ret;
++	}
++
++	int ret = rawVideo_->queueBuffer(buffer);
++	if (!ret && !rawStarted_) {
++		if (!pixConfigured_ || videoStarted_) {
++			ret = rawVideo_->streamOn();
++			if (!ret)
++				rawStarted_ = true;
++		} else {
++			/* Keep PIX streamOn before RDI streamOn as required by CAMSS. */
++			rawPendingStart_ = true;
++		}
++	}
++	if (ret) {
++		LOG(QcomPipeline, Error) << "Failed to queue RDI RAW buffer: " << ret;
++		failedRawBuffer_ = buffer;
++		rawVideo_->streamOff();
++		failedRawBuffer_ = nullptr;
++		rawStarted_ = false;
++		rawPendingStart_ = false;
++		if (pixQueued) {
++			failedBuffer_ = buffer->request()->findBuffer(&stream_);
++			video_->streamOff();
++			failedBuffer_ = nullptr;
++			videoStarted_ = false;
++		}
++		return ret;
++	}
++	return 0;
++}
++
+ int QcomCameraData::completeIfe(FrameBuffer *buffer, uint32_t sequence)
+ {
+ 	auto it = frameContexts_.find(buffer);
+@@ -2276,25 +2648,9 @@ int QcomCameraData::completeIfe(FrameBuffer *buffer, uint32_t sequence)
+ 		<< context.ife.red << " " << context.ife.green << " " << context.ife.blue
+ 		<< " CCT " << context.ife.cct << " AWB " << context.ife.awbEnabled;
+ 	/* V4L2 and IFE use MONOTONIC, while SensorTimestamp includes suspend time. */
+-	uint64_t bestSpan = UINT64_MAX;
+-	int64_t offset = 0;
+-	for (unsigned int attempt = 0; attempt < 5; ++attempt) {
+-		struct timespec bootTime;
+-		uint64_t before = monotonicNs();
+-		if (clock_gettime(CLOCK_BOOTTIME, &bootTime))
+-			return -errno;
+-		uint64_t after = monotonicNs();
+-		uint64_t span = after >= before ? after - before : UINT64_MAX;
+-		if (span < bestSpan) {
+-			bestSpan = span;
+-			int64_t bootNs = static_cast<int64_t>(bootTime.tv_sec) * 1000000000LL +
+-					 bootTime.tv_nsec;
+-			int64_t mid = static_cast<int64_t>(before + span / 2);
+-			offset = std::max<int64_t>(0, bootNs - mid);
+-			if (bestSpan < 20000)
+-				break;
+-		}
+-	}
++	int64_t offset = boottimeOffsetNs();
++	if (offset < 0)
++		return static_cast<int>(offset);
+ 	buffer->request()->_d()->metadata().set(controls::SensorTimestamp,
+ 					      config.sensor_timestamp + static_cast<uint64_t>(offset));
+ 	return 0;
+@@ -3466,7 +3822,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		setScalerCrop(*crop);
+ 		afWindowUpdated = true;
+ 	}
+-	if (afWindowUpdated)
++	if (afWindowUpdated && pixConfigured_)
+ 		syncBfRoi();
+ 
+ 	bool awbEnableChanged = false;
+@@ -3740,23 +4096,20 @@ void QcomCameraData::imageBufferReady(FrameBuffer *buffer)
+ 
+ 	QcomPipelineHandler *pipe =
+ 		static_cast<QcomPipelineHandler *>(this->pipe());
++	Request *request = buffer->request();
+ 
+ 	if (buffer->metadata().status != FrameMetadata::FrameSuccess &&
+ 	    buffer->metadata().status != FrameMetadata::FrameCancelled) {
+-		Request *request = buffer->request();
+ 		pipe->completeBuffer(request, buffer);
+-		pipe->completeRequest(request);
++		if (!request->hasPendingBuffers())
++			pipe->completeRequest(request);
+ 		return;
+ 	}
+ 
+-	Request *request = buffer->request();
+-
+ 	if (buffer->metadata().status == FrameMetadata::FrameCancelled) {
+-		for (const auto &[stream, fb] : request->buffers()) {
+-			fb->_d()->cancel();
+-			pipe->completeBuffer(request, fb);
+-		}
+-		pipe->completeRequest(request);
++		pipe->completeBuffer(request, buffer);
++		if (!request->hasPendingBuffers())
++			pipe->completeRequest(request);
+ 		return;
+ 	}
+ 
+@@ -3767,14 +4120,48 @@ void QcomCameraData::imageBufferReady(FrameBuffer *buffer)
+ 					 << " failed: " << ret;
+ 		buffer->_d()->metadata().status = FrameMetadata::FrameError;
+ 		pipe->completeBuffer(request, buffer);
+-		pipe->completeRequest(request);
++		if (!request->hasPendingBuffers())
++			pipe->completeRequest(request);
+ 		return;
+ 	}
+ 	fetchStats();
+ 	updateMetadata(request, sequence);
+ 
+ 	pipe->completeBuffer(request, buffer);
+-	pipe->completeRequest(request);
++	if (!request->hasPendingBuffers())
++		pipe->completeRequest(request);
++}
++
++void QcomCameraData::rawBufferReady(FrameBuffer *buffer)
++{
++	if (buffer == failedRawBuffer_)
++		return;
++
++	QcomPipelineHandler *pipe =
++		static_cast<QcomPipelineHandler *>(this->pipe());
++	Request *request = buffer->request();
++
++	if (buffer->metadata().status == FrameMetadata::FrameSuccess &&
++	    !request->findBuffer(&stream_)) {
++		ControlList &metadata = request->_d()->metadata();
++		int64_t offset = boottimeOffsetNs();
++		if (offset >= 0)
++			metadata.set(controls::SensorTimestamp,
++				     buffer->metadata().timestamp + static_cast<uint64_t>(offset));
++		int32_t exposure = std::clamp(static_cast<int32_t>(std::lround(aeExposure_)),
++					      exposureMin_, exposureMax_);
++		metadata.set(controls::ExposureTime,
++			     static_cast<int32_t>(exposure * lineDurationNs_ / 1000.0));
++		metadata.set(controls::AnalogueGain, static_cast<float>(aeGain_));
++		metadata.set(controls::FrameDuration, static_cast<int64_t>(frameDurationNs_ / 1000));
++		metadata.set(controls::FrameDurationLimits,
++			     { frameDurationUs(frameLengthLimits_[0]),
++			       frameDurationUs(frameLengthLimits_[1]) });
++	}
++
++	pipe->completeBuffer(request, buffer);
++	if (!request->hasPendingBuffers())
++		pipe->completeRequest(request);
+ }
+ 
+ std::unique_ptr<CameraConfiguration>
+@@ -3786,25 +4173,63 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
+ 
+ 	if (roles.empty())
+ 		return config;
+-	if (roles.size() != 1 || roles[0] == StreamRole::Raw)
++	if (roles.size() > 2)
+ 		return nullptr;
+ 
+-	std::map<PixelFormat, std::vector<SizeRange>> formats;
+-	std::vector<SizeRange> sizes;
+-	for (std::size_t i = 0; i < data->profile_.outputSizeCount; i++)
+-		sizes.emplace_back(data->profile_.outputSizes[i],
+-				   data->profile_.outputSizes[i]);
+-	formats[formats::NV12] = std::move(sizes);
+-
+-	StreamConfiguration cfg(formats);
+-	cfg.pixelFormat = formats::NV12;
+-	cfg.size = roles[0] == StreamRole::StillCapture
+-		? data->profile_.outputSizes[0]
+-		: data->profile_.defaultOutputSize;
+-	cfg.colorSpace = ColorSpace::Sycc;
+-	cfg.bufferCount = kBufferCount;
+-
+-	config->addConfiguration(cfg);
++	bool hasPix = false;
++	bool hasRaw = false;
++	Size pixSize = data->profile_.defaultOutputSize;
++	for (StreamRole role : roles) {
++		if (role == StreamRole::Raw) {
++			if (hasRaw || !data->rawVideo_)
++				return nullptr;
++			hasRaw = true;
++		} else {
++			if (hasPix)
++				return nullptr;
++			hasPix = true;
++			if (role == StreamRole::StillCapture)
++				pixSize = data->profile_.outputSizes[0];
++		}
++	}
++
++	const PixelFormat rawFmt = data->rawFormatForTransform(Transform::Identity);
++	for (StreamRole role : roles) {
++		if (role == StreamRole::Raw) {
++			std::map<PixelFormat, std::vector<SizeRange>> formats;
++			std::vector<SizeRange> sizes;
++			for (std::size_t i = 0; i < data->profile_.rawSizeCount; i++) {
++				if (data->rawFormatCache_.count(data->profile_.rawSizes[i]))
++					sizes.emplace_back(data->profile_.rawSizes[i],
++							   data->profile_.rawSizes[i]);
++			}
++			formats[rawFmt] = std::move(sizes);
++
++			StreamConfiguration cfg(formats);
++			cfg.pixelFormat = rawFmt;
++			cfg.size = hasPix
++				? selectPixInputSize(data->profile_, data->sensorModel_, pixSize)
++				: data->profile_.fullInputSize;
++			cfg.colorSpace = ColorSpace::Raw;
++			cfg.bufferCount = kBufferCount;
++			config->addConfiguration(cfg);
++		} else {
++			std::map<PixelFormat, std::vector<SizeRange>> formats;
++			std::vector<SizeRange> sizes;
++			for (std::size_t i = 0; i < data->profile_.outputSizeCount; i++)
++				sizes.emplace_back(data->profile_.outputSizes[i],
++						   data->profile_.outputSizes[i]);
++			formats[formats::NV12] = std::move(sizes);
++
++			StreamConfiguration cfg(formats);
++			cfg.pixelFormat = formats::NV12;
++			cfg.size = pixSize;
++			cfg.colorSpace = ColorSpace::Sycc;
++			cfg.bufferCount = kBufferCount;
++			config->addConfiguration(cfg);
++		}
++	}
++
+ 	if (config->validate() == CameraConfiguration::Invalid)
+ 		return nullptr;
+ 
+@@ -3817,21 +4242,43 @@ int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
+ 		return -EBUSY;
+ 
+ 	QcomCameraData *data = cameraData(camera);
+-	StreamConfiguration &cfg = config->at(0);
++	QcomCameraConfiguration *qcomConfig = static_cast<QcomCameraConfiguration *>(config);
+ 	int ret = data->openCaptureDevices();
+ 	if (ret < 0)
+ 		return ret;
+ 	auto closeDevices = utils::scope_exit{ [&]() { data->closeCaptureDevices(); } };
+ 
+-	Transform previousTransform = data->transform_;
+-	data->transform_ = static_cast<QcomCameraConfiguration *>(config)->transform_;
+-	ret = data->setFormats(cfg.size);
++	const Transform previousTransform = data->transform_;
++	const bool previousPix = data->pixConfigured_;
++	const bool previousRaw = data->rawConfigured_;
++	const Size previousPixSize = data->configuredPixSize_;
++	const Size previousSensorSize = data->configuredSensorSize_;
++	const PixelFormat previousRawFormat = data->configuredRawFormat_;
++
++	data->transform_ = qcomConfig->transform_;
++	data->pixConfigured_ = qcomConfig->pixIndex_.has_value();
++	data->rawConfigured_ = qcomConfig->rawIndex_.has_value();
++	data->configuredSensorSize_ = qcomConfig->sensorSize_;
++	if (qcomConfig->pixIndex_)
++		data->configuredPixSize_ = config->at(*qcomConfig->pixIndex_).size;
++	if (qcomConfig->rawIndex_)
++		data->configuredRawFormat_ = qcomConfig->rawFormat_;
++
++	ret = data->setFormats(true);
+ 	if (ret < 0) {
+ 		data->transform_ = previousTransform;
++		data->pixConfigured_ = previousPix;
++		data->rawConfigured_ = previousRaw;
++		data->configuredPixSize_ = previousPixSize;
++		data->configuredSensorSize_ = previousSensorSize;
++		data->configuredRawFormat_ = previousRawFormat;
+ 		return ret;
+ 	}
+ 
+-	cfg.setStream(&data->stream_);
++	if (qcomConfig->pixIndex_)
++		config->at(*qcomConfig->pixIndex_).setStream(&data->stream_);
++	if (qcomConfig->rawIndex_)
++		config->at(*qcomConfig->rawIndex_).setStream(&data->rawStream_);
+ 
+ 	return 0;
+ }
+@@ -3849,10 +4296,15 @@ int QcomPipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
+ 		return ret;
+ 	auto closeDevices = utils::scope_exit{ [&]() { data->closeCaptureDevices(); } };
+ 
+-	ret = data->setFormats(cfg.size, false);
++	ret = data->setFormats(false);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	if (stream == &data->rawStream_) {
++		if (!data->rawVideo_)
++			return -ENODEV;
++		return data->rawVideo_->exportBuffers(cfg.bufferCount, buffers);
++	}
+ 	return data->video_->exportBuffers(cfg.bufferCount, buffers);
+ }
+ 
+@@ -3875,11 +4327,11 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	} };
+ 
+ 	/* All cameras share the PIX route and an idle camera may have reconfigured it. */
+-	ret = data->setFormats(data->stream_.configuration().size, false);
++	ret = data->setFormats(false);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (data->lgAwb_) {
++	if (data->pixConfigured_ && data->lgAwb_) {
+ 		if (!fc4Engine_)
+ 			fc4Engine_ = std::make_unique<FC4Engine>();
+ 		data->setFc4Engine(fc4Engine_.get());
+@@ -3940,7 +4392,8 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->testPatternMode_ = controls::draft::TestPatternModeOff;
+ 	data->bfRoiProgrammed_ = false;
+ 	data->programmedBfRoi_ = {};
+-	data->syncBfRoi();
++	if (data->pixConfigured_)
++		data->syncBfRoi();
+ 	data->fc4StableCount_ = 0;
+ 	data->currAeStep_ = 0;
+ 	data->targetAeStep_ = 0;
+@@ -3949,6 +4402,9 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->frameStates_.clear();
+ 	data->frameContexts_.clear();
+ 	data->afSceneChange_.reset();
++	data->videoStarted_ = false;
++	data->rawStarted_ = false;
++	data->rawPendingStart_ = false;
+ 	if (data->afEnabled_) {
+ 		ret = data->setLensPosition(data->afPosition_);
+ 		if (ret)
+@@ -3960,23 +4416,34 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		if (ret)
+ 			return ret;
+ 	}
+-	data->resetAwb();
+-	ret = data->applyIfe(0);
+-	if (ret)
+-		return ret;
+ 
+-	if (data->afEnabled_ && data->afMode_ == controls::AfModeContinuous &&
+-	    !data->afPaused_)
+-		data->startAfScan(0);
++	if (data->pixConfigured_) {
++		data->resetAwb();
++		ret = data->applyIfe(0);
++		if (ret)
++			return ret;
+ 
+-	ret = data->recordFrameState();
+-	if (ret)
+-		return ret;
++		if (data->afEnabled_ && data->afMode_ == controls::AfModeContinuous &&
++		    !data->afPaused_)
++			data->startAfScan(0);
+ 
+-	ret = data->video_->importBuffers(data->stream_.configuration().bufferCount);
+-	if (ret < 0)
+-		return ret;
++		ret = data->recordFrameState();
++		if (ret)
++			return ret;
+ 
++		ret = data->video_->importBuffers(data->stream_.configuration().bufferCount);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (data->rawConfigured_) {
++		ret = data->rawVideo_->importBuffers(data->rawStream_.configuration().bufferCount);
++		if (ret < 0) {
++			if (data->pixConfigured_)
++				data->video_->releaseBuffers();
++			return ret;
++		}
++	}
+ 
+ 	activeCamera_ = camera;
+ 	errorCleanup.release();
+@@ -4001,7 +4468,13 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 	if (data->hasOis_)
+ 		data->setOisMode(controls::draft::OpticalImageStabilizationModeOff);
+ 
+-	data->video_->streamOff();
++	if (data->rawVideo_ && (data->rawStarted_ || data->rawPendingStart_)) {
++		data->rawVideo_->streamOff();
++		data->rawStarted_ = false;
++		data->rawPendingStart_ = false;
++	}
++	if (data->pixConfigured_)
++		data->video_->streamOff();
+ 	data->videoStarted_ = false;
+ 	data->resetTestPattern();
+ 	data->closeCaptureDevices();
+@@ -4020,10 +4493,11 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ int QcomPipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+ {
+ 	QcomCameraData *data = cameraData(camera);
+-	FrameBuffer *buffer = request->findBuffer(&data->stream_);
++	FrameBuffer *pixBuffer = request->findBuffer(&data->stream_);
++	FrameBuffer *rawBuffer = request->findBuffer(&data->rawStream_);
+ 
+-	if (!buffer) {
+-		LOG(QcomPipeline, Error) << "Request has no VFE PIX buffer";
++	if (!pixBuffer && !rawBuffer) {
++		LOG(QcomPipeline, Error) << "Request has no VFE PIX or RDI buffer";
+ 		return -ENOENT;
+ 	}
+ 
+@@ -4031,7 +4505,19 @@ int QcomPipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+ 	if (ret)
+ 		return ret;
+ 
+-	return data->queueFrameBuffer(buffer);
++	if (pixBuffer) {
++		ret = data->queueFrameBuffer(pixBuffer);
++		if (ret)
++			return ret;
++	}
++
++	if (rawBuffer) {
++		ret = data->queueRawBuffer(rawBuffer, pixBuffer != nullptr);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
+ }
+ 
+ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+@@ -4069,6 +4555,8 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+ 		}
+ 
+ 		std::set<Stream *> streams{ &data->stream_ };
++		if (data->rawVideo_)
++			streams.insert(&data->rawStream_);
+ 		std::shared_ptr<Camera> camera =
+ 			Camera::create(std::move(data), entity->name(), streams);
+ 		registerCamera(std::move(camera));

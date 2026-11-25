@@ -1,0 +1,300 @@
+From ca905e39d843a3bec7176bb9921b0edd424d184d Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu23234@gmail.com>
+Date: Sat, 7 Nov 2026 13:33:34 +0800
+Subject: [PATCH] libcamera: sensor: add LG G8 sensor helpers and ancillary
+ OIS/focus lens support
+
+Register gain models and frame delays for S5K3M5, IMX363, IMX351, and
+IMX520. Extend CameraLens with explicit open/close lifecycle and position
+readback, and distinguish focus lenses from OIS subdevices when discovering
+sensor ancillary entities.
+---
+ include/libcamera/internal/camera_lens.h      |  3 ++
+ include/libcamera/internal/camera_sensor.h    |  1 +
+ src/ipa/libipa/camera_sensor_helper.cpp       | 45 +++++++++++++++++
+ src/libcamera/camera_lens.cpp                 | 34 +++++++++++++
+ src/libcamera/sensor/camera_sensor_legacy.cpp | 37 +++++++++++---
+ .../sensor/camera_sensor_properties.cpp       | 50 +++++++++++++++++++
+ 6 files changed, 163 insertions(+), 7 deletions(-)
+
+diff --git a/include/libcamera/internal/camera_lens.h b/include/libcamera/internal/camera_lens.h
+index f347c5e..43f8e05 100644
+--- a/include/libcamera/internal/camera_lens.h
++++ b/include/libcamera/internal/camera_lens.h
+@@ -27,7 +27,10 @@ public:
+ 	~CameraLens();
+ 
+ 	int init();
++	int open();
++	void close();
+ 	int setFocusPosition(int32_t position);
++	int getFocusPosition(int32_t *position);
+ 
+ 	const std::string &model() const { return model_; }
+ 
+diff --git a/include/libcamera/internal/camera_sensor.h b/include/libcamera/internal/camera_sensor.h
+index e6b72d2..cfb4d75 100644
+--- a/include/libcamera/internal/camera_sensor.h
++++ b/include/libcamera/internal/camera_sensor.h
+@@ -48,6 +48,7 @@ public:
+ 	virtual V4L2Subdevice *device() = 0;
+ 
+ 	virtual CameraLens *focusLens() = 0;
++	virtual V4L2Subdevice *ois() { return nullptr; }
+ 
+ 	virtual const std::vector<unsigned int> &mbusCodes() const = 0;
+ 	virtual std::vector<Size> sizes(unsigned int mbusCode) const = 0;
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 9457d62..72e1f02 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -617,6 +617,39 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx335", CameraSensorHelperImx335)
+ 
++class CameraSensorHelperImx351 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx351()
++	{
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 0, 1024, -1, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx351", CameraSensorHelperImx351)
++
++class CameraSensorHelperImx363 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx363()
++	{
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 0, 512, -1, 512 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx363", CameraSensorHelperImx363)
++
++class CameraSensorHelperImx520 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx520()
++	{
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 0, 1024, -1, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx520", CameraSensorHelperImx520)
++
+ class CameraSensorHelperImx415 : public CameraSensorHelper
+ {
+ public:
+@@ -827,6 +860,18 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov13858", CameraSensorHelperOv13858)
+ 
++class CameraSensorHelperS5k3m5 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k3m5()
++	{
++		blackLevel_ = 4096;
++		/* Samsung analogue gain uses 32 register codes per multiplier. */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k3m5", CameraSensorHelperS5k3m5)
++
+ class CameraSensorHelperVd55g1 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/libcamera/camera_lens.cpp b/src/libcamera/camera_lens.cpp
+index ccc2a6a..7c1d273 100644
+--- a/src/libcamera/camera_lens.cpp
++++ b/src/libcamera/camera_lens.cpp
+@@ -76,6 +76,25 @@ int CameraLens::init()
+ 	return 0;
+ }
+ 
++/**
++ * \brief Open an initialized lens for focus control
++ * \return 0 on success or a negative error code otherwise
++ */
++int CameraLens::open()
++{
++	return subdev_->open();
++}
++
++/**
++ * \brief Close the lens device to release its runtime power reference
++ *
++ * Call open() before accessing focus controls again.
++ */
++void CameraLens::close()
++{
++	subdev_->close();
++}
++
+ /**
+  * \brief This function sets the focal point of the lens to a specific position.
+  * \param[in] position The focal point of the lens
+@@ -95,6 +114,21 @@ int CameraLens::setFocusPosition(int32_t position)
+ 	return 0;
+ }
+ 
++/**
++ * \brief Read the lens position from the driver
++ * \param[out] position The current lens position
++ * \return 0 on success or a negative error code otherwise
++ */
++int CameraLens::getFocusPosition(int32_t *position)
++{
++	const uint32_t id = V4L2_CID_FOCUS_ABSOLUTE;
++	ControlList controls = subdev_->getControls({ &id, 1 });
++	if (controls.empty())
++		return -EIO;
++	*position = controls.get(id).get<int32_t>();
++	return 0;
++}
++
+ int CameraLens::validateLensDriver()
+ {
+ 	int ret = 0;
+diff --git a/src/libcamera/sensor/camera_sensor_legacy.cpp b/src/libcamera/sensor/camera_sensor_legacy.cpp
+index 6a68382..1fe3a55 100644
+--- a/src/libcamera/sensor/camera_sensor_legacy.cpp
++++ b/src/libcamera/sensor/camera_sensor_legacy.cpp
+@@ -68,6 +68,7 @@ public:
+ 	V4L2Subdevice *device() override { return subdev_.get(); }
+ 
+ 	CameraLens *focusLens() override { return focusLens_.get(); }
++	V4L2Subdevice *ois() override { return ois_.get(); }
+ 
+ 	const std::vector<unsigned int> &mbusCodes() const override { return mbusCodes_; }
+ 	std::vector<Size> sizes(unsigned int mbusCode) const override;
+@@ -140,6 +141,7 @@ private:
+ 	ControlList properties_;
+ 
+ 	std::unique_ptr<CameraLens> focusLens_;
++	std::unique_ptr<V4L2Subdevice> ois_;
+ };
+ 
+ /**
+@@ -656,15 +658,36 @@ int CameraSensorLegacy::discoverAncillaryDevices()
+ 
+ 	for (MediaEntity *ancillary : entity_->ancillaryEntities()) {
+ 		switch (ancillary->function()) {
+-		case MEDIA_ENT_F_LENS:
+-			focusLens_ = std::make_unique<CameraLens>(ancillary);
+-			ret = focusLens_->init();
+-			if (ret) {
+-				LOG(CameraSensor, Error)
+-					<< "Lens initialisation failed, lens disabled";
+-				focusLens_.reset();
++		case MEDIA_ENT_F_LENS: {
++			V4L2Subdevice subdev(ancillary);
++			if (subdev.open() == 0) {
++				const auto &controls = subdev.controls();
++				if (controls.count(V4L2_CID_FOCUS_ABSOLUTE) && !focusLens_) {
++					focusLens_ = std::make_unique<CameraLens>(ancillary);
++					ret = focusLens_->init();
++					if (ret) {
++						LOG(CameraSensor, Error)
++							<< "Lens initialisation failed, lens disabled";
++						focusLens_.reset();
++					}
++					break;
++				}
++				if (controls.count(V4L2_CID_IMAGE_STABILIZATION) && !ois_) {
++					ois_ = std::make_unique<V4L2Subdevice>(ancillary);
++					if (ois_->open() == 0) {
++						LOG(CameraSensor, Info)
++							<< "Discovered OIS lens " << ancillary->name();
++					} else {
++						ois_.reset();
++					}
++					break;
++				}
+ 			}
++			LOG(CameraSensor, Info)
++				<< "Ignoring unsupported lens ancillary entity "
++				<< ancillary->name();
+ 			break;
++		}
+ 
+ 		default:
+ 			LOG(CameraSensor, Warning)
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+index 2804315..23f5611 100644
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -261,6 +261,28 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 			.testPatternModes = {},
+ 			.sensorDelays = { },
+ 		} },
++		{ "imx351", {
++			.unitCellSize = { 1000, 1000 },
++			.testPatternModes = {},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 1,
++				/* Horizontal blanking is fixed by the mode. */
++				.hblankDelay = 0,
++			},
++		} },
++		{ "imx363", {
++			.unitCellSize = { 1400, 1400 },
++			.testPatternModes = {},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 1,
++				/* Horizontal blanking is fixed by the mode. */
++				.hblankDelay = 0,
++			},
++		} },
+ 		{ "imx415", {
+ 			.unitCellSize = { 1450, 1450 },
+ 			.testPatternModes = {},
+@@ -271,6 +293,17 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 				.hblankDelay = 2
+ 			},
+ 		} },
++		{ "imx520", {
++			.unitCellSize = { 1120, 1120 },
++			.testPatternModes = {},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 1,
++				/* Horizontal blanking is fixed by the mode. */
++				.hblankDelay = 0,
++			},
++		} },
+ 		{ "imx462", {
+ 			.unitCellSize = { 2900, 2900 },
+ 			.testPatternModes = {},
+@@ -503,6 +536,23 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 			},
+ 			.sensorDelays = { },
+ 		} },
++		{ "s5k3m5", {
++			.unitCellSize = { 1000, 1000 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeSolidColor, 1 },
++				{ controls::draft::TestPatternModeColorBars, 2 },
++				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
++				{ controls::draft::TestPatternModePn9, 4 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 1,
++				/* Horizontal blanking is fixed by the mode. */
++				.hblankDelay = 0,
++			},
++		} },
+ 		{ "vd55g1", {
+ 			.unitCellSize = { 2160, 2160 },
+ 			.testPatternModes = {

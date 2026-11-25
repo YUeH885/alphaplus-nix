@@ -1,0 +1,47 @@
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index ef50a2e..ce87985 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -826,6 +826,7 @@ public:
+ 	int completeIfe(FrameBuffer *buffer, uint32_t sequence);
+ 	void imageBufferReady(FrameBuffer *buffer);
+ 	int processControls(const ControlList &controls);
++	void resetTestPattern();
+ 	int setOisMode(int32_t mode);
+ 	int setLensPosition(int position);
+ 	int startAfMove(int step);
+@@ -3086,6 +3087,18 @@ void QcomCameraData::setFrameDurationLimits(Span<const int64_t, 2> durations)
+ 	exposureMax_ = max - exposureMargin_;
+ }
+ 
++void QcomCameraData::resetTestPattern()
++{
++	if (sensor_->testPatternModes().empty())
++		return;
++
++	int ret = sensor_->setTestPatternMode(controls::draft::TestPatternModeOff);
++	if (ret)
++		LOG(QcomPipeline, Warning) << "Failed to disable sensor test pattern: " << ret;
++	else
++		testPatternMode_ = controls::draft::TestPatternModeOff;
++}
++
+ int QcomCameraData::processControls(const ControlList &controls)
+ {
+ 	if (auto limits = controls.get(controls::FrameDurationLimits))
+@@ -3605,6 +3618,7 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		return ret;
+ 
+ 	auto errorCleanup = utils::scope_exit{ [&]() {
++		data->resetTestPattern();
+ 		data->closeCaptureDevices();
+ 		data->closeAncillaryDevices();
+ 		data->setFc4Engine(nullptr);
+@@ -3735,6 +3749,7 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 
+ 	data->video_->streamOff();
+ 	data->videoStarted_ = false;
++	data->resetTestPattern();
+ 	data->closeCaptureDevices();
+ 	data->frameContexts_.clear();
+ 	data->lastStatsSequence_ = UINT32_MAX;

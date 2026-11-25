@@ -1,0 +1,236 @@
+diff --git a/src/apps/qcam/main_window.cpp b/src/apps/qcam/main_window.cpp
+index 59c2aa6..5b26114 100644
+--- a/src/apps/qcam/main_window.cpp
++++ b/src/apps/qcam/main_window.cpp
+@@ -8,17 +8,22 @@
+ #include "main_window.h"
+ 
+ #include <assert.h>
++#include <algorithm>
+ #include <iomanip>
+ #include <string>
+ 
+ #include <libcamera/camera_manager.h>
++#include <libcamera/control_ids.h>
++#include <libcamera/property_ids.h>
+ #include <libcamera/version.h>
+ 
+ #include <QCoreApplication>
++#include <QDoubleSpinBox>
+ #include <QFileDialog>
+ #include <QImage>
+ #include <QImageWriter>
+ #include <QMessageBox>
++#include <QMouseEvent>
+ #include <QMutexLocker>
+ #include <QStandardPaths>
+ #include <QStringList>
+@@ -128,6 +133,7 @@ MainWindow::MainWindow(CameraManager *cm, const OptionsParser::Options &options)
+ 		return;
+ 	}
+ 
++	centralWidget()->installEventFilter(this);
+ 	adjustSize();
+ 
+ 	/* Hotplug/unplug support */
+@@ -168,6 +174,34 @@ bool MainWindow::event(QEvent *e)
+ 	return QMainWindow::event(e);
+ }
+ 
++bool MainWindow::eventFilter(QObject *watched, QEvent *event)
++{
++	if (watched != centralWidget() || event->type() != QEvent::MouseButtonRelease ||
++	    !isCapturing_ || !tapFocusEnabled_ || !previewCrop_.width || !previewCrop_.height)
++		return QMainWindow::eventFilter(watched, event);
++
++	const auto *mouse = static_cast<QMouseEvent *>(event);
++	const Size &size = vfStream_->configuration().size;
++	const QSize frame = QSize(size.width, size.height)
++				    .scaled(centralWidget()->size(), Qt::KeepAspectRatio);
++	QRect visible(QPoint{}, frame);
++	visible.moveCenter(centralWidget()->rect().center());
++	if (mouse->button() != Qt::LeftButton || !visible.contains(mouse->position().toPoint()))
++		return QMainWindow::eventFilter(watched, event);
++
++	/* AF windows use sensor coordinates, including the visible zoom crop. */
++	const unsigned int width = std::max(1U, previewCrop_.width / 5);
++	const unsigned int height = std::max(1U, previewCrop_.height / 5);
++	const int x = previewCrop_.x + (mouse->position().x() - visible.x()) *
++		      previewCrop_.width / visible.width();
++	const int y = previewCrop_.y + (mouse->position().y() - visible.y()) *
++		      previewCrop_.height / visible.height();
++	pendingFocus_ = Rectangle(x - static_cast<int>(width / 2),
++				  y - static_cast<int>(height / 2), width, height)
++				.enclosedIn(previewCrop_);
++	return true;
++}
++
+ int MainWindow::createToolbars()
+ {
+ 	QAction *action;
+@@ -205,6 +239,16 @@ int MainWindow::createToolbars()
+ 	connect(action, &QAction::toggled, this, &MainWindow::toggleCapture);
+ 	startStopAction_ = action;
+ 
++	zoom_ = new QDoubleSpinBox(toolbar_);
++	zoom_->setAccessibleName(tr("Zoom"));
++	zoom_->setPrefix(tr("Zoom "));
++	zoom_->setSuffix(QStringLiteral("×"));
++	zoom_->setRange(1.0, 4.0);
++	zoom_->setSingleStep(0.25);
++	zoom_->setValue(1.0);
++	zoom_->setEnabled(false);
++	toolbar_->addWidget(zoom_);
++
+ 	/* Save As... action. */
+ 	action = toolbar_->addAction(QIcon::fromTheme("document-save-as",
+ 						      QIcon(":save.svg")),
+@@ -423,6 +467,35 @@ int MainWindow::startCapture()
+ 		return ret;
+ 	}
+ 
++	maximumCrop_ = camera_->properties().get(properties::ScalerCropMaximum)
++			       .value_or(Rectangle{});
++	previewCrop_ = maximumCrop_;
++	pendingFocus_.reset();
++	const auto &supported = camera_->controls();
++	double maxZoom = 1.0;
++	if (auto it = supported.find(&controls::ScalerCrop);
++	    it != supported.end() && maximumCrop_.width && maximumCrop_.height) {
++		const Rectangle minCrop = it->second.min().get<Rectangle>();
++		if (minCrop.width && minCrop.height)
++			maxZoom = std::min(static_cast<double>(maximumCrop_.width) / minCrop.width,
++					   static_cast<double>(maximumCrop_.height) / minCrop.height);
++	}
++	zoom_->setRange(1.0, std::clamp(maxZoom, 1.0, 4.0));
++	zoom_->setValue(1.0);
++	zoom_->setEnabled(maxZoom > 1.01);
++
++	auto supportsValue = [&supported](const ControlId *id, int32_t value) {
++		auto it = supported.find(id);
++		if (it == supported.end())
++			return false;
++		const auto &values = it->second.values();
++		return std::find(values.begin(), values.end(), ControlValue(value)) != values.end();
++	};
++	tapFocusEnabled_ = supportsValue(&controls::AfMode, controls::AfModeAuto) &&
++			   supportsValue(&controls::AfMetering, controls::AfMeteringWindows) &&
++			   supported.count(controls::AfWindows.id()) &&
++			   supported.count(controls::AfTrigger.id());
++
+ 	/* Store stream allocation. */
+ 	vfStream_ = config_->at(0).stream();
+ 	if (config_->size() == 2)
+@@ -440,6 +513,9 @@ int MainWindow::startCapture()
+ 				     vfConfig.stride);
+ 	if (ret < 0) {
+ 		qInfo() << "Failed to set viewfinder format";
++		zoom_->setEnabled(false);
++		tapFocusEnabled_ = false;
++		pendingFocus_.reset();
+ 		return ret;
+ 	}
+ 
+@@ -525,6 +601,10 @@ error_disconnect:
+ 	camera_->stop();
+ 
+ error:
++	zoom_->setEnabled(false);
++	tapFocusEnabled_ = false;
++	pendingFocus_.reset();
++
+ 	requests_.clear();
+ 
+ 	mappedBuffers_.clear();
+@@ -550,6 +630,9 @@ void MainWindow::stopCapture()
+ 	viewfinder_->stop();
+ 	if (saveRaw_)
+ 		saveRaw_->setEnabled(false);
++	zoom_->setEnabled(false);
++	tapFocusEnabled_ = false;
++	pendingFocus_.reset();
+ 	captureRaw_ = false;
+ 
+ 	int ret = camera_->stop();
+@@ -707,8 +790,10 @@ void MainWindow::processCapture()
+ 	}
+ 
+ 	/* Process buffers. */
+-	if (request->buffers().count(vfStream_))
++	if (request->buffers().count(vfStream_)) {
++		previewCrop_ = request->metadata().get(controls::ScalerCrop).value_or(maximumCrop_);
+ 		processViewfinder(request->buffers().at(vfStream_));
++	}
+ 
+ 	if (request->buffers().count(rawStream_))
+ 		processRaw(request->buffers().at(rawStream_), request->metadata());
+@@ -776,5 +861,22 @@ void MainWindow::renderComplete(FrameBuffer *buffer)
+ 
+ int MainWindow::queueRequest(Request *request)
+ {
++	ControlList &controls = request->controls();
++	if (zoom_->isEnabled()) {
++		const unsigned int width = maximumCrop_.width / zoom_->value();
++		const unsigned int height = maximumCrop_.height / zoom_->value();
++		const int x = maximumCrop_.x + static_cast<int>((maximumCrop_.width - width) / 2);
++		const int y = maximumCrop_.y + static_cast<int>((maximumCrop_.height - height) / 2);
++		controls.set(controls::ScalerCrop, Rectangle(x, y, width, height));
++	}
++
++	if (pendingFocus_) {
++		controls.set(controls::AfMode, controls::AfModeAuto);
++		controls.set(controls::AfMetering, controls::AfMeteringWindows);
++		controls.set(controls::AfWindows, Span<const Rectangle>(&*pendingFocus_, 1));
++		controls.set(controls::AfTrigger, controls::AfTriggerStart);
++		pendingFocus_.reset();
++	}
++
+ 	return camera_->queueRequest(request);
+ }
+diff --git a/src/apps/qcam/main_window.h b/src/apps/qcam/main_window.h
+index 20d369a..45e889b 100644
+--- a/src/apps/qcam/main_window.h
++++ b/src/apps/qcam/main_window.h
+@@ -8,6 +8,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include <optional>
+ #include <vector>
+ 
+ #include <libcamera/camera.h>
+@@ -32,6 +33,7 @@
+ #include "viewfinder.h"
+ 
+ class QAction;
++class QDoubleSpinBox;
+ 
+ class CameraSelectorDialog;
+ class Image;
+@@ -55,6 +57,7 @@ public:
+ 	~MainWindow();
+ 
+ 	bool event(QEvent *e) override;
++	bool eventFilter(QObject *watched, QEvent *event) override;
+ 
+ private Q_SLOTS:
+ 	void quit();
+@@ -92,6 +95,7 @@ private:
+ 	QToolBar *toolbar_;
+ 	QAction *startStopAction_;
+ 	QPushButton *cameraSelectButton_;
++	QDoubleSpinBox *zoom_;
+ 	QAction *saveRaw_;
+ 	ViewFinder *viewfinder_;
+ 
+@@ -118,6 +122,10 @@ private:
+ 	bool isCapturing_;
+ 	bool captureRaw_;
+ 	libcamera::Stream *vfStream_;
++	libcamera::Rectangle maximumCrop_;
++	libcamera::Rectangle previewCrop_;
++	std::optional<libcamera::Rectangle> pendingFocus_;
++	bool tapFocusEnabled_ = false;
+ 	libcamera::Stream *rawStream_;
+ 	std::map<const libcamera::Stream *, QQueue<libcamera::FrameBuffer *>> freeBuffers_;
+ 	QQueue<libcamera::Request *> doneQueue_;

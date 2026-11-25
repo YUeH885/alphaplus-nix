@@ -1,0 +1,145 @@
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index ba24e01..9afd26e 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -435,6 +435,7 @@ constexpr Size kNativeSize{ 2016, 1136 };
+ constexpr Size kFullSize{ 4032, 3024 };
+ constexpr Size kOutputSizes[] = {
+ 	{ 4032, 3024 },
++	{ 3840, 2160 },
+ 	{ 2016, 1136 },
+ 	{ 1920, 1080 },
+ 	{ 1280, 720 },
+@@ -456,17 +457,28 @@ constexpr Size kImx520OutputSizes[] = {
+ 	{ 640, 360 },
+ };
+ constexpr Size kImx351OutputSizes[] = {
+-	{ 4656, 3492 }, { 4032, 3024 },
++	{ 4656, 3492 }, { 4032, 3024 }, { 3840, 2160 },
+ 	{ 2320, 1312 }, { 2016, 1136 }, { 1920, 1080 },
+ 	{ 1440, 1080 }, { 1280, 960 }, { 1280, 720 },
+ 	{ 1008, 568 }, { 640, 480 }, { 640, 360 },
+ };
+-constexpr Size kQuadRawSizes[] = {
++constexpr Size kImx363RawSizes[] = {
+ 	{ 4032, 3024 },
++	{ 4032, 2272 },
++	{ 2016, 1512 },
+ 	{ 2016, 1136 },
+ };
++constexpr Size kS5k3m5RawSizes[] = {
++	{ 4032, 3024 },
++	{ 4032, 2272 },
++	{ 2016, 1512 },
++	{ 2016, 1136 },
++	{ 1008, 568 },
++};
+ constexpr Size kImx351RawSizes[] = {
+ 	{ 4656, 3492 },
++	{ 3840, 2160 },
++	{ 2328, 1744 },
+ 	{ 2328, 1312 },
+ };
+ constexpr Size kImx520RawSizes[] = {
+@@ -515,11 +527,15 @@ constexpr LscEepromSpec kImx520LscSpecs[] = {
+  */
+ constexpr PdafModeSpec kImx363PdafModes[] = {
+ 	{ { 4032, 3024 }, 1, 0x2b, 4032, 756, 5040, 1.0, PdafLayout::DualPdColLR, 0.0, 1.0 },
++	{ { 4032, 2272 }, 1, 0x2b, 4032, 568, 5040, 1.0, PdafLayout::DualPdColLR, 0.1243, 0.7513 },
++	{ { 2016, 1512 }, 1, 0x2b, 2016, 378, 2528, 2.0, PdafLayout::DualPdColLR, 0.0, 1.0 },
+ 	{ { 2016, 1136 }, 1, 0x2b, 2016, 284, 2528, 2.0, PdafLayout::DualPdColLR, 0.1243, 0.7513 },
+ };
+ 
+ constexpr PdafModeSpec kS5k3m5PdafModes[] = {
+ 	{ { 4032, 3024 }, 1, 0x30, 504, 752, 640, 1.0, PdafLayout::SparseS5k3m5Row8, 0.0, 1.0 },
++	{ { 4032, 2272 }, 1, 0x30, 504, 560, 640, 1.0, PdafLayout::SparseS5k3m5Row8, 0.1243, 0.7513 },
++	{ { 2016, 1512 }, 1, 0x30, 504, 752, 640, 1.0, PdafLayout::SparseS5k3m5Row8, 0.0, 1.0 },
+ 	{ { 2016, 1136 }, 1, 0x30, 504, 560, 640, 1.0, PdafLayout::SparseS5k3m5Row8, 0.1243, 0.7513 },
+ };
+ 
+@@ -592,8 +608,8 @@ constexpr SensorProfile kS5k3m5Profile = {
+ 	.outputSizes = kOutputSizes,
+ 	.outputSizeCount = std::size(kOutputSizes),
+ 	.defaultOutputSize = kNativeSize,
+-	.rawSizes = kQuadRawSizes,
+-	.rawSizeCount = std::size(kQuadRawSizes),
++	.rawSizes = kS5k3m5RawSizes,
++	.rawSizeCount = std::size(kS5k3m5RawSizes),
+ 	.fNumber = 2.4,
+ 	.gainModel = GainModel::Linear32,
+ 	.ccmEntries = kCcmEntries,
+@@ -631,8 +647,8 @@ constexpr SensorProfile kImx363Profile = {
+ 	.outputSizes = kOutputSizes,
+ 	.outputSizeCount = std::size(kOutputSizes),
+ 	.defaultOutputSize = kNativeSize,
+-	.rawSizes = kQuadRawSizes,
+-	.rawSizeCount = std::size(kQuadRawSizes),
++	.rawSizes = kImx363RawSizes,
++	.rawSizeCount = std::size(kImx363RawSizes),
+ 	.fNumber = 1.5,
+ 	.gainModel = GainModel::SonyInverse512,
+ 	.ccmEntries = kImx363CcmEntries,
+@@ -944,12 +960,27 @@ Size selectPixInputSize(const SensorProfile &profile, const std::string &sensorM
+ {
+ 	if (profile.fullResolutionOutput && pixSize == profile.outputSizes[0])
+ 		return profile.fullInputSize;
++	if (pixSize == Size{ 3840, 2160 }) {
++		if (sensorModel == "imx351")
++			return { 3840, 2160 };
++		if (sensorModel == "imx363" || sensorModel == "s5k3m5")
++			return { 4032, 2272 };
++	}
++	/* M09 (2016x1512) supports 120 fps with VC=1 PDAF; VFE center-crops 1920x1440 to 1080p. */
++	if (sensorModel == "imx363" && pixSize == Size{ 1920, 1080 })
++		return { 2016, 1512 };
+ 	if (pixSize.width * 3 == pixSize.height * 4) {
+ 		if (sensorModel == "imx520")
+ 			return { 1640, 1232 };
++		if (sensorModel == "imx363" || sensorModel == "s5k3m5")
++			return { 2016, 1512 };
++		if (sensorModel == "imx351" && pixSize.width <= 2328)
++			return { 2328, 1744 };
+ 		if (profile.fullResolutionOutput)
+ 			return profile.fullInputSize;
+ 	}
++	if (sensorModel == "s5k3m5" && pixSize.width <= 1008 && pixSize.height <= 568)
++		return { 1008, 568 };
+ 	return profile.nativeInputSize;
+ }
+ 
+@@ -2377,8 +2408,10 @@ int QcomCameraData::refreshSensorInfo(bool updateControls)
+ 	exposureMin_ = controls.at(V4L2_CID_EXPOSURE).min().get<int32_t>();
+ 	exposureMargin_ = std::max<int32_t>(
+ 		0, maxFrameLines_ - controls.at(V4L2_CID_EXPOSURE).max().get<int32_t>());
+-	const int64_t defaultDuration = frameDurationUs(minFrameLines_);
+-	frameDurationInfo_ = ControlInfo(defaultDuration, frameDurationUs(maxFrameLines_),
++	const int64_t minDuration = frameDurationUs(minFrameLines_);
++	const int64_t maxDuration = frameDurationUs(maxFrameLines_);
++	const int64_t defaultDuration = std::clamp<int64_t>(16667, minDuration, maxDuration);
++	frameDurationInfo_ = ControlInfo(minDuration, maxDuration,
+ 					 Span<const int64_t, 2>{ { defaultDuration, defaultDuration } });
+ 	setFrameDurationLimits(std::array<int64_t, 2>{ 0, 0 });
+ 	gainMin_ = gainFromCode(profile_, controls.at(V4L2_CID_ANALOGUE_GAIN)
+@@ -4971,11 +5004,20 @@ int64_t QcomCameraData::frameDurationUs(int32_t lines) const
+ 
+ void QcomCameraData::setFrameDurationLimits(Span<const int64_t, 2> durations)
+ {
+-	auto toLines = [this](int64_t duration) {
+-		duration = std::clamp(duration, frameDurationUs(minFrameLines_), frameDurationUs(maxFrameLines_));
++	const int64_t minDuration = frameDurationUs(minFrameLines_);
++	const int64_t maxDuration = frameDurationUs(maxFrameLines_);
++	auto toLines = [this, minDuration, maxDuration](int64_t duration) {
++		duration = std::clamp(duration, minDuration, maxDuration);
+ 		return std::clamp(static_cast<int32_t>(std::llround(duration * 1000.0 / lineDurationNs_)),
+ 				  minFrameLines_, maxFrameLines_);
+ 	};
++	/* Keep unrequested high-speed modes at 60 fps until 120 fps is requested. */
++	if (durations[0] <= 0 && durations[1] <= 0) {
++		int32_t def = toLines(std::max<int64_t>(16667, minDuration));
++		frameLengthLimits_ = { def, def };
++		exposureMax_ = def - exposureMargin_;
++		return;
++	}
+ 	int32_t min = toLines(durations[0]);
+ 	int32_t max = std::max(min, toLines(durations[1]));
+ 	frameLengthLimits_ = { min, max };

@@ -1,0 +1,394 @@
+From 0071df3da0d2587a7bc3d52e988d855ad55dbd20 Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu23234@gmail.com>
+Date: Tue, 24 Nov 2026 11:27:38 +0800
+Subject: [PATCH] qcom: synchronize main flash strobe to VFE SOF
+
+---
+ src/libcamera/pipeline/qcom/qcom.cpp | 212 +++++++++++++++++++++++++--
+ 1 file changed, 203 insertions(+), 9 deletions(-)
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index f6ce98f..ba24e01 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -149,39 +149,45 @@ public:
+ 		for (auto &dev : devices_)
+ 			dev->close();
+ 		torchOn_ = false;
++		strobeActive_ = false;
+ 		strobeUntil_ = {};
+ 	}
+ 
+ 	void turnOff()
+ 	{
+-		if (isOpen() && setMode(V4L2_FLASH_LED_MODE_NONE)) {
++		if (!isOpen())
++			return;
++		if (strobeActive_)
++			stopStrobe();
++		else if (setMode(V4L2_FLASH_LED_MODE_NONE))
+ 			torchOn_ = false;
+-			strobeUntil_ = {};
+-		}
+ 	}
+ 
+ 	bool setTorch(bool on)
+ 	{
++		if (strobeActive_)
++			stopStrobe();
+ 		if (!setMode(on ? V4L2_FLASH_LED_MODE_TORCH : V4L2_FLASH_LED_MODE_NONE))
+ 			return false;
+ 
+ 		torchOn_ = on;
++		strobeActive_ = false;
+ 		strobeUntil_ = {};
+ 		return true;
+ 	}
+ 
+-	bool triggerFlash()
++	bool triggerFlash(int32_t requestedTimeoutUs = 200000)
+ 	{
+ 		if (!setMode(V4L2_FLASH_LED_MODE_FLASH))
+ 			return false;
+ 		torchOn_ = false;
+ 
+-		int32_t appliedTimeoutUs = 200000;
++		int32_t appliedTimeoutUs = requestedTimeoutUs;
+ 		for (auto &dev : devices_) {
+ 			const ControlInfoMap &info = dev->controls();
+ 			const ControlInfo &timeoutInfo = info.at(V4L2_CID_FLASH_TIMEOUT);
+ 			const int32_t timeoutUs = std::clamp<int32_t>(
+-				200000, timeoutInfo.min().get<int32_t>(),
++				requestedTimeoutUs, timeoutInfo.min().get<int32_t>(),
+ 				timeoutInfo.max().get<int32_t>());
+ 			appliedTimeoutUs = std::min(appliedTimeoutUs, timeoutUs);
+ 
+@@ -200,15 +206,44 @@ public:
+ 				return false;
+ 		}
+ 
++		strobeActive_ = true;
+ 		strobeUntil_ = std::chrono::steady_clock::now() +
+ 			       std::chrono::microseconds(appliedTimeoutUs);
+ 		return true;
+ 	}
+ 
++	void stopStrobe()
++	{
++		if (!isOpen()) {
++			strobeActive_ = false;
++			strobeUntil_ = {};
++			torchOn_ = false;
++			return;
++		}
++
++		if (strobeActive_) {
++			for (auto &dev : devices_) {
++				const ControlInfoMap &info = dev->controls();
++				if (!info.count(V4L2_CID_FLASH_STROBE_STOP))
++					continue;
++				ControlList stop(info);
++				stop.set(V4L2_CID_FLASH_STROBE_STOP, 0);
++				int ret = dev->setControls(&stop);
++				if (ret && ret != -EBUSY)
++					LOG(QcomPipeline, Error) << "Failed to stop flash strobe: " << ret;
++			}
++		}
++
++		setMode(V4L2_FLASH_LED_MODE_NONE);
++		strobeActive_ = false;
++		strobeUntil_ = {};
++		torchOn_ = false;
++	}
++
+ 	bool isTorchOn() const { return torchOn_; }
+ 	bool isStrobeActive() const
+ 	{
+-		return std::chrono::steady_clock::now() < strobeUntil_;
++		return strobeActive_ && std::chrono::steady_clock::now() < strobeUntil_;
+ 	}
+ 
+ private:
+@@ -245,6 +280,7 @@ private:
+ 
+ 	std::vector<std::unique_ptr<V4L2Subdevice>> devices_;
+ 	bool torchOn_ = false;
++	bool strobeActive_ = false;
+ 	std::chrono::steady_clock::time_point strobeUntil_{};
+ };
+ 
+@@ -1086,6 +1122,8 @@ public:
+ 	int queueFrameBuffer(FrameBuffer *buffer);
+ 	int queueRawBuffer(FrameBuffer *buffer, bool pixQueued);
+ 	int completeIfe(FrameBuffer *buffer, uint32_t sequence);
++	void onFrameStart(uint32_t sequence);
++	void cancelFlashStrobe(bool turnOffHardware);
+ 	void imageBufferReady(FrameBuffer *buffer);
+ 	void rawBufferReady(FrameBuffer *buffer);
+ 	int processControls(const ControlList &controls);
+@@ -1232,6 +1270,16 @@ public:
+ 	std::unique_ptr<FlashDevice> flash_;
+ 	bool flashOwned_ = false;
+ 	bool flashActive() const { return flash_ && flashOwned_; }
++	struct PendingFlashStrobe {
++		bool armed = false;
++		bool active = false;
++		uint32_t fireSof = 0;
++		uint32_t stopSof = 0;
++		int32_t timeoutUs = 200000;
++		FrameBuffer *targetBuffer = nullptr;
++	};
++	PendingFlashStrobe flashStrobe_{};
++	uint32_t lastStrobeSequence_ = UINT32_MAX;
+ 	PreflashState preflashState_ = PreflashState::Idle;
+ 	int preflashSkipFrames_ = 0;
+ 	int preflashSettledFrames_ = 0;
+@@ -1720,6 +1768,7 @@ int QcomCameraData::bindVfeSlot(int slotIndex, MediaEntity *pixEntity,
+ 	newVideo->bufferReady.connect(this, &QcomCameraData::imageBufferReady);
+ 	if (newRawVideo)
+ 		newRawVideo->bufferReady.connect(this, &QcomCameraData::rawBufferReady);
++	newPix->frameStart.connect(this, &QcomCameraData::onFrameStart);
+ 
+ 	pixEntity_ = pixEntity;
+ 	rdiEntity_ = newRawVideo ? rdiEntity : nullptr;
+@@ -2406,6 +2455,7 @@ int QcomCameraData::openCaptureDevices()
+ 
+ void QcomCameraData::closeCaptureDevices()
+ {
++	cancelFlashStrobe(true);
+ 	if (rawVideo_)
+ 		rawVideo_->close();
+ 	video_->close();
+@@ -2940,6 +2990,15 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 			flash_->turnOff();
+ 		return ret;
+ 	}
++	const bool wasStreaming = videoStarted_;
++	bool frameStartArmedForRequest = false;
++	if (firingMainFlash) {
++		cancelFlashStrobe(true);
++		if (flash_->isTorchOn())
++			flash_->setTorch(false);
++		if (wasStreaming && pix_ && pix_->isOpen())
++			frameStartArmedForRequest = (pix_->setFrameStartEnabled(true) == 0);
++	}
+ 	ret = context.request->queue();
+ 	if (!ret && !videoStarted_) {
+ 		ret = video_->streamOn();
+@@ -2956,6 +3015,9 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	}
+ 	if (ret) {
+ 		LOG(QcomPipeline, Error) << "Failed to queue IFE request: " << ret;
++		if (frameStartArmedForRequest && !flashStrobe_.armed && !flashStrobe_.active &&
++		    pix_ && pix_->isOpen())
++			pix_->setFrameStartEnabled(false);
+ 		if (firingMainFlash && flash_->isTorchOn())
+ 			flash_->turnOff();
+ 		/* The pipeline base class cancels the request that returns an error. */
+@@ -2976,7 +3038,72 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	if (firingMainFlash) {
+ 		flashMode_ = controls::draft::FlashModeOff;
+ 		preflashState_ = PreflashState::Idle;
+-		if (flash_->triggerFlash())
++
++		const int64_t estFrameDurUs = std::max<int64_t>(
++			frameDurationUs(frameLines),
++			static_cast<int64_t>(frameDurationNs_ / 1000));
++		const int32_t strobeTimeoutUs = std::clamp<int32_t>(
++			static_cast<int32_t>(estFrameDurUs * 2 + 20000),
++			50000, 250000);
++
++		bool keepFrameStartEnabled = false;
++		bool handledImmediate = false;
++		if (wasStreaming && frameStartArmedForRequest) {
++			uint32_t nextReqSeq = 0;
++			uint32_t nextSofSeq = 0;
++			const int reqRet = video_->ioctl(VIDIOC_QCOM_CAMSS_GET_REQUEST_SEQUENCE, &nextReqSeq);
++			const int sofRet = video_->ioctl(VIDIOC_QCOM_CAMSS_GET_FRAME_SEQUENCE, &nextSofSeq);
++			if (!reqRet && !sofRet && nextReqSeq >= 2) {
++				const uint32_t targetSeq = nextReqSeq - 1;
++				const uint32_t fireSof = targetSeq - 1;
++				const uint32_t stopSof = targetSeq + 1;
++				lastStrobeSequence_ = targetSeq;
++
++				if (static_cast<int32_t>(nextSofSeq - fireSof) <= 0) {
++					flashStrobe_ = {
++						true,
++						false,
++						fireSof,
++						stopSof,
++						strobeTimeoutUs,
++						buffer,
++					};
++					keepFrameStartEnabled = true;
++					LOG(QcomPipeline, Debug)
++						<< "Armed SOF flash strobe: target=" << targetSeq
++						<< " fireSof=" << fireSof << " stopSof=" << stopSof
++						<< " nextSof=" << nextSofSeq
++						<< " timeoutUs=" << strobeTimeoutUs;
++				} else {
++					handledImmediate = true;
++					if (flash_->triggerFlash(strobeTimeoutUs)) {
++						context.flashState = controls::draft::FlashStateFlashFired;
++						if (static_cast<int32_t>(nextSofSeq - stopSof) <= 0) {
++							flashStrobe_ = {
++								false,
++								true,
++								fireSof,
++								stopSof,
++								strobeTimeoutUs,
++								buffer,
++							};
++							keepFrameStartEnabled = true;
++							LOG(QcomPipeline, Debug)
++								<< "Fired immediate flash strobe with SOF stop: target="
++								<< targetSeq << " stopSof=" << stopSof
++								<< " nextSof=" << nextSofSeq
++								<< " timeoutUs=" << strobeTimeoutUs;
++						}
++					}
++				}
++			}
++		}
++
++		if (!keepFrameStartEnabled && frameStartArmedForRequest && pix_ && pix_->isOpen())
++			pix_->setFrameStartEnabled(false);
++
++		if (!keepFrameStartEnabled && !handledImmediate &&
++		    flash_->triggerFlash(strobeTimeoutUs))
+ 			context.flashState = controls::draft::FlashStateFlashFired;
+ 	}
+ 	return 0;
+@@ -3557,7 +3684,11 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 	unsigned int led = 0;
+ 	bool flashOn = false;
+ 	if (flashActive()) {
+-		if (flash_->isStrobeActive()) {
++		const bool strobeStatsFrame =
++			lastStrobeSequence_ != UINT32_MAX &&
++			lastStatsSequence_ != UINT32_MAX &&
++			qcom::inputSequence(lastStatsSequence_) == lastStrobeSequence_;
++		if (flash_->isStrobeActive() || strobeStatsFrame) {
+ 			flashState = 3;
+ 			led = 3;
+ 			flashOn = true;
+@@ -4975,6 +5106,9 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 			    mode != controls::draft::FlashModeTorch) {
+ 				LOG(QcomPipeline, Warning) << "Ignoring unsupported FlashMode " << mode;
+ 			} else {
++				if ((flashStrobe_.armed || flashStrobe_.active) &&
++				    mode != controls::draft::FlashModeSingle)
++					cancelFlashStrobe(true);
+ 				const bool preflashLighting =
+ 					preflashState_ == PreflashState::EnterSkip ||
+ 					preflashState_ == PreflashState::Settling;
+@@ -4992,6 +5126,8 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 			int32_t trigger = *controls.get(controls::draft::AePrecaptureTrigger);
+ 			precaptureTrigger_ = trigger;
+ 			if (trigger == controls::draft::AePrecaptureTriggerStart) {
++				if (flashStrobe_.armed || flashStrobe_.active)
++					cancelFlashStrobe(true);
+ 				if (preflashState_ == PreflashState::Idle) {
+ 					if (!flash_->setTorch(true))
+ 						return -EIO;
+@@ -5002,6 +5138,8 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 					LOG(QcomPipeline, Debug) << "Flash precapture started";
+ 				}
+ 			} else if (trigger == controls::draft::AePrecaptureTriggerCancel) {
++				if (flashStrobe_.armed || flashStrobe_.active)
++					cancelFlashStrobe(true);
+ 				preflashState_ = PreflashState::Idle;
+ 				if (flashMode_ != controls::draft::FlashModeTorch)
+ 					flash_->turnOff();
+@@ -5334,11 +5472,63 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 	}
+ }
+ 
++void QcomCameraData::cancelFlashStrobe(bool turnOffHardware)
++{
++	flashStrobe_ = {};
++	if (pix_ && pix_->isOpen())
++		pix_->setFrameStartEnabled(false);
++	if (turnOffHardware && flashActive() && flash_->isStrobeActive())
++		flash_->stopStrobe();
++}
++
++void QcomCameraData::onFrameStart(uint32_t sequence)
++{
++	if (!flashActive() || (!flashStrobe_.armed && !flashStrobe_.active)) {
++		if (pix_ && pix_->isOpen())
++			pix_->setFrameStartEnabled(false);
++		return;
++	}
++
++	if (flashStrobe_.armed &&
++	    static_cast<int32_t>(sequence - flashStrobe_.fireSof) >= 0) {
++		flashStrobe_.armed = false;
++		if (static_cast<int32_t>(sequence - flashStrobe_.stopSof) < 0 &&
++		    flash_->triggerFlash(flashStrobe_.timeoutUs)) {
++			flashStrobe_.active = true;
++			if (flashStrobe_.targetBuffer) {
++				auto it = frameContexts_.find(flashStrobe_.targetBuffer);
++				if (it != frameContexts_.end())
++					it->second.flashState = controls::draft::FlashStateFlashFired;
++			}
++			LOG(QcomPipeline, Debug)
++				<< "Fired SOF flash strobe at sof=" << sequence
++				<< " stopSof=" << flashStrobe_.stopSof
++				<< " timeoutUs=" << flashStrobe_.timeoutUs;
++		} else {
++			cancelFlashStrobe(false);
++			return;
++		}
++	}
++
++	if (flashStrobe_.active &&
++	    static_cast<int32_t>(sequence - flashStrobe_.stopSof) >= 0) {
++		flash_->stopStrobe();
++		flashStrobe_ = {};
++		if (pix_ && pix_->isOpen())
++			pix_->setFrameStartEnabled(false);
++		LOG(QcomPipeline, Debug)
++			<< "Stopped SOF flash strobe at sof=" << sequence;
++	}
++}
++
+ void QcomCameraData::imageBufferReady(FrameBuffer *buffer)
+ {
+ 	if (buffer == failedBuffer_)
+ 		return;
+ 
++	if (flashStrobe_.targetBuffer == buffer)
++		flashStrobe_.targetBuffer = nullptr;
++
+ 	QcomPipelineHandler *pipe =
+ 		static_cast<QcomPipelineHandler *>(this->pipe());
+ 	Request *request = buffer->request();
+@@ -5812,6 +6002,8 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	}
+ 
+ 	data->lastStatsSequence_ = UINT32_MAX;
++	data->lastStrobeSequence_ = UINT32_MAX;
++	data->cancelFlashStrobe(true);
+ 	data->statsTimestamp_ = 0;
+ 	data->luxIndex_.reset();
+ 	data->histogramTarget_.reset();
+@@ -5940,6 +6132,7 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 
+ 	QcomCameraData *data = cameraData(camera);
+ 
++	data->cancelFlashStrobe(true);
+ 	if (data->flashActive()) {
+ 		data->flash_->turnOff();
+ 		data->flashMode_ = controls::draft::FlashModeOff;
+@@ -5984,6 +6177,7 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 	data->fdFrameCounter_ = 0;
+ 	data->frameContexts_.clear();
+ 	data->lastStatsSequence_ = UINT32_MAX;
++	data->lastStrobeSequence_ = UINT32_MAX;
+ 	data->aeLocked_ = false;
+ 	data->aeMotion_.reset();
+ 	data->resetAwb();
+-- 
+2.55.0
+

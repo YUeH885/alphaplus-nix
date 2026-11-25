@@ -1,0 +1,1682 @@
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_manual.h b/src/libcamera/pipeline/qcom/lg_awb_manual.h
+index 0d15707..0f8398d 100644
+--- a/src/libcamera/pipeline/qcom/lg_awb_manual.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_manual.h
+@@ -34,6 +34,35 @@ inline LgAwbPoint lgAwbProjectWhitePoint(const LgAwbColour &colour, LgAwbPoint p
+ 	return selected;
+ }
+ 
++inline LgAwbRatios lgAwbRatiosForTemperature(const LgAwbColour &colour, int32_t cct)
++{
++	const auto &locus = colour.ideal();
++	const auto &nominal = colour.nominalRgb();
++	LgAwbRatios nearest = nominal.front();
++	int nearestDistance = std::numeric_limits<int>::max();
++	for (unsigned int i = 0; i < locus.size(); ++i) {
++		int temperature = lgAwbColourTemperature(locus[i]);
++		int distance = std::abs(temperature - cct);
++		if (distance < nearestDistance) {
++			nearestDistance = distance;
++			nearest = nominal[i];
++		}
++		if (i + 1 == locus.size())
++			break;
++
++		int nextTemperature = lgAwbColourTemperature(locus[i + 1]);
++		if (temperature == nextTemperature ||
++		    cct < std::min(temperature, nextTemperature) ||
++		    cct > std::max(temperature, nextTemperature))
++			continue;
++
++		float factor = static_cast<float>(cct - temperature) / (nextTemperature - temperature);
++		return { std::lerp(nominal[i].red, nominal[i + 1].red, factor),
++			 std::lerp(nominal[i].blue, nominal[i + 1].blue, factor) };
++	}
++	return nearest;
++}
++
+ inline int32_t lgAwbManualColourTemperature(const LgAwbColour &colour, LgAwbRatios ratios)
+ {
+ 	auto point = colour.fromRgb(ratios);
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+index 39ba3fe..94e5414 100644
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -680,7 +680,7 @@ inline LgAwbFoeConfiguration imx363LgAwbFoeConfiguration()
+ 
+ inline LgAwbFwbConfiguration imx363LgAwbFwbConfiguration()
+ {
+-	return { 0, 15, { 0.681531012f, 0.487322986f }, { 1.0f, 1.0f }, 50 };
++	return { 1, 15, { 0.681531012f, 0.487322986f }, { 1.0f, 1.0f }, 50 };
+ }
+ 
+ inline LgAwbDtbConfiguration imx363LgAwbDtbConfiguration()
+@@ -1615,7 +1615,7 @@ inline LgAwbFoeConfiguration imx351LgAwbFoeConfiguration()
+ 
+ inline LgAwbFwbConfiguration imx351LgAwbFwbConfiguration()
+ {
+-	return { 0, 15, { 0.681531012f, 0.487322986f }, { 1.0f, 1.0f }, 50 };
++	return { 1, 15, { 0.681531012f, 0.487322986f }, { 1.0f, 1.0f }, 50 };
+ }
+ 
+ inline LgAwbDtbConfiguration imx351LgAwbDtbConfiguration()
+@@ -2589,7 +2589,7 @@ inline LgAwbFoeConfiguration s5k3m5LgAwbFoeConfiguration()
+ 
+ inline LgAwbFwbConfiguration s5k3m5LgAwbFwbConfiguration()
+ {
+-	return { 0, 15, { 0.681531012f, 0.487322986f }, { 1.0f, 1.0f }, 50 };
++	return { 1, 15, { 0.681531012f, 0.487322986f }, { 1.0f, 1.0f }, 50 };
+ }
+ 
+ inline LgAwbDtbConfiguration s5k3m5LgAwbDtbConfiguration()
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 1ff5fac..036abfa 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -12,6 +12,7 @@
+ #include <cmath>
+ #include <chrono>
+ #include <cstdint>
++#include <ctime>
+ #include <cstring>
+ #include <deque>
+ #include <fcntl.h>
+@@ -21,6 +22,7 @@
+ #include <map>
+ #include <iomanip>
+ #include <memory>
++#include <numeric>
+ #include <optional>
+ #include <set>
+ #include <string>
+@@ -44,6 +46,7 @@
+ #include <libcamera/framebuffer.h>
+ #include <libcamera/geometry.h>
+ #include <libcamera/pixel_format.h>
++#include <libcamera/property_ids.h>
+ #include <libcamera/stream.h>
+ 
+ #include "libcamera/internal/camera.h"
+@@ -88,117 +91,113 @@ namespace {
+ class FlashDevice
+ {
+ public:
+-	static FlashDevice &instance()
++	explicit FlashDevice(MediaEntity *entity)
++		: device_(entity)
+ 	{
+-		static FlashDevice dev;
+-		return dev;
+ 	}
+ 
+-	bool isAvailable() const { return hasFlash_; }
++	int open()
++	{
++		int ret = device_.open();
++		if (ret < 0)
++			return ret;
+ 
+-	void turnOff()
++		const ControlInfoMap &info = device_.controls();
++		constexpr uint32_t required[] = {
++			V4L2_CID_FLASH_LED_MODE,
++			V4L2_CID_FLASH_INTENSITY,
++			V4L2_CID_FLASH_TORCH_INTENSITY,
++			V4L2_CID_FLASH_TIMEOUT,
++			V4L2_CID_FLASH_STROBE,
++		};
++		for (uint32_t id : required) {
++			if (!info.count(id)) {
++				LOG(QcomPipeline, Error) << "Flash subdev missing control " << id;
++				close();
++				return -EOPNOTSUPP;
++			}
++		}
++		return 0;
++	}
++
++	void close()
+ 	{
+-		if (!hasFlash_)
+-			return;
+-		setSysfs(whiteBrightnessFd_, 0);
+-		setSysfs(yellowBrightnessFd_, 0);
+-		setSysfs(whiteStrobeFd_, 0);
++		device_.close();
+ 		torchOn_ = false;
+-		strobeActive_ = false;
++		strobeUntil_ = {};
+ 	}
+ 
+-	void setTorch(bool on, uint32_t brightness = 255)
++	void turnOff()
+ 	{
+-		if (!hasFlash_)
+-			return;
+-		if (on) {
+-			setSysfs(whiteBrightnessFd_, std::min<uint32_t>(brightness, 255));
+-			torchOn_ = true;
+-		} else {
+-			setSysfs(whiteBrightnessFd_, 0);
+-			setSysfs(yellowBrightnessFd_, 0);
++		if (device_.isOpen() && setMode(V4L2_FLASH_LED_MODE_NONE)) {
+ 			torchOn_ = false;
++			strobeUntil_ = {};
+ 		}
+ 	}
+ 
+-	void triggerFlash(uint32_t currentUa = 900000, uint32_t timeoutUs = 200000)
++	bool setTorch(bool on)
+ 	{
+-		if (!hasFlash_)
+-			return;
+-		setSysfs(whiteFlashBrightnessFd_, std::min<uint32_t>(currentUa, 900000));
+-		setSysfs(whiteTimeoutFd_, std::min<uint32_t>(timeoutUs, 500000));
+-		setSysfs(whiteStrobeFd_, 1);
+-		strobeActive_ = true;
+-	}
++		if (!setMode(on ? V4L2_FLASH_LED_MODE_TORCH : V4L2_FLASH_LED_MODE_NONE))
++			return false;
+ 
+-	void clearStrobe()
+-	{
+-		strobeActive_ = false;
++		torchOn_ = on;
++		strobeUntil_ = {};
++		return true;
+ 	}
+ 
+-	bool isTorchOn() const { return torchOn_; }
+-	bool isStrobeActive() const { return strobeActive_; }
+-
+-private:
+-	FlashDevice()
+-		: hasFlash_(false), torchOn_(false), strobeActive_(false),
+-		  whiteBrightnessFd_(-1), whiteStrobeFd_(-1),
+-		  whiteTimeoutFd_(-1), whiteFlashBrightnessFd_(-1),
+-		  yellowBrightnessFd_(-1)
++	bool triggerFlash()
+ 	{
+-		init();
++		if (!setMode(V4L2_FLASH_LED_MODE_FLASH))
++			return false;
++		torchOn_ = false;
++
++		const ControlInfoMap &info = device_.controls();
++		const ControlInfo &timeoutInfo = info.at(V4L2_CID_FLASH_TIMEOUT);
++		const int32_t timeoutUs = std::clamp<int32_t>(
++			200000, timeoutInfo.min().get<int32_t>(), timeoutInfo.max().get<int32_t>());
++		ControlList controls(info);
++		controls.set(V4L2_CID_FLASH_INTENSITY, info.at(V4L2_CID_FLASH_INTENSITY).max());
++		controls.set(V4L2_CID_FLASH_TIMEOUT, timeoutUs);
++		if (!apply(controls))
++			return false;
++
++		ControlList strobe(info);
++		strobe.set(V4L2_CID_FLASH_STROBE, 0);
++		if (!apply(strobe))
++			return false;
++
++		strobeUntil_ = std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUs);
++		return true;
+ 	}
+ 
+-	~FlashDevice()
++	bool isTorchOn() const { return torchOn_; }
++	bool isStrobeActive() const
+ 	{
+-		turnOff();
+-		closeFds();
++		return std::chrono::steady_clock::now() < strobeUntil_;
+ 	}
+ 
+-	void init()
++private:
++	bool setMode(int32_t mode)
+ 	{
+-		whiteBrightnessFd_ = open("/sys/class/leds/white:flash/brightness", O_WRONLY | O_CLOEXEC);
+-		whiteStrobeFd_ = open("/sys/class/leds/white:flash/flash_strobe", O_WRONLY | O_CLOEXEC);
+-		whiteTimeoutFd_ = open("/sys/class/leds/white:flash/flash_timeout", O_WRONLY | O_CLOEXEC);
+-		whiteFlashBrightnessFd_ = open("/sys/class/leds/white:flash/flash_brightness", O_WRONLY | O_CLOEXEC);
+-		yellowBrightnessFd_ = open("/sys/class/leds/yellow:flash/brightness", O_WRONLY | O_CLOEXEC);
+-
+-		hasFlash_ = (whiteBrightnessFd_ >= 0 && whiteStrobeFd_ >= 0);
+-		turnOff();
++		ControlList controls(device_.controls());
++		controls.set(V4L2_CID_FLASH_LED_MODE, mode);
++		if (mode == V4L2_FLASH_LED_MODE_TORCH)
++			controls.set(V4L2_CID_FLASH_TORCH_INTENSITY,
++				     device_.controls().at(V4L2_CID_FLASH_TORCH_INTENSITY).max());
++		return apply(controls);
+ 	}
+ 
+-	void closeFds()
++	bool apply(ControlList &controls)
+ 	{
+-		auto safeClose = [](int &fd) {
+-			if (fd >= 0) {
+-				close(fd);
+-				fd = -1;
+-			}
+-		};
+-		safeClose(whiteBrightnessFd_);
+-		safeClose(whiteStrobeFd_);
+-		safeClose(whiteTimeoutFd_);
+-		safeClose(whiteFlashBrightnessFd_);
+-		safeClose(yellowBrightnessFd_);
++		int ret = device_.setControls(&controls);
++		if (ret)
++			LOG(QcomPipeline, Error) << "Failed to set flash controls: " << ret;
++		return ret == 0;
+ 	}
+ 
+-	static void setSysfs(int fd, uint32_t val)
+-	{
+-		if (fd < 0)
+-			return;
+-		std::string str = std::to_string(val) + "\n";
+-		lseek(fd, 0, SEEK_SET);
+-		[[maybe_unused]] auto ret = write(fd, str.c_str(), str.size());
+-	}
+-
+-	bool hasFlash_;
+-	bool torchOn_;
+-	bool strobeActive_;
+-	int whiteBrightnessFd_;
+-	int whiteStrobeFd_;
+-	int whiteTimeoutFd_;
+-	int whiteFlashBrightnessFd_;
+-	int yellowBrightnessFd_;
++	V4L2Subdevice device_;
++	bool torchOn_ = false;
++	std::chrono::steady_clock::time_point strobeUntil_{};
+ };
+ 
+ struct SmartFlashTuning {
+@@ -356,15 +355,27 @@ constexpr Size kOutputSizes[] = {
+ 	{ 1920, 1080 },
+ 	{ 1280, 720 },
+ 	{ 1008, 568 },
++	{ 1440, 1080 },
++	{ 1280, 960 },
++	{ 640, 480 },
+ 	{ 640, 360 },
+ };
+ constexpr Size kImx520OutputSizes[] = {
+ 	{ 3280, 2460 },
++	{ 1632, 1224 },
+ 	{ 1632, 924 },
+ 	{ 1280, 720 },
+ 	{ 1008, 568 },
++	{ 1440, 1080 },
++	{ 1280, 960 },
++	{ 640, 480 },
+ 	{ 640, 360 },
+ };
++constexpr Size kImx351OutputSizes[] = {
++	{ 2320, 1312 }, { 2016, 1136 }, { 1920, 1080 },
++	{ 1440, 1080 }, { 1280, 960 }, { 1280, 720 },
++	{ 1008, 568 }, { 640, 480 }, { 640, 360 },
++};
+ constexpr unsigned int kBufferCount = 4;
+ 
+ constexpr uint64_t kAfSettleNs = 50ULL * 1000 * 1000;
+@@ -478,8 +489,8 @@ constexpr SensorProfile kImx351Profile = {
+ 	.fullInputSize = { 4656, 3492 },
+ 	.nativeInputSize = { 2328, 1312 },
+ 	.fullResolutionOutput = false,
+-	.outputSizes = kOutputSizes + 1,
+-	.outputSizeCount = std::size(kOutputSizes) - 1,
++	.outputSizes = kImx351OutputSizes,
++	.outputSizeCount = std::size(kImx351OutputSizes),
+ 	.defaultOutputSize = kNativeSize,
+ 	.gainModel = GainModel::SonyInverse1024,
+ 	.ccmEntries = kImx351CcmEntries,
+@@ -798,8 +809,10 @@ public:
+ 	int openAncillaryDevices();
+ 	void closeAncillaryDevices();
+ 	void setFc4Engine(FC4Engine *engine) { fc4Engine_ = engine; }
+-	int setFormats(const Size &size);
+-	int refreshSensorInfo();
++	int setFormats(const Size &size, bool updateControls = true);
++	int openCaptureDevices();
++	void closeCaptureDevices();
++	int refreshSensorInfo(bool updateControls = true);
+ 	void resetAwb();
+ 	void resetAwbProcessing();
+ 	int recordFrameState();
+@@ -810,15 +823,23 @@ public:
+ 	int completeIfe(FrameBuffer *buffer, uint32_t sequence);
+ 	void imageBufferReady(FrameBuffer *buffer);
+ 	int processControls(const ControlList &controls);
++	int setOisMode(int32_t mode);
+ 	int setLensPosition(int position);
+ 	int startAfMove(int step);
+ 	void startAfScan(uint64_t timestamp);
++	void updateAfWeights();
+ 	double lensPosition() const;
+ 	int lensPositionToCode(double position) const;
+ 
++	struct FormatGeometry {
++		unsigned int stride;
++		unsigned int frameSize;
++	};
++	std::map<Size, FormatGeometry> formatCache_;
+ 	Stream stream_;
+ 	std::unique_ptr<CameraSensor> sensor_;
+ 	std::unique_ptr<V4L2Subdevice> pix_;
++	Transform transform_ = Transform::Identity;
+ 	std::unique_ptr<V4L2VideoDevice> video_;
+ 
+ 	std::shared_ptr<MediaDevice> media_;
+@@ -837,8 +857,15 @@ public:
+ 	/* Sensor timing and control ranges. */
+ 	double lineDurationNs_ = 1.0;
+ 	uint64_t frameDurationNs_ = 0;
++	int32_t sensorHeight_ = 0;
++	int32_t minFrameLines_ = 0;
++	int32_t maxFrameLines_ = 0;
++	int32_t exposureMargin_ = 0;
++	std::array<int32_t, 2> frameLengthLimits_{};
++	ControlInfo frameDurationInfo_;
+ 	uint64_t lensSetTimestamp_ = 0;
+ 	bool videoStarted_ = false;
++	FrameBuffer *failedBuffer_ = nullptr;
+ 	struct IfeState {
+ 		double red = 1.0;
+ 		double blue = 1.0;
+@@ -867,10 +894,17 @@ public:
+ 		bool aeLocked;
+ 		float exposureValue;
+ 		int32_t aeState;
++		int32_t flickerMode;
++		int32_t flickerPeriod;
++		std::array<int64_t, 2> frameDurationLimits;
++		int64_t frameDuration = 0;
+ 		int32_t flashMode;
+ 		int32_t flashState;
+ 		int32_t precaptureTrigger;
+ 		int32_t oisMode;
++		int32_t afMetering;
++		std::vector<Rectangle> afWindows;
++		int32_t testPatternMode;
+ 	};
+ 	std::map<FrameBuffer *, FrameContext> frameContexts_;
+ 	std::map<uint32_t, FrameState> frameStates_;
+@@ -880,6 +914,8 @@ public:
+ 	double gainMax_ = 1.0;
+ 
+ 	/* AE state. */
++	int32_t flickerMode_ = controls::FlickerOff;
++	int32_t flickerPeriod_ = 0;
+ 	bool aeEnabled_ = true;
+ 	bool aeLocked_ = false;
+ 	float lockedIndex_ = 0.0f;
+@@ -900,7 +936,7 @@ public:
+ 		Settling,
+ 		Settled,
+ 	};
+-	bool hasFlash_ = false;
++	std::unique_ptr<FlashDevice> flash_;
+ 	PreflashState preflashState_ = PreflashState::Idle;
+ 	int preflashSkipFrames_ = 0;
+ 	int preflashSettledFrames_ = 0;
+@@ -953,6 +989,7 @@ public:
+ 	int32_t awbInitialCct_ = 0;
+ 	int32_t awbFrame_ = 0;
+ 	Size statsInputSize_;
++	Rectangle analogCrop_;
+ 	double colourTemperature_ = 4250.0;
+ 	int16_t ccmQ7_[9] = { 214, -93, 7, -38, 170, -5, 6, -157, 279 };
+ 
+@@ -967,6 +1004,10 @@ public:
+ 	};
+ 
+ 	bool afEnabled_ = false;
++	int32_t afMetering_ = controls::AfMeteringAuto;
++	std::vector<Rectangle> afWindows_;
++	std::array<double, QCOM_CAMSS_BF_ROIS> afWeights_{};
++	int32_t testPatternMode_ = controls::draft::TestPatternModeOff;
+ 	int afMode_ = controls::AfModeContinuous;
+ 	int afPauseState_ = controls::AfPauseStateRunning;
+ 	bool afPaused_ = false;
+@@ -987,7 +1028,7 @@ public:
+ 
+ private:
+ 	int findPath(MediaEntity *sensor, MediaEntity *target);
+-	int disableLinks();
++	int setupLinks();
+ 	void setIfeWb(double gainR, double gainG, double gainB);
+ 	void setManualAwb(double gainR, double gainB, std::optional<int32_t> cct);
+ 	void fetchStats();
+@@ -999,7 +1041,10 @@ private:
+ 	void completeAfScan(bool success);
+ 	void refreshAfModel();
+ 	bool trackAfGravity();
+ 	double focusScore() const;
++	std::pair<double, double> quantizedExposureForFlicker(double exposure, double gain) const;
++	void setFrameDurationLimits(Span<const int64_t, 2> limits);
++	int64_t frameDurationUs(int32_t lines) const;
+ 	void updateMetadata(Request *request, uint32_t sequence);
+ 	uint64_t lensReadyTimestamp() const;
+ 
+@@ -1018,6 +1063,8 @@ public:
+ 
+ 	Status validate() override;
+ 
++	Transform transform_ = Transform::Identity;
++
+ private:
+ 	QcomCameraData *data_;
+ };
+@@ -1071,44 +1118,45 @@ CameraConfiguration::Status QcomCameraConfiguration::validate()
+ 		status = Adjusted;
+ 	}
+ 
+-	bool sizeSupported = false;
+-	for (std::size_t i = 0; i < data_->profile_.outputSizeCount; i++) {
+-		const Size &size = data_->profile_.outputSizes[i];
+-		if (cfg.size == size)
+-			sizeSupported = true;
++	const SensorProfile &profile = data_->profile_;
++	Size size = profile.defaultOutputSize;
++	if (cfg.size.width && cfg.size.height) {
++		Span<const Size> sizes(profile.outputSizes, profile.outputSizeCount);
++		auto distance = [&cfg](const Size &candidate) {
++			double dx = static_cast<double>(candidate.width) / cfg.size.width - 1.0;
++			double dy = static_cast<double>(candidate.height) / cfg.size.height - 1.0;
++			return dx * dx + dy * dy;
++		};
++		size = *std::min_element(sizes.begin(), sizes.end(),
++					 [&distance](const Size &a, const Size &b) {
++						 return distance(a) < distance(b);
++					 });
+ 	}
+-
+-	if (!sizeSupported) {
+-		cfg.size = data_->profile_.defaultOutputSize;
++	if (cfg.size != size) {
++		cfg.size = size;
+ 		status = Adjusted;
+ 	}
+ 
++	Orientation requestedOrientation = orientation;
++	transform_ = data_->sensor_->computeTransform(&orientation);
++	if (orientation != requestedOrientation)
++		status = Adjusted;
++
+ 	cfg.bufferCount = kBufferCount;
+ 	if (cfg.colorSpace != ColorSpace::Sycc) {
+ 		cfg.colorSpace = ColorSpace::Sycc;
+ 		status = Adjusted;
+ 	}
+ 
+-	V4L2DeviceFormat format;
+-	format.fourcc = data_->video_->toV4L2PixelFormat(cfg.pixelFormat);
+-	format.size = cfg.size;
+-	format.colorSpace = cfg.colorSpace;
+-
+-	if (data_->video_->tryFormat(&format)) {
++	auto it = data_->formatCache_.find(cfg.size);
++	if (it == data_->formatCache_.end()) {
+ 		LOG(QcomPipeline, Error)
+ 			<< "VFE PIX does not support NV12 " << cfg.size;
+ 		return Invalid;
+ 	}
+ 
+-	if (format.fourcc != data_->video_->toV4L2PixelFormat(cfg.pixelFormat) ||
+-	    format.size != cfg.size) {
+-		LOG(QcomPipeline, Error)
+-			<< "Unexpected VFE PIX format " << format.toString();
+-		return Invalid;
+-	}
+-
+-	cfg.stride = format.planes[0].bpl;
+-	cfg.frameSize = format.planes[0].size;
++	cfg.stride = it->second.stride;
++	cfg.frameSize = it->second.frameSize;
+ 
+ 	return status;
+ }
+@@ -1166,21 +1214,12 @@ int QcomCameraData::findPath(MediaEntity *sensor, MediaEntity *target)
+ 	return 0;
+ }
+ 
+-int QcomCameraData::disableLinks()
++int QcomCameraData::setupLinks()
+ {
+-	for (MediaEntity *entity : media_->entities()) {
+-		for (MediaPad *pad : entity->pads()) {
+-			for (MediaLink *link : pad->links()) {
+-				if (!(link->flags() & MEDIA_LNK_FL_ENABLED) ||
+-				    link->flags() & MEDIA_LNK_FL_IMMUTABLE)
+-					continue;
+-
+-				int ret = link->setEnabled(false);
+-				if (ret < 0)
+-					return ret;
+-			}
+-		}
+-	}
++	/* Other clients may have changed the links since enumeration. */
++	int ret = media_->disableLinks();
++	if (ret < 0)
++		return ret;
+ 
+ 	for (MediaLink *link : links_) {
+ 		if (link->flags() & MEDIA_LNK_FL_ENABLED)
+@@ -1323,9 +1362,6 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 	}
+ 
+ 	pix_ = std::make_unique<V4L2Subdevice>(pixEntity_);
+-	ret = pix_->open();
+-	if (ret < 0)
+-		return ret;
+ 
+ 	video_ = V4L2VideoDevice::fromEntityName(media_.get(), videoEntity->name());
+ 	if (!video_) {
+@@ -1333,9 +1369,10 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 		return -ENODEV;
+ 	}
+ 
+-	ret = video_->open();
++	ret = openCaptureDevices();
+ 	if (ret < 0)
+ 		return ret;
++	auto closeDevices = utils::scope_exit{ [&]() { closeCaptureDevices(); } };
+ 
+ 	if (!media_->supportsRequests()) {
+ 		LOG(QcomPipeline, Error) << "CAMSS media requests are required";
+@@ -1348,6 +1385,26 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 		return ret;
+ 	}
+ 
++	const V4L2PixelFormat nv12Fourcc = video_->toV4L2PixelFormat(formats::NV12);
++	for (std::size_t i = 0; i < profile_.outputSizeCount; ++i) {
++		V4L2DeviceFormat format;
++		format.fourcc = nv12Fourcc;
++		format.size = profile_.outputSizes[i];
++		format.colorSpace = ColorSpace::Sycc;
++		if (video_->tryFormat(&format) == 0 &&
++		    format.fourcc == nv12Fourcc &&
++		    format.size == profile_.outputSizes[i]) {
++			formatCache_[profile_.outputSizes[i]] = {
++				format.planes[0].bpl,
++				format.planes[0].size,
++			};
++		}
++	}
++	if (formatCache_.empty()) {
++		LOG(QcomPipeline, Error) << "VFE PIX does not support any configured NV12 size";
++		return -EINVAL;
++	}
++
+ 	video_->bufferReady.connect(this, &QcomCameraData::imageBufferReady);
+ 
+ 	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
+@@ -1380,18 +1437,27 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 
+ 	ControlInfoMap::Map ctrls;
+ 	ctrls[&controls::AeEnable] = ControlInfo(false, true, true);
++	ctrls[&controls::AeFlickerMode] = ControlInfo(
++		{ { ControlValue(controls::FlickerOff), ControlValue(controls::FlickerManual) } },
++		ControlValue(controls::FlickerOff));
++	ctrls[&controls::AeFlickerPeriod] = ControlInfo(0, 1000000, 0);
++	ctrls[&controls::FrameDurationLimits] = frameDurationInfo_;
+ 	ctrls[&controls::draft::AeLock] = ControlInfo(false, true, false);
+ 	ctrls[&controls::ExposureValue] = ControlInfo(kAeMinEv, kAeMaxEv, 0.0f);
+ 	ctrls[&controls::ExposureTime] = ControlInfo(
+ 		static_cast<int32_t>(exposureMin_ * lineDurationNs_ / 1000.0),
+-		static_cast<int32_t>(exposureMax_ * lineDurationNs_ / 1000.0),
++		static_cast<int32_t>((maxFrameLines_ - exposureMargin_) * lineDurationNs_ / 1000.0),
+ 		static_cast<int32_t>(aeExposure_ * lineDurationNs_ / 1000.0));
+ 	ctrls[&controls::AnalogueGain] = ControlInfo(
+ 		static_cast<float>(gainMin_), static_cast<float>(gainMax_),
+ 		static_cast<float>(aeGain_));
+-	hasFlash_ = (sensorEntity->name().find("imx520") == std::string::npos);
++	/* All rear sensors on this board share one flash controller. */
++	MediaEntity *flash = media_->getEntityByName("white:flash");
++	if (sensorModel_ != "imx520" && flash && flash->function() == MEDIA_ENT_F_FLASH &&
++	    access(flash->deviceNode().c_str(), R_OK | W_OK) == 0)
++		flash_ = std::make_unique<FlashDevice>(flash);
+ 	smartFlash_ = smartFlashTuningForSensor(sensorEntity->name());
+-	if (hasFlash_) {
++	if (flash_) {
+ 		ctrls[&controls::draft::FlashMode] = ControlInfo(
+ 			static_cast<int32_t>(controls::draft::FlashModeOff),
+ 			static_cast<int32_t>(controls::draft::FlashModeTorch),
+@@ -1414,7 +1480,7 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 	}
+ 	ctrls[&controls::AwbEnable] = ControlInfo(false, true, true);
+ 	ctrls[&controls::ColourGains] = ControlInfo(0.25f, 8.0f, 1.0f);
+-	if (qtiAwb_)
++	if (qtiAwb_ || lgAwb_)
+ 		ctrls[&controls::ColourTemperature] = ControlInfo(1500, 12000, 5000);
+ 	if (qtiAwb_ || lgAwb_) {
+ 		ctrls[&controls::draft::FaceDetectMode] = ControlInfo(
+@@ -1430,8 +1496,12 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 		ctrls[&controls::draft::FaceDetectFaceScores] = ControlInfo(
+ 			static_cast<uint8_t>(0), static_cast<uint8_t>(100), static_cast<uint8_t>(0));
+ 	}
+-	ctrls[&controls::DigitalGain] = ControlInfo(1.0f, 4095.0f / 128, 1.0f);
++	properties_ = sensor_->properties();
++	properties_.set(properties::ScalerCropMaximum, analogCrop_);
+ 	if (afEnabled_) {
++		ctrls[&controls::AfMetering] = ControlInfo(
++			controls::AfMeteringValues, ControlValue(controls::AfMeteringAuto));
++		ctrls[&controls::AfWindows] = ControlInfo(Rectangle{}, analogCrop_, Rectangle{});
+ 		ctrls[&controls::AfMode] = ControlInfo(
+ 			{ { ControlValue(controls::AfModeManual),
+ 			    ControlValue(controls::AfModeAuto),
+@@ -1449,8 +1519,15 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 			ControlValue(controls::AfPauseResume));
+ 	}
+ 
++	if (!sensor_->testPatternModes().empty()) {
++		std::vector<ControlValue> patterns;
++		for (auto mode : sensor_->testPatternModes())
++			patterns.emplace_back(mode);
++		ctrls[&controls::draft::TestPatternMode] = ControlInfo(
++			patterns, ControlValue(controls::draft::TestPatternModeOff));
++	}
++
+ 	controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
+-	properties_ = sensor_->properties();
+ 	closeAncillaryDevices();
+ 
+ 	return 0;
+@@ -1459,6 +1536,11 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ int QcomCameraData::openAncillaryDevices()
+ {
+ 	int ret;
++	if (flash_) {
++		ret = flash_->open();
++		if (ret < 0)
++			return ret;
++	}
+ 	if (lens_) {
+ 		ret = lens_->open();
+ 		if (ret < 0)
+@@ -1484,6 +1566,10 @@ int QcomCameraData::openAncillaryDevices()
+ 
+ void QcomCameraData::closeAncillaryDevices()
+ {
++	if (flash_) {
++		flash_->turnOff();
++		flash_->close();
++	}
+ 	if (accelerometer_)
+ 		accelerometer_->stop();
+ 	if (V4L2Subdevice *ois = sensor_->ois())
+@@ -1492,7 +1578,7 @@ void QcomCameraData::closeAncillaryDevices()
+ 		lens_->close();
+ }
+ 
+-int QcomCameraData::refreshSensorInfo()
++int QcomCameraData::refreshSensorInfo(bool updateControls)
+ {
+ 	IPACameraSensorInfo info;
+ 	int ret = sensor_->sensorInfo(&info);
+@@ -1500,11 +1586,23 @@ int QcomCameraData::refreshSensorInfo()
+ 		return ret;
+ 
+ 	statsInputSize_ = info.outputSize;
++	analogCrop_ = info.analogCrop;
++	if (updateControls)
++		properties_.set(properties::ScalerCropMaximum, analogCrop_);
++	updateAfWeights();
+ 	lineDurationNs_ = 1e9 * info.minLineLength / info.pixelRate;
+ 	frameDurationNs_ = std::llround(lineDurationNs_ * info.minFrameLength);
++	sensorHeight_ = info.outputSize.height;
++	minFrameLines_ = info.minFrameLength;
++	maxFrameLines_ = info.maxFrameLength;
+ 	const ControlInfoMap &controls = sensor_->controls();
+ 	exposureMin_ = controls.at(V4L2_CID_EXPOSURE).min().get<int32_t>();
+-	exposureMax_ = controls.at(V4L2_CID_EXPOSURE).max().get<int32_t>();
++	exposureMargin_ = std::max<int32_t>(
++		0, maxFrameLines_ - controls.at(V4L2_CID_EXPOSURE).max().get<int32_t>());
++	const int64_t defaultDuration = frameDurationUs(minFrameLines_);
++	frameDurationInfo_ = ControlInfo(defaultDuration, frameDurationUs(maxFrameLines_),
++					 Span<const int64_t, 2>{ { defaultDuration, defaultDuration } });
++	setFrameDurationLimits(std::array<int64_t, 2>{ 0, 0 });
+ 	gainMin_ = gainFromCode(profile_, controls.at(V4L2_CID_ANALOGUE_GAIN)
+ 						 .min().get<int32_t>());
+ 	gainMax_ = gainFromCode(profile_, controls.at(V4L2_CID_ANALOGUE_GAIN)
+@@ -1518,14 +1616,17 @@ int QcomCameraData::refreshSensorInfo()
+ 	aeGain_ = gainFromCode(profile_,
+ 			       initial.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>());
+ 
+-	if (!controlInfo_.empty()) {
++	if (updateControls && !controlInfo_.empty()) {
+ 		ControlInfoMap::Map map;
+ 		for (const auto &[id, range] : controlInfo_)
+ 			map.emplace(id, range);
+ 		map[&libcamera::controls::ExposureTime] = ControlInfo(
+ 			static_cast<int32_t>(exposureMin_ * lineDurationNs_ / 1000),
+-			static_cast<int32_t>(exposureMax_ * lineDurationNs_ / 1000),
++			static_cast<int32_t>((maxFrameLines_ - exposureMargin_) * lineDurationNs_ / 1000),
+ 			static_cast<int32_t>(aeExposure_ * lineDurationNs_ / 1000));
++		map[&libcamera::controls::FrameDurationLimits] = frameDurationInfo_;
++		if (afEnabled_)
++			map[&libcamera::controls::AfWindows] = ControlInfo(Rectangle{}, analogCrop_, Rectangle{});
+ 		controlInfo_ = ControlInfoMap(std::move(map), libcamera::controls::controls);
+ 	}
+ 	return 0;
+@@ -1551,22 +1652,45 @@ int QcomCameraData::recordFrameState()
+ 	return 0;
+ }
+ 
+-int QcomCameraData::setFormats(const Size &size)
++int QcomCameraData::openCaptureDevices()
++{
++	int ret = pix_->open();
++	if (ret < 0)
++		return ret;
++
++	ret = video_->open();
++	if (ret < 0)
++		pix_->close();
++	return ret;
++}
++
++void QcomCameraData::closeCaptureDevices()
+ {
+-	int ret = disableLinks();
++	video_->close();
++	pix_->close();
++}
++
++int QcomCameraData::setFormats(const Size &size, bool updateControls)
++{
++	int ret = setupLinks();
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	const Size inputSize = profile_.fullResolutionOutput &&
+-			       size == profile_.outputSizes[0]
+-				       ? profile_.fullInputSize
+-				       : profile_.nativeInputSize;
++	Size inputSize = profile_.nativeInputSize;
++	if (profile_.fullResolutionOutput && size == profile_.outputSizes[0]) {
++		inputSize = profile_.fullInputSize;
++	} else if (size.width * 3 == size.height * 4) {
++		if (sensorModel_ == "imx520")
++			inputSize = { 1640, 1232 };
++		else if (profile_.fullResolutionOutput)
++			inputSize = profile_.fullInputSize;
++	}
+ 	inputSize_ = inputSize;
+ 	V4L2SubdeviceFormat format;
+ 	format.code = profile_.mediaBusCode;
+ 	format.size = inputSize;
+ 
+-	ret = sensor_->setFormat(&format);
++	ret = sensor_->setFormat(&format, transform_);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1593,13 +1717,23 @@ int QcomCameraData::setFormats(const Size &size)
+ 			}
+ 
+ 			if (sink->entity() == pixEntity_) {
+-				Rectangle compose{ 0, 0, size };
++				Rectangle compose{ size.expandedToAspectRatio(format.size).alignedUpTo(2, 2) };
+ 				ret = subdev.setSelection(sink->index(),
+ 							  V4L2_SEL_TGT_COMPOSE,
+ 							  &compose);
+ 				if (ret < 0)
+ 					return ret;
+ 
++				if (compose.width < size.width || compose.height < size.height)
++					return -EINVAL;
++
++				Rectangle crop{ static_cast<int>((compose.width - size.width) / 2),
++						static_cast<int>((compose.height - size.height) / 2),
++						size };
++				ret = subdev.setSelection(1, V4L2_SEL_TGT_CROP, &crop);
++				if (ret < 0)
++					return ret;
++
+ 				V4L2SubdeviceFormat sourceFormat = format;
+ 				sourceFormat.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
+ 				sourceFormat.size = size;
+@@ -1638,7 +1772,7 @@ int QcomCameraData::setFormats(const Size &size)
+ 	    videoFormat.size != format.size)
+ 		return -EINVAL;
+ 
+-	return refreshSensorInfo();
++	return refreshSensorInfo(updateControls);
+ }
+ 
+ void QcomCameraData::setIfeWb(double gainR, double gainG, double gainB)
+@@ -1753,6 +1887,9 @@ int QcomCameraData::applyIfe(uint32_t sequence)
+ 
+ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ {
++	if (failedBuffer_)
++		return -ESHUTDOWN;
++
+ 	auto [it, inserted] = frameContexts_.try_emplace(buffer);
+ 	FrameContext &context = it->second;
+ 	int ret;
+@@ -1770,9 +1907,8 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 			return ret;
+ 	}
+ 
+-	bool firingMainFlash = false;
+-	if (hasFlash_ && flashMode_ == controls::draft::FlashModeSingle) {
+-		firingMainFlash = true;
++	bool firingMainFlash = flash_ && flashMode_ == controls::draft::FlashModeSingle;
++	if (firingMainFlash && aeEnabled_) {
+ 		float minIdx = aeExposureIndex(profile_, exposureMin_ * lineDurationNs_ * gainMin_);
+ 		float maxIdx = aeExposureIndex(profile_, exposureMax_ * lineDurationNs_ * gainMax_);
+ 		float flashIndex = (preflashState_ == PreflashState::Settled)
+@@ -1791,28 +1927,32 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 					   gainMin_, gainMax_);
+ 		aeExposure_ = allocatedExposure / lineDurationNs_;
+ 		aeGain_ = allocatedGain;
+-		FlashDevice::instance().setTorch(false);
+-		FlashDevice::instance().triggerFlash(900000, 200000);
+-		flashMode_ = controls::draft::FlashModeOff;
+-		preflashState_ = PreflashState::Idle;
+-	} else if (hasFlash_) {
+-		FlashDevice::instance().clearStrobe();
+ 	}
+ 
++	auto [targetExposure, targetGain] = firingMainFlash
++		? std::pair{ aeExposure_, aeGain_ }
++		: quantizedExposureForFlicker(aeExposure_, aeGain_);
++	int32_t exposure = std::clamp(static_cast<int32_t>(std::lround(targetExposure)),
++				      exposureMin_, exposureMax_);
++	int32_t frameLines = std::max(frameLengthLimits_[0], exposure + exposureMargin_);
++
+ 	context.sensor = ControlList(sensor_->controls());
+-	context.sensor.set(V4L2_CID_EXPOSURE, static_cast<int32_t>(std::lround(aeExposure_)));
+-	context.sensor.set(V4L2_CID_ANALOGUE_GAIN, gainToCode(profile_, aeGain_));
++	context.sensor.set(V4L2_CID_EXPOSURE, exposure);
++	context.sensor.set(V4L2_CID_ANALOGUE_GAIN, gainToCode(profile_, targetGain));
++	context.sensor.set(V4L2_CID_VBLANK, frameLines - sensorHeight_);
++	context.frameDurationLimits = { frameDurationUs(frameLengthLimits_[0]),
++					frameDurationUs(frameLengthLimits_[1]) };
+ 	context.aeEnabled = aeEnabled_;
++	context.flickerMode = flickerMode_;
++	context.flickerPeriod = flickerPeriod_;
+ 	context.aeLocked = aeLocked_;
+ 	context.exposureValue = aeEnabled_ ? aeEvValue(aeEvStep_) : 0.0f;
+ 	if (!aeEnabled_) {
+ 		context.aeState = controls::AeStateIdle;
+ 	} else if (preflashState_ == PreflashState::EnterSkip || preflashState_ == PreflashState::Settling) {
+-		context.aeState = 5; /* AeStatePrecapture */
++		context.aeState = controls::AeStateSearching;
+ 	} else if (preflashState_ == PreflashState::Settled) {
+ 		context.aeState = controls::AeStateConverged;
+-	} else if (hasFlash_ && luxIndex_ && *luxIndex_ >= 280.0) {
+-		context.aeState = 4; /* AeStateFlashRequired */
+ 	} else {
+ 		context.aeState = (aeLocked_ || aeSettled_) ? controls::AeStateConverged
+ 							     : controls::AeStateSearching;
+@@ -1820,16 +1960,20 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	context.flashMode = firingMainFlash ? controls::draft::FlashModeSingle : flashMode_;
+ 	context.precaptureTrigger = precaptureTrigger_;
+ 	context.oisMode = oisMode_;
++	context.afMetering = afMetering_;
++	context.afWindows = afWindows_;
++	context.testPatternMode = testPatternMode_;
+ 	precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
+-	if (!hasFlash_)
++	if (!flash_)
+ 		context.flashState = controls::draft::FlashStateUnavailable;
+-	else if (firingMainFlash)
+-		context.flashState = controls::draft::FlashStateFlashFired;
+ 	else
+ 		context.flashState = controls::draft::FlashStateReady;
+ 	ret = sensor_->device()->setControls(&context.sensor, context.request.get());
+-	if (ret)
++	if (ret) {
++		if (firingMainFlash && flash_->isTorchOn())
++			flash_->turnOff();
+ 		return ret;
++	}
+ 	qcom_camss_ife_config config = ifeConfiguration();
+ 	context.ife.red = config.wb_gain_q7[0] / 128.0;
+ 	context.ife.green = config.wb_gain_q7[1] / 128.0;
+@@ -1839,11 +1983,17 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	for (unsigned int i = 0; i < context.ife.ccm.size(); i++)
+ 		context.ife.ccm[i] = config.ccm_q7[i] / 128.0f;
+ 	ret = transferIfe(config, context.request.get(), false);
+-	if (ret)
++	if (ret) {
++		if (firingMainFlash && flash_->isTorchOn())
++			flash_->turnOff();
+ 		return ret;
++	}
+ 	ret = video_->queueBuffer(buffer, context.request.get());
+-	if (ret)
++	if (ret) {
++		if (firingMainFlash && flash_->isTorchOn())
++			flash_->turnOff();
+ 		return ret;
++	}
+ 	ret = context.request->queue();
+ 	if (!ret && !videoStarted_) {
+ 		ret = video_->streamOn();
+@@ -1851,13 +2001,24 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 			videoStarted_ = true;
+ 	}
+ 	if (ret) {
+-		LOG(QcomPipeline, Error) << "Failed to start queued IFE request: " << ret;
+-		/* streamOff() completes accepted buffers through bufferReady. */
++		LOG(QcomPipeline, Error) << "Failed to queue IFE request: " << ret;
++		if (firingMainFlash && flash_->isTorchOn())
++			flash_->turnOff();
++		/* The pipeline base class cancels the request that returns an error. */
++		failedBuffer_ = buffer;
+ 		int cancel = video_->streamOff();
++		failedBuffer_ = nullptr;
+ 		if (cancel)
+ 			LOG(QcomPipeline, Error) << "Failed to cancel queued buffers: " << cancel;
+ 		else
+ 			videoStarted_ = false;
++		return ret;
++	}
++	if (firingMainFlash) {
++		flashMode_ = controls::draft::FlashModeOff;
++		preflashState_ = PreflashState::Idle;
++		if (flash_->triggerFlash())
++			context.flashState = controls::draft::FlashStateFlashFired;
+ 	}
+ 	return 0;
+ }
+@@ -1872,13 +2033,35 @@ int QcomCameraData::completeIfe(FrameBuffer *buffer, uint32_t sequence)
+ 	int ret = transferIfe(config, context.request.get(), true);
+ 	if (ret)
+ 		return ret;
+-	if (config.frame_sequence != sequence || !config.sensor_timestamp)
++	if (config.frame_sequence != sequence || !config.sensor_timestamp || !config.frame_duration_us)
+ 		return -EIO;
++	context.frameDuration = config.frame_duration_us;
++	frameDurationNs_ = context.frameDuration * 1000;
+ 	LOG(QcomPipeline, Debug) << "IFE request frame " << sequence << " gains "
+ 		<< context.ife.red << " " << context.ife.green << " " << context.ife.blue
+ 		<< " CCT " << context.ife.cct << " AWB " << context.ife.awbEnabled;
++	/* V4L2 and IFE use MONOTONIC, while SensorTimestamp includes suspend time. */
++	uint64_t bestSpan = UINT64_MAX;
++	int64_t offset = 0;
++	for (unsigned int attempt = 0; attempt < 5; ++attempt) {
++		struct timespec bootTime;
++		uint64_t before = monotonicNs();
++		if (clock_gettime(CLOCK_BOOTTIME, &bootTime))
++			return -errno;
++		uint64_t after = monotonicNs();
++		uint64_t span = after >= before ? after - before : UINT64_MAX;
++		if (span < bestSpan) {
++			bestSpan = span;
++			int64_t bootNs = static_cast<int64_t>(bootTime.tv_sec) * 1000000000LL +
++					 bootTime.tv_nsec;
++			int64_t mid = static_cast<int64_t>(before + span / 2);
++			offset = std::max<int64_t>(0, bootNs - mid);
++			if (bestSpan < 20000)
++				break;
++		}
++	}
+ 	buffer->request()->_d()->metadata().set(controls::SensorTimestamp,
+-					      config.sensor_timestamp);
++					      config.sensor_timestamp + static_cast<uint64_t>(offset));
+ 	return 0;
+ }
+ 
+@@ -2224,7 +2407,9 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 		/* Baseline AE exposure knee tables are tuned for fixed 60Hz (steps of 1/120s = 8333us).
+ 		 * Motion frequency is bound to frequency 2 (60Hz) matching baseline AE allocation.
+ 		 */
+-		constexpr int frequency = kMotionFrequency;
++		const int frequency = flickerMode_ == controls::FlickerManual &&
++				      flickerPeriod_ && flickerPeriod_ != 8333
++					      ? 0 : kMotionFrequency;
+ 		float curGain = static_cast<float>(appliedGain);
+ 		float iqmOutdoor = latestFilteredOutdoorProb_;
+ 		/* Standard single-exposure Bayer streaming has no secondary short exposure (slRatio = 0.0f).
+@@ -2273,8 +2458,8 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 				 << aeExposure_ << " gain " << aeGain_;
+ 
+ 	bool aeSettled = result.settled;
+-	if (hasFlash_) {
+-		if (preflashState_ == PreflashState::Idle && !FlashDevice::instance().isTorchOn()) {
++	if (flash_) {
++		if (preflashState_ == PreflashState::Idle && !flash_->isTorchOn()) {
+ 			ambientZoneLuma_ = currentZoneLuma_;
+ 			if (luxIndex_)
+ 				ambientIndex_ = static_cast<float>(*luxIndex_);
+@@ -2291,7 +2476,7 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 
+ 			if (preflashSettledFrames_ >= 3 || preflashFrameCounter_ >= 12) {
+ 				preflashState_ = PreflashState::Settled;
+-				FlashDevice::instance().setTorch(false);
++				flash_->setTorch(false);
+ 				preflashIndex_ = result.index;
+ 				preflashZoneLuma_ = currentZoneLuma_;
+ 				auto flashRes = estimateSmartFlash(smartFlash_, profile_.aeLuxLogScale,
+@@ -2364,17 +2549,14 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 	unsigned int flashState = 0;
+ 	unsigned int led = 0;
+ 	bool flashOn = false;
+-	if (hasFlash_) {
+-		if (FlashDevice::instance().isTorchOn() || flashMode_ == controls::draft::FlashModeTorch) {
+-			flashState = 1;
+-			led = 1;
+-			flashOn = true;
+-		} else if (preflashState_ == PreflashState::Settling || preflashState_ == PreflashState::Settled) {
+-			flashState = 2;
+-			led = 1;
+-			flashOn = true;
+-		} else if (FlashDevice::instance().isStrobeActive()) {
++	if (flash_) {
++		if (flash_->isStrobeActive()) {
+ 			flashState = 3;
++			led = 3;
++			flashOn = true;
++		} else if (flash_->isTorchOn()) {
++			flashState = (preflashState_ == PreflashState::EnterSkip ||
++				      preflashState_ == PreflashState::Settling) ? 2 : 1;
+ 			led = 1;
+ 			flashOn = true;
+ 		}
+@@ -2424,7 +2606,8 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 
+ 	const auto &result = lgAwb_->process(lgBg_.rgb,
+ 		{ luxRounded, awbMinimumGrayCount_, flashState, led, awbCameraId_, fps, 13, 0,
+-		  aeSettled, false, false, false, false, flashOn, false, awbFlatMetric_,
++		  aeSettled, false, false, false, latestFilteredOutdoorProb_ >= 0.5f,
++		  flashOn, false, awbFlatMetric_,
+ 		  static_cast<uint32_t>(awbFrame_),
+ 		  static_cast<uint32_t>(statsInputSize_.width),
+ 		  static_cast<uint32_t>(statsInputSize_.height),
+@@ -2453,6 +2636,7 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 		<< " ae " << aeSettled << " flat " << awbFlatMetric_
+ 		<< " startup " << result.cadence.startup << " skipped " << result.cadence.skipped
+ 		<< " counter " << result.cadence.counter << " gray " << result.grayValid
++		<< " FWB weight " << result.fwbWeight
+ 		<< " source " << static_cast<unsigned int>(result.target.source)
+ 		<< " target " << result.target.rgb[0] << " " << result.target.rgb[1] << " " << result.target.rgb[2]
+ 		<< " gains " << result.rgb[0] << " " << result.rgb[1] << " " << result.rgb[2]
+@@ -2460,12 +2644,76 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 
+ }
+ 
+-double QcomCameraData::focusScore() const
++void QcomCameraData::updateAfWeights()
+ {
+-	/* Keep background edges outside the central focus target out of the score. */
+-	const uint64_t *roi = &bf_[1 + (QCOM_CAMSS_BF_ROIS / 2) * 4];
++	afWeights_.fill(0.0);
++	if (statsInputSize_.width <= 128 || statsInputSize_.height <= 64) {
++		afWeights_[QCOM_CAMSS_BF_ROIS / 2] = 1.0;
++		return;
++	}
++
++	std::optional<Point> fallbackCenter;
++	if (afMetering_ == controls::AfMeteringWindows && !afWindows_.empty()) {
++		/* Match the BF layout programmed by vfe_stats_bf_dmi(). */
++		const Size cell{ ((statsInputSize_.width - 128) / 5) & ~1U,
++				 ((statsInputSize_.height - 64) / 5) & ~1U };
++		for (Rectangle window : afWindows_) {
++			window = window.boundedTo(analogCrop_);
++			if (!window.width || !window.height)
++				continue;
++			window = window.transformedBetween(analogCrop_, Rectangle(statsInputSize_));
++			if (!!(transform_ & Transform::HFlip))
++				window.x = statsInputSize_.width - (window.x + window.width);
++			if (!!(transform_ & Transform::VFlip))
++				window.y = statsInputSize_.height - (window.y + window.height);
++
++			if (!fallbackCenter)
++				fallbackCenter = window.center();
++
++			for (unsigned int i = 0; i < afWeights_.size(); ++i) {
++				Rectangle region{ static_cast<int>(64 + cell.width * (i % 5)),
++						  static_cast<int>(32 + cell.height * (i / 5)), cell };
++				Rectangle overlap = region.boundedTo(window);
++				afWeights_[i] += overlap.width * overlap.height;
++			}
++		}
++	}
++	double area = std::accumulate(afWeights_.begin(), afWeights_.end(), 0.0);
++	if (!area) {
++		unsigned int best = QCOM_CAMSS_BF_ROIS / 2;
++		if (fallbackCenter) {
++			const Size cell{ ((statsInputSize_.width - 128) / 5) & ~1U,
++					 ((statsInputSize_.height - 64) / 5) & ~1U };
++			double bestDist = std::numeric_limits<double>::max();
++			for (unsigned int i = 0; i < afWeights_.size(); ++i) {
++				Rectangle region{ static_cast<int>(64 + cell.width * (i % 5)),
++						  static_cast<int>(32 + cell.height * (i / 5)), cell };
++				Point center = region.center();
++				double dx = center.x - fallbackCenter->x;
++				double dy = center.y - fallbackCenter->y;
++				double dist = dx * dx + dy * dy;
++				if (dist < bestDist) {
++					bestDist = dist;
++					best = i;
++				}
++			}
++		}
++		afWeights_[best] = 1.0;
++		return;
++	}
++	for (double &weight : afWeights_)
++		weight /= area;
++}
+ 
+-	return (roi[1] & 0xffffffffffULL) + (roi[3] & 0xffffffffffULL);
++double QcomCameraData::focusScore() const
++{
++	double score = 0.0;
++	for (unsigned int i = 0; i < afWeights_.size(); ++i) {
++		const uint64_t *roi = &bf_[1 + i * 4];
++		score += afWeights_[i] * ((roi[1] & 0xffffffffffULL) +
++					  (roi[3] & 0xffffffffffULL));
++	}
++	return score;
+ }
+ 
+ void QcomCameraData::startAfScan(uint64_t timestamp)
+@@ -2648,8 +2896,92 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 	}
+ }
+ 
++int QcomCameraData::setOisMode(int32_t mode)
++{
++	V4L2Subdevice *ois = sensor_->ois();
++	ControlList controls(ois->controls());
++	controls.set(V4L2_CID_IMAGE_STABILIZATION,
++		     mode == controls::draft::OpticalImageStabilizationModeOn ? 1 : 0);
++	int ret = ois->setControls(&controls);
++	if (ret) {
++		LOG(QcomPipeline, Error) << "Failed to set OIS mode: " << ret;
++		return ret < 0 ? ret : -EIO;
++	}
++
++	oisMode_ = mode;
++	return 0;
++}
++
++std::pair<double, double> QcomCameraData::quantizedExposureForFlicker(double exposure, double gain) const
++{
++	if (!aeEnabled_ || flickerMode_ != controls::FlickerManual || !flickerPeriod_)
++		return { exposure, gain };
++
++	double period = flickerPeriod_ * 1000.0 / lineDurationNs_;
++	if (exposure < period || exposureMax_ < period)
++		return { exposure, gain };
++
++	double maxPeriods = std::floor(exposureMax_ / period);
++	double periods = std::clamp(std::round(exposure / period), 1.0, maxPeriods);
++	double quantized = std::clamp(std::round(periods * period),
++				      static_cast<double>(exposureMin_),
++				      static_cast<double>(exposureMax_));
++	double adjustedGain = std::clamp(gain * exposure / quantized, gainMin_, gainMax_);
++	return { quantized, adjustedGain };
++}
++
++int64_t QcomCameraData::frameDurationUs(int32_t lines) const
++{
++	return std::llround(lines * lineDurationNs_ / 1000.0);
++}
++
++void QcomCameraData::setFrameDurationLimits(Span<const int64_t, 2> durations)
++{
++	auto toLines = [this](int64_t duration) {
++		duration = std::clamp(duration, frameDurationUs(minFrameLines_), frameDurationUs(maxFrameLines_));
++		return std::clamp(static_cast<int32_t>(std::llround(duration * 1000.0 / lineDurationNs_)),
++				  minFrameLines_, maxFrameLines_);
++	};
++	int32_t min = toLines(durations[0]);
++	int32_t max = std::max(min, toLines(durations[1]));
++	frameLengthLimits_ = { min, max };
++	exposureMax_ = max - exposureMargin_;
++}
++
+ int QcomCameraData::processControls(const ControlList &controls)
+ {
++	if (auto limits = controls.get(controls::FrameDurationLimits))
++		setFrameDurationLimits(*limits);
++	if (auto mode = controls.get(controls::AeFlickerMode)) {
++		if (*mode == controls::FlickerOff || *mode == controls::FlickerManual)
++			flickerMode_ = *mode;
++		else
++			LOG(QcomPipeline, Warning) << "Ignoring unsupported AeFlickerMode " << *mode;
++	}
++	if (auto period = controls.get(controls::AeFlickerPeriod))
++		flickerPeriod_ = std::clamp(*period, 0, 1000000);
++	if (auto mode = controls.get(controls::draft::TestPatternMode)) {
++		int ret = sensor_->setTestPatternMode(static_cast<controls::draft::TestPatternModeEnum>(*mode));
++		if (ret)
++			return ret < 0 ? ret : -EIO;
++		testPatternMode_ = *mode;
++	}
++	bool afWindowUpdated = false;
++	if (auto metering = controls.get(controls::AfMetering)) {
++		if (*metering == controls::AfMeteringAuto ||
++		    *metering == controls::AfMeteringWindows) {
++			afMetering_ = *metering;
++			updateAfWeights();
++			afWindowUpdated = true;
++		} else {
++			LOG(QcomPipeline, Warning) << "Ignoring unsupported AfMetering " << *metering;
++		}
++	}
++	if (auto windows = controls.get(controls::AfWindows)) {
++		afWindows_.assign(windows->begin(), windows->end());
++		updateAfWeights();
++		afWindowUpdated = true;
++	}
+ 	if (controls.contains(controls::AeEnable.id())) {
+ 		bool enabled = *controls.get(controls::AeEnable);
+ 		bool resumeAuto = enabled && !aeEnabled_;
+@@ -2712,14 +3044,25 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 	if (aeEnabled_ && controls.contains(controls::ExposureValue.id()))
+ 		aeEvStep_ = aeEvStep(*controls.get(controls::ExposureValue));
+ 
+-	if (hasFlash_) {
++	if (flash_) {
+ 		if (controls.contains(controls::draft::FlashMode.id())) {
+ 			int32_t mode = *controls.get(controls::draft::FlashMode);
+-			flashMode_ = mode;
+-			if (mode == controls::draft::FlashModeTorch)
+-				FlashDevice::instance().setTorch(true, 255);
+-			else if (mode == controls::draft::FlashModeOff && preflashState_ == PreflashState::Idle)
+-				FlashDevice::instance().setTorch(false);
++			if (mode != controls::draft::FlashModeOff &&
++			    mode != controls::draft::FlashModeSingle &&
++			    mode != controls::draft::FlashModeTorch) {
++				LOG(QcomPipeline, Warning) << "Ignoring unsupported FlashMode " << mode;
++			} else {
++				const bool preflashLighting =
++					preflashState_ == PreflashState::EnterSkip ||
++					preflashState_ == PreflashState::Settling;
++				if (mode == controls::draft::FlashModeTorch &&
++				    !flash_->isTorchOn() && !flash_->setTorch(true))
++					return -EIO;
++				if (mode == controls::draft::FlashModeOff && !preflashLighting &&
++				    flash_->isTorchOn() && !flash_->setTorch(false))
++					return -EIO;
++				flashMode_ = mode;
++			}
+ 		}
+ 
+ 		if (controls.contains(controls::draft::AePrecaptureTrigger.id())) {
+@@ -2727,38 +3070,28 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 			precaptureTrigger_ = trigger;
+ 			if (trigger == controls::draft::AePrecaptureTriggerStart) {
+ 				if (preflashState_ == PreflashState::Idle) {
++					if (!flash_->setTorch(true))
++						return -EIO;
+ 					preflashState_ = PreflashState::EnterSkip;
+ 					preflashSkipFrames_ = (sensor_->entity()->name().find("imx363") != std::string::npos) ? 3 : 2;
+ 					preflashSettledFrames_ = 0;
+ 					preflashFrameCounter_ = 0;
+-					FlashDevice::instance().setTorch(true, 255);
+ 					LOG(QcomPipeline, Debug) << "Flash precapture started";
+ 				}
+ 			} else if (trigger == controls::draft::AePrecaptureTriggerCancel) {
+ 				preflashState_ = PreflashState::Idle;
+ 				if (flashMode_ != controls::draft::FlashModeTorch)
+-					FlashDevice::instance().turnOff();
++					flash_->turnOff();
+ 				LOG(QcomPipeline, Debug) << "Flash precapture cancelled";
+ 			}
+ 		}
+ 	}
+ 
+-	if (hasOis_ && controls.contains(controls::draft::OpticalImageStabilizationMode.id())) {
+-		int32_t mode = *controls.get(controls::draft::OpticalImageStabilizationMode);
+-		if (mode != oisMode_) {
+-			oisMode_ = mode;
+-			V4L2Subdevice *ois = sensor_->ois();
+-			if (ois) {
+-				ControlList oisCtrls(ois->controls());
+-				oisCtrls.set(V4L2_CID_IMAGE_STABILIZATION,
+-					     mode == controls::draft::OpticalImageStabilizationModeOn ? 1 : 0);
+-				int oisRet = ois->setControls(&oisCtrls);
+-				if (oisRet)
+-					LOG(QcomPipeline, Error) << "Failed to set OIS mode: " << oisRet;
+-				else
+-					LOG(QcomPipeline, Debug) << "OIS mode set to " << mode;
+-			}
+-		}
++	if (auto mode = controls.get(controls::draft::OpticalImageStabilizationMode);
++	    hasOis_ && mode && *mode != oisMode_) {
++		int ret = setOisMode(*mode);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	if (controls.contains(controls::AwbEnable.id())) {
+@@ -2769,14 +3102,21 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		}
+ 	}
+ 	if (!awbEnabled_) {
+-		auto cct = qtiAwb_ ? controls.get(controls::ColourTemperature) : std::nullopt;
++		auto cct = controls.get(controls::ColourTemperature);
+ 		if (cct)
+ 			*cct = std::clamp(*cct, 1500, 12000);
+ 		if (auto gains = controls.get(controls::ColourGains)) {
+ 			setManualAwb((*gains)[0], (*gains)[1], cct);
+ 		} else if (cct) {
+-			auto manualGains = qtiAwb_->manualGains(*cct);
+-			setManualAwb(manualGains[0], manualGains[1], cct);
++			if (qtiAwb_) {
++				auto manualGains = qtiAwb_->manualGains(*cct);
++				setManualAwb(manualGains[0], manualGains[1], cct);
++			} else if (lgAwb_) {
++				const auto &colour = lgAwb_->grayCore().colour();
++				auto ratios = lgAwbRatiosForTemperature(colour, *cct);
++				if (ratios.red > 0.0f && ratios.blue > 0.0f)
++					setManualAwb(1.0 / ratios.red, 1.0 / ratios.blue, cct);
++			}
+ 		}
+ 	}
+ 
+@@ -2861,7 +3201,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 	    controls.contains(controls::AfTrigger.id())) {
+ 		int trigger = *controls.get(controls::AfTrigger);
+ 		if (trigger == controls::AfTriggerStart &&
+-		    afStage_ == AfStage::Idle) {
++		    (afStage_ == AfStage::Idle || afWindowUpdated)) {
+ 			startAfScan(statsTimestamp_);
+ 		}
+ 		else if (trigger == controls::AfTriggerCancel) {
+@@ -2906,8 +3246,8 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 		int32_t us = static_cast<int32_t>(lines * lineDurationNs_ / 1000.0);
+ 		metadata.set(controls::ExposureTime, us);
+ 	}
+-	metadata.set(controls::FrameDuration,
+-		     static_cast<int64_t>(frameDurationNs_ / 1000));
++	metadata.set(controls::FrameDuration, context.frameDuration);
++	metadata.set(controls::FrameDurationLimits, context.frameDurationLimits);
+ 
+ 	if (applied.contains(V4L2_CID_ANALOGUE_GAIN)) {
+ 		int32_t gain = applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
+@@ -2938,12 +3278,19 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 		} else {
+ 			LOG(QcomPipeline, Debug) << "Missing AF state for frame " << sequence;
+ 		}
++		metadata.set(controls::AfMetering, context.afMetering);
++		if (!context.afWindows.empty())
++			metadata.set(controls::AfWindows, Span<const Rectangle>(context.afWindows));
+ 	}
++	if (!sensor_->testPatternModes().empty())
++		metadata.set(controls::draft::TestPatternMode, context.testPatternMode);
+ 
+ 	metadata.set(controls::AeEnable, context.aeEnabled);
+ 	metadata.set(controls::draft::AeLock, context.aeLocked);
+ 	metadata.set(controls::ExposureValue, context.exposureValue);
+ 	metadata.set(controls::AeState, context.aeState);
++	metadata.set(controls::AeFlickerMode, context.flickerMode);
++	metadata.set(controls::AeFlickerPeriod, context.flickerPeriod);
+ 	metadata.set(controls::draft::FlashMode, context.flashMode);
+ 	metadata.set(controls::draft::FlashState, context.flashState);
+ 	metadata.set(controls::draft::AePrecaptureTrigger, context.precaptureTrigger);
+@@ -2983,6 +3330,9 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 
+ void QcomCameraData::imageBufferReady(FrameBuffer *buffer)
+ {
++	if (buffer == failedBuffer_)
++		return;
++
+ 	QcomPipelineHandler *pipe =
+ 		static_cast<QcomPipelineHandler *>(this->pipe());
+ 
+@@ -3031,6 +3381,8 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
+ 
+ 	if (roles.empty())
+ 		return config;
++	if (roles.size() != 1 || roles[0] == StreamRole::Raw)
++		return nullptr;
+ 
+ 	std::map<PixelFormat, std::vector<SizeRange>> formats;
+ 	std::vector<SizeRange> sizes;
+@@ -3041,12 +3393,15 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
+ 
+ 	StreamConfiguration cfg(formats);
+ 	cfg.pixelFormat = formats::NV12;
+-	cfg.size = data->profile_.defaultOutputSize;
++	cfg.size = roles[0] == StreamRole::StillCapture
++		? data->profile_.outputSizes[0]
++		: data->profile_.defaultOutputSize;
+ 	cfg.colorSpace = ColorSpace::Sycc;
+ 	cfg.bufferCount = kBufferCount;
+ 
+ 	config->addConfiguration(cfg);
+-	config->validate();
++	if (config->validate() == CameraConfiguration::Invalid)
++		return nullptr;
+ 
+ 	return config;
+ }
+@@ -3058,11 +3413,18 @@ int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
+ 
+ 	QcomCameraData *data = cameraData(camera);
+ 	StreamConfiguration &cfg = config->at(0);
+-	int ret;
++	int ret = data->openCaptureDevices();
++	if (ret < 0)
++		return ret;
++	auto closeDevices = utils::scope_exit{ [&]() { data->closeCaptureDevices(); } };
+ 
++	Transform previousTransform = data->transform_;
++	data->transform_ = static_cast<QcomCameraConfiguration *>(config)->transform_;
+ 	ret = data->setFormats(cfg.size);
+-	if (ret < 0)
++	if (ret < 0) {
++		data->transform_ = previousTransform;
+ 		return ret;
++	}
+ 
+ 	cfg.setStream(&data->stream_);
+ 
+@@ -3072,10 +3434,21 @@ int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
+ int QcomPipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
+ 					    std::vector<std::unique_ptr<FrameBuffer>> *buffers)
+ {
++	if (activeCamera_)
++		return -EBUSY;
++
+ 	QcomCameraData *data = cameraData(camera);
+-	unsigned int count = stream->configuration().bufferCount;
++	const StreamConfiguration &cfg = stream->configuration();
++	int ret = data->openCaptureDevices();
++	if (ret < 0)
++		return ret;
++	auto closeDevices = utils::scope_exit{ [&]() { data->closeCaptureDevices(); } };
+ 
+-	return data->video_->exportBuffers(count, buffers);
++	ret = data->setFormats(cfg.size, false);
++	if (ret < 0)
++		return ret;
++
++	return data->video_->exportBuffers(cfg.bufferCount, buffers);
+ }
+ 
+ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+@@ -3084,14 +3457,33 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		return -EBUSY;
+ 
+ 	QcomCameraData *data = cameraData(camera);
+-	int ret;
++	int ret = data->openCaptureDevices();
++	if (ret < 0)
++		return ret;
++
++	auto errorCleanup = utils::scope_exit{ [&]() {
++		data->closeCaptureDevices();
++		data->closeAncillaryDevices();
++		data->setFc4Engine(nullptr);
++		fc4Engine_.reset();
++	} };
++
++	/* All cameras share the PIX route and an idle camera may have reconfigured it. */
++	ret = data->setFormats(data->stream_.configuration().size, false);
++	if (ret < 0)
++		return ret;
++
++	if (data->lgAwb_) {
++		if (!fc4Engine_)
++			fc4Engine_ = std::make_unique<FC4Engine>();
++		data->setFc4Engine(fc4Engine_.get());
++	}
+ 
+-	auto errorCleanup = utils::scope_exit{ [&]() { data->closeAncillaryDevices(); } };
+ 	ret = data->openAncillaryDevices();
+ 	if (ret < 0)
+ 		return ret;
+-	if (data->hasFlash_) {
+-		FlashDevice::instance().turnOff();
++	if (data->flash_) {
++		data->flash_->turnOff();
+ 		data->flashMode_ = controls::draft::FlashModeOff;
+ 		data->preflashState_ = QcomCameraData::PreflashState::Idle;
+ 		data->flashState_ = controls::draft::FlashStateReady;
+@@ -3100,7 +3492,14 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		data->flashInfluence_ = 0.0f;
+ 	}
+ 
+-	V4L2Subdevice *ois = data->sensor_->ois();
++	if (data->hasOis_) {
++		auto mode = controls
++			? controls->get(controls::draft::OpticalImageStabilizationMode)
++			: std::nullopt;
++		ret = data->setOisMode(mode.value_or(controls::draft::OpticalImageStabilizationModeOn));
++		if (ret)
++			return ret;
++	}
+ 
+ 	data->lastStatsSequence_ = UINT32_MAX;
+ 	data->statsTimestamp_ = 0;
+@@ -3108,10 +3507,28 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->histogramTarget_.reset();
+ 	data->aecLuma_.reset();
+ 	data->aeTargetLuma_.reset();
++	data->aeEnabled_ = true;
++	data->aeEvStep_ = 0;
++	data->flickerMode_ = controls::FlickerOff;
++	data->flickerPeriod_ = 0;
+ 	data->aeLocked_ = false;
+ 	data->lockedIndex_ = 0.0f;
+ 	data->lockedEvStep_ = 0;
+ 	data->aeSettled_ = false;
++	data->awbEnabled_ = true;
++	data->faceDetectMode_ = controls::draft::FaceDetectModeOff;
++	data->faceRect_.reset();
++	data->lgFaces_.clear();
++	data->afMode_ = controls::AfModeContinuous;
++	data->afMetering_ = controls::AfMeteringAuto;
++	data->afWindows_.clear();
++	data->afPaused_ = false;
++	data->afDeferredPause_ = false;
++	data->afPauseState_ = controls::AfPauseStateRunning;
++	data->afState_ = controls::AfStateIdle;
++	data->afStage_ = QcomCameraData::AfStage::Idle;
++	data->testPatternMode_ = controls::draft::TestPatternModeOff;
++	data->updateAfWeights();
+ 	data->fc4StableCount_ = 0;
+ 	data->currAeStep_ = 0;
+ 	data->targetAeStep_ = 0;
+@@ -3152,18 +3569,6 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	activeCamera_ = camera;
+ 	errorCleanup.release();
+ 
+-	if (ois) {
+-		ControlList ctrls(ois->controls());
+-		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 1);
+-		ret = ois->setControls(&ctrls);
+-		if (ret) {
+-			LOG(QcomPipeline, Error) << "Failed to enable OIS: " << ret;
+-			stopDevice(camera);
+-			return ret;
+-		}
+-		data->oisMode_ = controls::draft::OpticalImageStabilizationModeOn;
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -3171,8 +3576,8 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ {
+ 	QcomCameraData *data = cameraData(camera);
+ 
+-	if (data->hasFlash_) {
+-		FlashDevice::instance().turnOff();
++	if (data->flash_) {
++		data->flash_->turnOff();
+ 		data->flashMode_ = controls::draft::FlashModeOff;
+ 		data->preflashState_ = QcomCameraData::PreflashState::Idle;
+ 		data->flashState_ = controls::draft::FlashStateReady;
+@@ -3181,24 +3586,19 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 		data->flashInfluence_ = 0.0f;
+ 	}
+ 
+-	V4L2Subdevice *ois = data->sensor_->ois();
+-	if (ois) {
+-		ControlList ctrls(ois->controls());
+-		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 0);
+-		int ret = ois->setControls(&ctrls);
+-		if (ret)
+-			LOG(QcomPipeline, Error) << "Failed to disable OIS: " << ret;
+-		data->oisMode_ = controls::draft::OpticalImageStabilizationModeOn;
+-	}
++	if (data->hasOis_)
++		data->setOisMode(controls::draft::OpticalImageStabilizationModeOff);
+ 
+ 	data->video_->streamOff();
+ 	data->videoStarted_ = false;
+-	data->video_->releaseBuffers();
++	data->closeCaptureDevices();
+ 	data->frameContexts_.clear();
+ 	data->lastStatsSequence_ = UINT32_MAX;
+ 	data->aeLocked_ = false;
+ 	data->aeMotion_.reset();
+ 	data->resetAwb();
++	data->setFc4Engine(nullptr);
++	fc4Engine_.reset();
+ 	data->closeAncillaryDevices();
+ 	if (activeCamera_ == camera)
+ 		activeCamera_ = nullptr;
+@@ -3230,7 +3630,6 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+ 	if (!media_)
+ 		return false;
+ 
+-	fc4Engine_ = std::make_unique<FC4Engine>();
+ 	unsigned int registered = 0;
+ 	for (MediaEntity *entity : media_->entities()) {
+ 		if (entity->function() != MEDIA_ENT_F_CAM_SENSOR)
+@@ -3249,7 +3648,6 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+ 			continue;
+ 
+ 		auto data = std::make_unique<QcomCameraData>(this, media_, *profile);
+-		data->setFc4Engine(fc4Engine_.get());
+ 		int ret = data->init(entity);
+ 		if (ret < 0) {
+ 			LOG(QcomPipeline, Error)
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+index 90c5c05..604c2f1 100644
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -6,7 +6,7 @@
+ 
+ #include <linux/videodev2.h>
+ 
+-#define QCOM_CAMSS_IFE_CONFIG_VERSION 4
++#define QCOM_CAMSS_IFE_CONFIG_VERSION 6
+ 
+ #define QCOM_CAMSS_IFE_CONFIG_BLACK_LEVEL (1U << 0)
+ #define QCOM_CAMSS_IFE_CONFIG_WHITE_BALANCE (1U << 1)
+@@ -29,7 +29,7 @@ struct qcom_camss_ife_config {
+ 	int16_t ccm_q7[9];
+ 	int16_t ccm_offset[3];
+ 	uint16_t gamma[QCOM_CAMSS_IFE_GAMMA_CHANNELS][QCOM_CAMSS_IFE_GAMMA_ENTRIES];
+-	uint32_t reserved2;
++	uint32_t frame_duration_us;
+ 	uint64_t sensor_timestamp;
+ };
+ 

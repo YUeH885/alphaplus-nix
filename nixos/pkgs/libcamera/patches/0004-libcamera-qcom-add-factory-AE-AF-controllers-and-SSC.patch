@@ -1,0 +1,1413 @@
+From 1fc4f060958a7308ba8dc1433f1afeb6f22106eb Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu23234@gmail.com>
+Date: Sat, 7 Nov 2026 13:33:34 +0800
+Subject: [PATCH] libcamera: qcom: add factory AE/AF controllers and SSC
+ gravity compensation
+
+Add Chromatix histogram AE, FastConv exposure convergence, EV compensation,
+LG AE histogram flatness, LG SFAF contrast autofocus, sensor tuning tables,
+and SSC accelerometer gravity compensation for the main camera lens.
+---
+ src/libcamera/pipeline/qcom/ae_convergence.h  |  49 ++
+ .../pipeline/qcom/ae_exposure_compensation.h  |  37 ++
+ src/libcamera/pipeline/qcom/ae_histogram.h    | 173 +++++++
+ .../pipeline/qcom/ae_histogram_tuning.h       |  85 ++++
+ src/libcamera/pipeline/qcom/imx351_tuning.h   |  70 +++
+ src/libcamera/pipeline/qcom/imx363_tuning.h   |  51 +++
+ src/libcamera/pipeline/qcom/imx520_tuning.h   |  52 +++
+ src/libcamera/pipeline/qcom/lg_ae_flat.h      |  75 +++
+ .../pipeline/qcom/lg_ae_flat_tuning.h         |  26 ++
+ src/libcamera/pipeline/qcom/lg_ae_histogram.h |  18 +
+ src/libcamera/pipeline/qcom/s5k3m5.h          | 427 ++++++++++++++++++
+ src/libcamera/pipeline/qcom/s5k3m5_tuning.h   |  73 +++
+ .../pipeline/qcom/ssc_accelerometer.cpp       | 116 +++++
+ .../pipeline/qcom/ssc_accelerometer.h         |  37 ++
+ 14 files changed, 1289 insertions(+)
+ create mode 100644 src/libcamera/pipeline/qcom/ae_convergence.h
+ create mode 100644 src/libcamera/pipeline/qcom/ae_exposure_compensation.h
+ create mode 100644 src/libcamera/pipeline/qcom/ae_histogram.h
+ create mode 100644 src/libcamera/pipeline/qcom/ae_histogram_tuning.h
+ create mode 100644 src/libcamera/pipeline/qcom/imx351_tuning.h
+ create mode 100644 src/libcamera/pipeline/qcom/imx363_tuning.h
+ create mode 100644 src/libcamera/pipeline/qcom/imx520_tuning.h
+ create mode 100644 src/libcamera/pipeline/qcom/lg_ae_flat.h
+ create mode 100644 src/libcamera/pipeline/qcom/lg_ae_flat_tuning.h
+ create mode 100644 src/libcamera/pipeline/qcom/lg_ae_histogram.h
+ create mode 100644 src/libcamera/pipeline/qcom/s5k3m5.h
+ create mode 100644 src/libcamera/pipeline/qcom/s5k3m5_tuning.h
+ create mode 100644 src/libcamera/pipeline/qcom/ssc_accelerometer.cpp
+ create mode 100644 src/libcamera/pipeline/qcom/ssc_accelerometer.h
+
+diff --git a/src/libcamera/pipeline/qcom/ae_convergence.h b/src/libcamera/pipeline/qcom/ae_convergence.h
+new file mode 100644
+index 0000000..620fa8b
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ae_convergence.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++
++namespace libcamera::qcom {
++
++struct AeConvergenceTuning {
++	float unitStep;
++	float toleranceSteps;
++	float aggressiveness;
++};
++
++struct AeConvergenceResult {
++	float index;
++	bool settled;
++};
++
++inline AeConvergenceResult aeConvergeFast(const AeConvergenceTuning &tuning,
++					 float current, float applied, float target,
++					 float minimum, float maximum,
++					 unsigned int latency)
++{
++	float tolerance = tuning.unitStep * tuning.toleranceSteps;
++	float delta = target - current;
++	float index = current;
++	if (std::abs(delta) >= tolerance) {
++		float appliedDelta = target - applied;
++		float step = 0.0f;
++		if (delta * appliedDelta >= 0.0f) {
++			step = delta * tuning.aggressiveness;
++			float limit = appliedDelta / static_cast<float>(latency);
++			if (std::abs(step) > std::abs(limit))
++				step = limit;
++			if (std::abs(step) < tuning.unitStep)
++				step = step > 0.0f ? tuning.unitStep : -tuning.unitStep;
++		}
++		index += step;
++	}
++	index = std::clamp(std::round(index / tuning.unitStep) * tuning.unitStep,
++			   minimum, maximum);
++	float settledRange = 2.0f * tolerance;
++	return { index, index + settledRange >= maximum ||
++			index - settledRange <= minimum ||
++			std::abs(index - applied) <= settledRange };
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/ae_exposure_compensation.h b/src/libcamera/pipeline/qcom/ae_exposure_compensation.h
+new file mode 100644
+index 0000000..147ff5d
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ae_exposure_compensation.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++
++namespace libcamera::qcom {
++
++/* Shared Metering v8 EV tuning from all four factory Chromatix files. */
++constexpr int kAeStepsPerEv = 6;
++constexpr float kAeMinEv = -2.0f;
++constexpr float kAeMaxEv = 2.0f;
++constexpr std::array<float, 25> kAeEvMultipliers = {
++	0.25f, 0.2806f, 0.315f, 0.3536f, 0.3969f, 0.4454f,
++	0.5f, 0.5612f, 0.6299f, 0.7071f, 0.7937f, 0.8909f,
++	1.0f, 1.1225f, 1.2599f, 1.4142f, 1.5874f, 1.7818f,
++	2.0f, 2.2449f, 2.5198f, 2.8284f, 3.1748f, 3.5636f, 4.0f,
++};
++
++inline int aeEvStep(float ev)
++{
++	return std::lround(std::clamp(ev, kAeMinEv, kAeMaxEv) * kAeStepsPerEv);
++}
++
++inline float aeEvValue(int step)
++{
++	return static_cast<float>(step) / kAeStepsPerEv;
++}
++
++inline float aeEvOffset(int step, double logScale)
++{
++	unsigned int index = step - static_cast<int>(kAeMinEv * kAeStepsPerEv);
++	return logScale * std::log10(static_cast<double>(kAeEvMultipliers[index]));
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/ae_histogram.h b/src/libcamera/pipeline/qcom/ae_histogram.h
+new file mode 100644
+index 0000000..f906621
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ae_histogram.h
+@@ -0,0 +1,173 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <numeric>
++#include <optional>
++#include <span>
++
++namespace libcamera::qcom {
++
++/* Titan 175 nonuniform BHIST bins encode the upper edge in the 12-bit domain. */
++constexpr unsigned int bhistBinValue12(unsigned int bin)
++{
++	if (bin < 512)
++		return bin;
++	if (bin < 640)
++		return 4 * bin - 1533;
++	return 8 * bin - 4089;
++}
++
++struct AeHistogramParams {
++	float minTargetRatio;
++	float maxTargetRatio;
++	float brightLow;
++	float brightHigh;
++	float darkLow;
++	float darkHigh;
++	std::array<float, 2> pushupRange;
++	std::array<float, 2> pushdownRange;
++	std::array<float, 2> darkRange;
++};
++
++struct AeHistogramZone {
++	float start;
++	float end;
++	AeHistogramParams params;
++};
++
++struct AeHistogramTuning {
++	bool enabled;
++	float filterFactor;
++	std::array<AeHistogramZone, 5> zones;
++};
++
++inline AeHistogramParams aeHistogramParams(const AeHistogramTuning &tuning, float lux)
++{
++	const auto &zones = tuning.zones;
++	for (unsigned int i = 0; i + 1 < zones.size(); i++) {
++		if (lux < zones[i].end)
++			return zones[i].params;
++		if (lux >= zones[i + 1].start)
++			continue;
++		float t = (lux - zones[i].end) / (zones[i + 1].start - zones[i].end);
++		const auto &a = zones[i].params;
++		const auto &b = zones[i + 1].params;
++		auto mix = [t](float x, float y) { return std::fma(y - x, t, x); };
++		auto range = [&mix](const auto &x, const auto &y) {
++			return std::array{ mix(x[0], y[0]), mix(x[1], y[1]) };
++		};
++		return { mix(a.minTargetRatio, b.minTargetRatio),
++			 mix(a.maxTargetRatio, b.maxTargetRatio),
++			 mix(a.brightLow, b.brightLow), mix(a.brightHigh, b.brightHigh),
++			 mix(a.darkLow, b.darkLow), mix(a.darkHigh, b.darkHigh),
++			 range(a.pushupRange, b.pushupRange),
++			 range(a.pushdownRange, b.pushdownRange),
++			 range(a.darkRange, b.darkRange) };
++	}
++	return zones.back().params;
++}
++
++class BhistDistribution
++{
++public:
++	BhistDistribution(std::span<const uint32_t, 1024> bins, uint64_t total)
++	{
++		uint64_t count = 0;
++		float moment = 0.0f;
++		for (unsigned int i = 0; i < bins.size(); i++) {
++			count += bins[i];
++			moment = std::fma(static_cast<float>(bins[i]),
++					  static_cast<float>(bhistBinValue12(i)), moment);
++			cdf_[i] = static_cast<float>(count) / static_cast<float>(total);
++			moment_[i] = moment / static_cast<float>(total);
++		}
++	}
++
++	float mean8(float lower, float upper) const
++	{
++		return (integral(upper) - integral(lower)) / (upper - lower) / 16.0f;
++	}
++
++private:
++	float integral(float percentile) const
++	{
++		if (percentile == 0.0f)
++			return 0.0f;
++		unsigned int i = std::lower_bound(cdf_.begin(), cdf_.end(), percentile) -
++				 cdf_.begin();
++		float previous = i ? cdf_[i - 1] : 0.0f;
++		float previousMoment = i ? moment_[i - 1] : 0.0f;
++		float t = (percentile - previous) / (cdf_[i] - previous);
++		return std::fma(moment_[i] - previousMoment, t, previousMoment);
++	}
++
++	std::array<float, 1024> cdf_;
++	std::array<float, 1024> moment_;
++};
++
++class AeHistogramTarget
++{
++public:
++	void reset() { bounds_.reset(); }
++
++	float process(const AeHistogramTuning &tuning,
++		      std::span<const uint32_t, 1024> bins,
++		      float lux, float reference, float target)
++	{
++		if (!tuning.enabled)
++			return target;
++		uint64_t total = std::accumulate(bins.begin(), bins.end(), uint64_t{ 0 });
++		if (!total)
++			return target;
++
++		AeHistogramParams params = aeHistogramParams(tuning, lux);
++		BhistDistribution histogram(bins, total);
++		float up = std::max(0.1f, histogram.mean8(1.0f - params.pushupRange[1],
++							1.0f - params.pushupRange[0]));
++		float down = std::max(0.1f, histogram.mean8(1.0f - params.pushdownRange[1],
++							  1.0f - params.pushdownRange[0]));
++		float dark = std::max(0.1f, histogram.mean8(params.darkRange[0],
++							  params.darkRange[1]));
++		std::array<float, 4> bounds = { reference * (params.brightLow / up),
++					       reference * (params.brightHigh / down),
++					       reference * (params.darkLow / dark),
++					       reference * (params.darkHigh / dark) };
++		if (bounds[0] > bounds[1])
++			std::swap(bounds[0], bounds[1]);
++		if (bounds_) {
++			for (unsigned int i = 0; i < bounds.size(); i++)
++				bounds[i] = std::fma((*bounds_)[i] - bounds[i],
++						     tuning.filterFactor, bounds[i]);
++		}
++		bounds_ = bounds;
++
++		float lower, upper;
++		if (bounds[1] < bounds[2]) {
++			lower = bounds[1];
++			upper = bounds[2];
++		} else if (bounds[0] < bounds[2]) {
++			lower = bounds[2];
++			upper = std::min(bounds[1], bounds[3]);
++		} else if (bounds[1] < bounds[3]) {
++			lower = bounds[0];
++			upper = bounds[1];
++		} else if (bounds[0] < bounds[3]) {
++			lower = bounds[0];
++			upper = bounds[3];
++		} else {
++			lower = bounds[3];
++			upper = bounds[0];
++		}
++		return std::clamp(std::clamp(target, lower, upper),
++				  params.minTargetRatio * target, params.maxTargetRatio * target);
++	}
++
++private:
++	std::optional<std::array<float, 4>> bounds_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/ae_histogram_tuning.h b/src/libcamera/pipeline/qcom/ae_histogram_tuning.h
+new file mode 100644
+index 0000000..635bbe5
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ae_histogram_tuning.h
+@@ -0,0 +1,85 @@
++/* Generated by tools/gen-qcom-histogram-tuning.py. */
++
++namespace libcamera::qcom {
++
++constexpr AeHistogramTuning kS5k3m5HistogramTuning = {
++	true, 0.500000000f, {{
++		{ 0.000000000f, 100.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 200.000000000f, 265.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.045000002f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 280.000000000f, 310.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 230.000000000f, 5.000000000f, 118.000000000f,
++		    { 0.010000000f, 0.045000002f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 345.000000000f, 400.000000000f,
++		  { 1.000000000f, 1.000000000f, 120.000000000f, 190.000000000f, 5.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.029999999f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 450.000000000f, 1000.000000000f,
++		  { 1.000000000f, 1.000000000f, 120.000000000f, 190.000000000f, 5.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++	}}
++};
++
++constexpr AeHistogramTuning kImx363HistogramTuning = {
++	true, 0.500000000f, {{
++		{ 0.000000000f, 100.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 166.000000000f, 235.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 295.000000000f, 325.000000000f,
++		  { 0.699999988f, 1.500000000f, 130.000000000f, 170.000000000f, 2.000000000f, 118.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 362.000000000f, 400.000000000f,
++		  { 0.699999988f, 1.000000000f, 120.000000000f, 170.000000000f, 2.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 450.000000000f, 1000.000000000f,
++		  { 0.800000012f, 1.000000000f, 110.000000000f, 160.000000000f, 2.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++	}}
++};
++
++constexpr AeHistogramTuning kImx351HistogramTuning = {
++	true, 0.500000000f, {{
++		{ 0.000000000f, 100.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 200.000000000f, 265.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.045000002f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 280.000000000f, 310.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 230.000000000f, 5.000000000f, 118.000000000f,
++		    { 0.010000000f, 0.045000002f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 345.000000000f, 400.000000000f,
++		  { 1.000000000f, 1.000000000f, 120.000000000f, 190.000000000f, 5.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.029999999f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 450.000000000f, 1000.000000000f,
++		  { 1.000000000f, 1.000000000f, 120.000000000f, 190.000000000f, 5.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++	}}
++};
++
++constexpr AeHistogramTuning kImx520HistogramTuning = {
++	false, 0.500000000f, {{
++		{ 0.000000000f, 100.000000000f,
++		  { 0.899999976f, 2.000000000f, 150.000000000f, 210.000000000f, 0.000000000f, 149.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 166.000000000f, 265.000000000f,
++		  { 0.899999976f, 2.430000067f, 150.000000000f, 210.000000000f, 0.000000000f, 149.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 290.000000000f, 320.000000000f,
++		  { 0.899999976f, 2.430000067f, 150.000000000f, 210.000000000f, 0.000000000f, 149.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 362.000000000f, 400.000000000f,
++		  { 0.800000012f, 1.200000048f, 120.000000000f, 190.000000000f, 0.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 450.000000000f, 1000.000000000f,
++		  { 0.800000012f, 1.200000048f, 120.000000000f, 190.000000000f, 0.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++	}}
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/imx351_tuning.h b/src/libcamera/pipeline/qcom/imx351_tuning.h
+new file mode 100644
+index 0000000..ae0126a
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/imx351_tuning.h
+@@ -0,0 +1,70 @@
++/* Generated by tools/gen-imx351-qcom-tuning.py. */
++
++namespace libcamera::qcom {
++
++constexpr CcmEntry kImx351CcmEntries[] = {
++	{ 2500, { 234, -124, 18, -27, 160, -5, -6, -176, 310 } },
++	{ 3350, { 234, -124, 18, -27, 160, -5, -6, -176, 310 } },
++	{ 4400, { 231, -114, 11, -35, 170, -7, -6, -110, 245 } },
++	{ 7000, { 220, -96, 4, -21, 169, -19, -2, -115, 245 } },
++	{ 10000, { 220, -96, 4, -21, 169, -19, -2, -115, 245 } },
++};
++
++constexpr CctReference kImx351CctReferences[] = {
++	{ 2856, 1.034621954, 0.342722595 },
++	{ 5000, 0.644243002, 0.574822009 },
++	{ 6500, 0.592698872, 0.613973022 },
++	{ 7500, 0.562896788, 0.661324978 },
++};
++
++constexpr double kImx351AeAggressiveness = 0.649999976;
++constexpr double kImx351AeLuxFilterFactor = 0.500000000;
++constexpr double kImx351AeLuxReferenceLuma8 = 50.0;
++constexpr double kImx351AeLuxLumaMinimum8 = 0.1;
++constexpr double kImx351AeLuxLogScale = 77.89852905273438;
++constexpr double kImx351AeToleranceSteps = 2.0;
++constexpr double kImx351AeUnitStep = 0.500000000;
++
++constexpr AeLuxZone kImx351AeLuxZones[] = {
++	{ 0.0, 120.0, 40.0 },
++	{ 200.0, 240.0, 37.5 },
++	{ 300.0, 340.0, 35.0 },
++	{ 380.0, 420.0, 28.0 },
++	{ 450.0, 1000.0, 26.0 },
++};
++
++constexpr AeExposureKnee kImx351AeExposureKnees[] = {
++	{ 1.000000000, 74906, 0.000000000 },
++	{ 1.000000000, 33333333, 206.303298950 },
++	{ 4.000000000, 33333333, 253.202896118 },
++	{ 4.000000000, 41666667, 260.752014160 },
++	{ 10.000000000, 41666667, 291.750885010 },
++	{ 10.000000000, 50000000, 297.919006348 },
++	{ 24.000000000, 50000000, 327.536895752 },
++	{ 24.000000000, 62500000, 335.085998535 },
++	{ 34.000000000, 62500000, 346.869506836 },
++	{ 34.000000000, 76923077, 353.894104004 },
++	{ 64.000000000, 76923077, 375.292907715 },
++	{ 64.000000000, 99831461, 384.111785889 },
++};
++
++constexpr float kImx351AeMetering[16][16] = {
++	{ 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.142200, 0.179100, 0.221600, 0.262200, 0.294000, 0.311400, 0.311400, 0.294000, 0.262200, 0.221600, 0.179100, 0.142200, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.179100, 0.248600, 0.328300, 0.404500, 0.464100, 0.496700, 0.496700, 0.464100, 0.404500, 0.328300, 0.248600, 0.179100, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.221600, 0.328300, 0.450700, 0.567800, 0.659400, 0.709400, 0.709400, 0.659400, 0.567800, 0.450700, 0.328300, 0.221600, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.262200, 0.404500, 0.567800, 0.724100, 0.846100, 0.912900, 0.912900, 0.846100, 0.724100, 0.567800, 0.404500, 0.262200, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.294000, 0.464100, 0.659400, 0.846100, 0.992100, 1.000000, 1.000000, 0.992100, 0.846100, 0.659300, 0.464100, 0.294000, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.311400, 0.496700, 0.709400, 0.912900, 1.000000, 1.000000, 1.000000, 1.000000, 0.912900, 0.709400, 0.496600, 0.311400, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.311400, 0.496700, 0.709400, 0.912900, 1.000000, 1.000000, 1.000000, 1.000000, 0.912900, 0.709400, 0.496600, 0.311400, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.294000, 0.464100, 0.659400, 0.846100, 0.992100, 1.000000, 1.000000, 0.992000, 0.846100, 0.659300, 0.464000, 0.294000, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.262200, 0.404500, 0.567800, 0.724100, 0.846100, 0.912900, 0.912900, 0.846100, 0.724000, 0.567800, 0.404500, 0.262200, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.221600, 0.328300, 0.450700, 0.567800, 0.659300, 0.709400, 0.709400, 0.659300, 0.567800, 0.450700, 0.328300, 0.221600, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.179100, 0.248600, 0.328300, 0.404500, 0.464100, 0.496600, 0.496600, 0.464000, 0.404500, 0.328300, 0.248600, 0.179100, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.142200, 0.179100, 0.221600, 0.262200, 0.294000, 0.311400, 0.311400, 0.294000, 0.262200, 0.221600, 0.179100, 0.142200, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 },
++	{ 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000 },
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/imx363_tuning.h b/src/libcamera/pipeline/qcom/imx363_tuning.h
+new file mode 100644
+index 0000000..b9275d0
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/imx363_tuning.h
+@@ -0,0 +1,51 @@
++/* Generated by tools/gen-imx363-qcom-tuning.py. */
++
++namespace libcamera::qcom {
++
++constexpr CcmEntry kImx363CcmEntries[] = {
++	{ 2450, { 209, -127, 46, -35, 145, 18, -6, -185, 318 } },
++	{ 3200, { 230, -131, 29, -28, 136, 20, 9, -189, 308 } },
++	{ 4250, { 226, -92, -7, -41, 185, -16, -1, -122, 251 } },
++	{ 7000, { 214, -87, 1, -30, 185, -26, -2, -127, 257 } },
++	{ 15000, { 214, -87, 1, -30, 185, -26, -2, -127, 257 } },
++};
++
++constexpr CctReference kImx363CctReferences[] = {
++	{ 2856, 1.034621954, 0.342722595 },
++	{ 5000, 0.644243002, 0.574822009 },
++	{ 6500, 0.592698872, 0.613973022 },
++	{ 7500, 0.562896788, 0.661324978 },
++};
++
++constexpr double kImx363AeAggressiveness = 0.800000012;
++constexpr double kImx363AeLuxFilterFactor = 0.500000000;
++constexpr double kImx363AeLuxReferenceLuma8 = 50.0;
++constexpr double kImx363AeLuxLumaMinimum8 = 0.1;
++constexpr double kImx363AeLuxLogScale = 77.89852905273438;
++constexpr double kImx363AeToleranceSteps = 4.0;
++constexpr double kImx363AeUnitStep = 0.500000000;
++
++constexpr AeLuxZone kImx363AeLuxZones[] = {
++	{ 0.0, 100.0, 42.0 },
++	{ 166.0, 265.0, 40.0 },
++	{ 290.0, 320.0, 35.0 },
++	{ 362.0, 400.0, 26.0 },
++	{ 450.0, 1000.0, 26.0 },
++};
++
++constexpr AeExposureKnee kImx363AeExposureKnees[] = {
++	{ 1.000000000, 74906, 0.000000000 },
++	{ 1.000000000, 33333333, 206.303298950 },
++	{ 4.000000000, 33333333, 253.202896118 },
++	{ 4.000000000, 41666667, 260.752014160 },
++	{ 8.000000000, 41666667, 284.201812744 },
++	{ 8.000000000, 58823529, 295.868011475 },
++	{ 12.000000000, 58823529, 309.585296631 },
++	{ 12.000000000, 66666667, 313.819702148 },
++	{ 32.000000000, 66666667, 347.002014160 },
++	{ 32.000000000, 76923077, 351.843200684 },
++	{ 46.000000000, 76923077, 364.120605469 },
++	{ 46.000000000, 99831461, 372.939514160 },
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/imx520_tuning.h b/src/libcamera/pipeline/qcom/imx520_tuning.h
+new file mode 100644
+index 0000000..2faff43
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/imx520_tuning.h
+@@ -0,0 +1,52 @@
++/* Generated by tools/gen-imx520-qcom-tuning.py. */
++
++namespace libcamera::qcom {
++
++constexpr CcmEntry kImx520CcmEntries[] = {
++	{ 2400, { 208, -88, 8, -28, 179, -23, -3, -115, 246 } },
++	{ 3300, { 217, -98, 8, -31, 184, -25, -3, -127, 259 } },
++	{ 4380, { 232, -118, 14, -31, 190, -31, -8, -92, 227 } },
++	{ 9000, { 219, -96, 5, -28, 202, -46, -8, -100, 236 } },
++};
++
++constexpr CctReference kImx520CctReferences[] = {
++	{ 2856, 0.767592549, 0.347797126 },
++	{ 5000, 0.482321143, 0.568528652 },
++	{ 6500, 0.412425041, 0.634280205 },
++	{ 7500, 0.357652098, 0.693407536 },
++};
++
++constexpr double kImx520AeAggressiveness = 0.649999976;
++constexpr double kImx520AeLuxFilterFactor = 0.500000000;
++constexpr double kImx520AeLuxReferenceLuma8 = 50.0;
++constexpr double kImx520AeLuxLumaMinimum8 = 0.1;
++constexpr double kImx520AeLuxLogScale = 77.89852905273438;
++constexpr double kImx520AeToleranceSteps = 2.0;
++constexpr double kImx520AeUnitStep = 0.500000000;
++
++constexpr AeLuxZone kImx520AeLuxZones[] = {
++	{ 1.0, 160.0, 46.0 },
++	{ 190.0, 230.0, 44.0 },
++	{ 250.0, 280.0, 42.0 },
++	{ 300.0, 340.0, 38.0 },
++	{ 370.0, 1000.0, 36.0 },
++};
++
++constexpr AeExposureKnee kImx520AeExposureKnees[] = {
++	{ 1.000000000, 48626, 0.000000000 },
++	{ 1.000000000, 33333333, 220.920822144 },
++	{ 3.000000000, 33333333, 258.087829590 },
++	{ 3.000000000, 35714285, 260.421905518 },
++	{ 8.000000000, 35714285, 293.604217529 },
++	{ 8.000000000, 41666666, 298.819274902 },
++	{ 16.000000000, 41666666, 322.269042969 },
++	{ 16.000000000, 62500000, 335.986297607 },
++	{ 24.000000000, 62500000, 349.703521729 },
++	{ 24.000000000, 71428571, 354.221008301 },
++	{ 32.000000000, 71428571, 363.953552246 },
++	{ 32.000000000, 83333333, 369.168609619 },
++	{ 52.000000000, 83333333, 385.593750000 },
++	{ 52.000000000, 111111111, 395.326293945 },
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_ae_flat.h b/src/libcamera/pipeline/qcom/lg_ae_flat.h
+new file mode 100644
+index 0000000..e2fcfdd
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_ae_flat.h
+@@ -0,0 +1,75 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++namespace libcamera::qcom {
++
++struct LgAeFlatConfiguration {
++	int firstBin, lastBin;
++	float enterThreshold, exitThreshold;
++	int windowWidth;
++	float filterFactor;
++	int extension;
++	bool brightCorrection;
++	int brightBin, brightPenalty;
++};
++
++struct LgAeFlatResult {
++	float metric = 0;
++	uint32_t flat = 0;
++	int32_t firstBin = 0;
++};
++
++class LgAeFlat
++{
++public:
++	explicit LgAeFlat(const LgAeFlatConfiguration &config) : config_(config) {}
++
++	void reset() { result_ = {}; }
++
++	const LgAeFlatResult &process(const std::array<uint32_t, 256> &histogram)
++	{
++		std::array<uint32_t, 256> cumulative;
++		uint32_t total = 0;
++		for (unsigned int i = 0; i < histogram.size(); i++)
++			cumulative[i] = total += histogram[i];
++		float maximum = 0;
++		result_.firstBin = 0;
++		int last = config_.lastBin + (result_.flat == 1 ? config_.extension : 0);
++		if (total) {
++			for (int bin = config_.firstBin; bin <= last; bin++) {
++				int first = bin - config_.windowWidth;
++				float fraction = static_cast<float>(cumulative[bin] - cumulative[first]) /
++						 static_cast<float>(total);
++				if (fraction > maximum) {
++					maximum = fraction;
++					result_.firstBin = first;
++				}
++			}
++		}
++		float bright = total ? static_cast<float>(total - cumulative[config_.brightBin]) /
++				       static_cast<float>(total) : 0;
++		if (static_cast<double>(bright) > 0.1)
++			bright = 0.1f;
++		if (!config_.brightCorrection)
++			bright = 0;
++		float corrected = maximum / std::fma(bright, static_cast<float>(config_.brightPenalty), 1.0f);
++		/* Preserve the factory's separate product followed by a fused history blend. */
++		volatile float current = config_.filterFactor * corrected;
++		result_.metric = std::fma(result_.metric, 1.0f - config_.filterFactor, current);
++		result_.flat = result_.metric > config_.enterThreshold ||
++			(result_.flat == 1 && result_.metric > config_.exitThreshold);
++		return result_;
++	}
++
++	const LgAeFlatResult &result() const { return result_; }
++
++private:
++	LgAeFlatConfiguration config_;
++	LgAeFlatResult result_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_ae_flat_tuning.h b/src/libcamera/pipeline/qcom/lg_ae_flat_tuning.h
+new file mode 100644
+index 0000000..7963786
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_ae_flat_tuning.h
+@@ -0,0 +1,26 @@
++/* Generated by tools/gen-lg-ae-flat-tuning.py. */
++#pragma once
++
++#include "lg_ae_flat.h"
++
++namespace libcamera::qcom {
++
++inline LgAeFlatConfiguration imx363LgAeFlatConfiguration()
++{
++	return { 42, 120, 0.750000000f, 0.750000000f, 40,
++		 0.300000012f, 20, true, 230, 5 };
++}
++
++inline LgAeFlatConfiguration imx351LgAeFlatConfiguration()
++{
++	return { 42, 120, 0.750000000f, 0.750000000f, 40,
++		 0.300000012f, 20, true, 230, 5 };
++}
++
++inline LgAeFlatConfiguration s5k3m5LgAeFlatConfiguration()
++{
++	return { 42, 120, 0.750000000f, 0.750000000f, 40,
++		 0.300000012f, 20, true, 230, 5 };
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_ae_histogram.h b/src/libcamera/pipeline/qcom/lg_ae_histogram.h
+new file mode 100644
+index 0000000..d0715e2
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_ae_histogram.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++namespace libcamera::qcom {
++
++inline std::array<uint32_t, 256> lgAeHistogram(const std::array<uint32_t, 1024> &raw)
++{
++	std::array<uint32_t, 256> result{};
++	for (unsigned int i = 0; i < result.size(); i++)
++		for (unsigned int j = 0; j < 4; j++)
++			result[i] += raw[i * 4 + j] & 0x01ffffff;
++	return result;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
+new file mode 100644
+index 0000000..2d158fe
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/s5k3m5.h
+@@ -0,0 +1,427 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++
++namespace libcamera::qcom {
++
++/* PIX image and statistics DMA complete one CAMIF SOF after their input frame. */
++inline uint32_t inputSequence(uint32_t completedSequence)
++{
++	return completedSequence ? completedSequence - 1 : 0;
++}
++
++struct CcmEntry {
++	unsigned int cct;
++	int16_t q7[9];
++};
++
++struct CctReference {
++	double cct;
++	double rg;
++	double bg;
++};
++
++#include "s5k3m5_tuning.h"
++
++/* The factory luma target is an 8-bit code; statistics use 10 bits. */
++constexpr double kAeTargetScale = 4.0;
++constexpr double kLgAfLowLightLuma8 = 17.0;
++
++inline bool lgAfLowLight(double luma10)
++{
++	return luma10 < kLgAfLowLightLuma8 * kAeTargetScale;
++}
++
++class LgAfSearchStats
++{
++public:
++	void reset()
++	{
++		previousScore_ = 0.0;
++		previousFocus_ = 0;
++		riseStartFocus_ = 0;
++		minimumFocus_ = 0;
++		maximumScore_ = 0;
++		maximumRise_ = 0.0;
++		upCount_ = 0;
++		downCount_ = 0;
++		sampleCount_ = 0;
++		reversalCount_ = 0;
++	}
++
++	bool update(double score, bool lowLight)
++	{
++		/* LG compares raw scores, but computes ratios from float-to-int FV >> 4. */
++		uint64_t raw = static_cast<uint64_t>(static_cast<float>(score));
++		uint64_t focus = raw >> 4;
++		if (!sampleCount_) {
++			minimumFocus_ = focus;
++		} else {
++			minimumFocus_ = std::min(minimumFocus_, focus);
++			if (score > previousScore_) {
++				if (!upCount_)
++					riseStartFocus_ = previousFocus_;
++				if (downCount_)
++					reversalCount_++;
++				upCount_++;
++				downCount_ = 0;
++				double rise = static_cast<double>(focus - riseStartFocus_) /
++					std::max<uint64_t>(focus, 1);
++				maximumRise_ = std::max(maximumRise_, rise);
++			} else {
++				if (upCount_)
++					reversalCount_++;
++				downCount_++;
++				upCount_ = 0;
++			}
++		}
++		maximumScore_ = std::max(maximumScore_, raw);
++		sampleCount_++;
++		previousScore_ = score;
++		previousFocus_ = focus;
++
++		return downCount_ >= (lowLight ? 3U : 4U) ||
++		       (downCount_ > 2 && focusRange() > 0.1) ||
++		       (upCount_ > 2 && maximumRise_ < 0.01) ||
++		       (sampleCount_ >= 9 && reversalCount_ >= 6);
++	}
++
++	unsigned int upCount() const { return upCount_; }
++	unsigned int downCount() const { return downCount_; }
++	unsigned int sampleCount() const { return sampleCount_; }
++	unsigned int reversalCount() const { return reversalCount_; }
++	double maximumRise() const { return maximumRise_; }
++	uint64_t peakScore() const { return maximumScore_; }
++	double focusRange() const
++	{
++		uint64_t maximum = maximumScore_ >> 4;
++		return static_cast<double>(maximum - minimumFocus_) /
++		       std::max<uint64_t>(maximum, 1);
++	}
++
++private:
++	double previousScore_ = 0.0;
++	uint64_t previousFocus_ = 0;
++	uint64_t riseStartFocus_ = 0;
++	uint64_t minimumFocus_ = 0;
++	uint64_t maximumScore_ = 0;
++	double maximumRise_ = 0.0;
++	unsigned int upCount_ = 0;
++	unsigned int downCount_ = 0;
++	unsigned int sampleCount_ = 0;
++	unsigned int reversalCount_ = 0;
++};
++
++struct LgAfResult {
++	unsigned int fineSamples;
++	uint64_t peakScore;
++	double focusRange;
++	double maximumRise;
++};
++
++inline bool lgAfScanSucceeded(const LgAfResult &result, int position,
++			     int position200mm, int position700mm)
++{
++	if (!result.peakScore || result.fineSamples > 30)
++		return false;
++
++	bool outside = position < position200mm || position > position700mm;
++	return !(outside && result.peakScore > 2000 &&
++		 result.focusRange < 0.1f && result.maximumRise < 0.015f);
++}
++
++class LgAfSceneChange
++{
++public:
++	void reset()
++	{
++		previousScore_.reset();
++		unstable_ = false;
++		stableCount_ = 0;
++	}
++
++	bool update(double score)
++	{
++		uint64_t current = static_cast<uint64_t>(static_cast<float>(score)) >> 4;
++		if (!previousScore_) {
++			previousScore_ = current;
++			return false;
++		}
++
++		uint64_t previous = *previousScore_;
++		previousScore_ = current;
++		uint64_t maximum = std::max<uint64_t>({ current, previous, 1 });
++		double change = static_cast<double>(
++			current > previous ? current - previous : previous - current) / maximum;
++
++		if (change > 0.50) {
++			unstable_ = true;
++			stableCount_ = 0;
++			return false;
++		}
++
++		if (!unstable_)
++			return false;
++
++		if (change < 0.1f) {
++			if (++stableCount_ >= 4) {
++				unstable_ = false;
++				stableCount_ = 0;
++				return true;
++			}
++		} else {
++			stableCount_ = 0;
++		}
++
++		return false;
++	}
++
++	bool unstable() const { return unstable_; }
++	unsigned int stableCount() const { return stableCount_; }
++
++private:
++	std::optional<uint64_t> previousScore_;
++	bool unstable_ = false;
++	unsigned int stableCount_ = 0;
++};
++
++class LgAfModel
++{
++public:
++	static constexpr std::size_t kEepromBlockSize = 14;
++	static constexpr double kLensPositionMin = 0.0;
++	static constexpr std::size_t eepromOffset(unsigned int cameraId)
++	{
++		return cameraId == 1 ? 0x0400 : 0x0a80;
++	}
++
++	static std::optional<LgAfModel>
++	fromEeprom(unsigned int cameraId,
++		   const std::array<uint8_t, kEepromBlockSize> &block,
++		   std::string *error)
++	{
++		auto fail = [error](const std::string &message) {
++			if (error)
++				*error = message;
++			return std::optional<LgAfModel>{};
++		};
++
++		if (cameraId != 0 && cameraId != 1 && cameraId != 3)
++			return fail("unsupported LG camera ID " +
++				    std::to_string(cameraId));
++
++		std::size_t checksumOffset = cameraId == 0 ? 12 : 4;
++		uint16_t storedChecksum = block[checksumOffset] |
++					  block[checksumOffset + 1] << 8;
++		uint16_t calculatedChecksum = 0;
++		for (std::size_t i = 0; i < checksumOffset; i++)
++			calculatedChecksum += block[i];
++		if (storedChecksum != calculatedChecksum)
++			return fail("EEPROM AF checksum mismatch");
++
++		int16_t infinityDac = static_cast<int16_t>(block[0] | block[1] << 8);
++		int16_t macroDac = static_cast<int16_t>(block[2] | block[3] << 8);
++		int infinityQ = (infinityDac + 1023) / 2;
++		int macroQ = (macroDac + 1023) / 2;
++		if (infinityQ < 0 || infinityQ > 1023 ||
++		    macroQ < 0 || macroQ > 1023 || macroQ <= infinityQ)
++			return fail("invalid EEPROM AF endpoints");
++
++		LgAfModel model;
++		model.cameraId_ = cameraId;
++		model.checksum_ = storedChecksum;
++		model.rawInfinityDac_ = infinityDac;
++		model.rawMacroDac_ = macroDac;
++		if (cameraId == 0) {
++			model.focalLengthMm_ = 4.230000019073486;
++			model.calibrationDistanceMm_ = 100.0;
++			model.nearDistanceMm_ = 80.0;
++			model.stepFraction_ = 0.023399999365210533f;
++			infinityQ -= 30;
++			macroQ -= 30;
++		} else if (cameraId == 1) {
++			model.focalLengthMm_ = 2.9200000762939453;
++			model.calibrationDistanceMm_ = 150.0;
++			model.nearDistanceMm_ = 150.0;
++			model.stepFraction_ = 0.023399999365210533f;
++		} else {
++			model.focalLengthMm_ = 5.849999904632568;
++			model.calibrationDistanceMm_ = 400.0;
++			model.nearDistanceMm_ = 400.0;
++			model.stepFraction_ = 0.029999999329447746f;
++			/* Camera ID 3 uses the factory type-3 infinity extension. */
++			infinityQ = std::max(0, static_cast<int>(
++				static_cast<float>(infinityQ) -
++				static_cast<float>(macroQ - infinityQ) * 0.1644f));
++		}
++		model.infinityPosition_ = 1024 - infinityQ;
++		model.macroPosition_ = 1024 - macroQ;
++		model.updateBounds();
++
++		int span = macroQ - infinityQ;
++		model.coarseStepNormal_ = static_cast<unsigned int>(
++			static_cast<float>(3.0f * model.stepFraction_) * span);
++		model.fineStepNormal_ = static_cast<unsigned int>(model.stepFraction_ * span);
++		model.coarseStepLowLight_ = static_cast<unsigned int>(
++			static_cast<float>(6.0f * model.stepFraction_) * span);
++		model.fineStepLowLight_ = static_cast<unsigned int>(
++			static_cast<float>(2.0f * model.stepFraction_) * span);
++		if (model.infinityPosition_ > 1023 ||
++		    model.macroPosition_ < 0 ||
++		    model.nearPosition_ >= model.farPosition_ ||
++		    !model.coarseStepNormal_ || !model.fineStepNormal_ ||
++		    !model.coarseStepLowLight_ || !model.fineStepLowLight_)
++			return fail("invalid LG AF model");
++
++		return model;
++	}
++
++	unsigned int cameraId() const { return cameraId_; }
++	uint16_t checksum() const { return checksum_; }
++	int rawInfinityDac() const { return rawInfinityDac_; }
++	int rawMacroDac() const { return rawMacroDac_; }
++	int infinityPosition() const
++	{
++		return std::clamp(infinityPosition_ - gravityOffset_, 0, 1023);
++	}
++	int nearPosition() const { return nearPosition_; }
++	int farPosition() const { return farPosition_; }
++	int codeMin() const { return positionToCode(farPosition_); }
++	int codeMax() const { return positionToCode(nearPosition_); }
++	int infinityCode() const { return positionToCode(infinityPosition()); }
++	double lensPositionMax() const { return 1000.0 / nearDistanceMm_; }
++	int gravityOffset() const { return gravityOffset_; }
++	int gravityTrackingThreshold() const
++	{
++		return static_cast<int>(static_cast<double>(
++			static_cast<float>(infinityPosition_ - macroPosition_) * stepFraction_) + 0.5);
++	}
++
++	void setAcceleration(float x, float y, float z)
++	{
++		double norm = std::sqrt(static_cast<double>(
++			std::fma(z, z, std::fma(x, x, y * y))));
++		double reference = norm >= 9.0 && norm <= 11.0 ? norm : 9.80665;
++		/* LG maps the SSC vector to (-x, y, -z) before projecting gravity. */
++		gravityOffset_ = cameraId_ == 0
++			? static_cast<int>(-static_cast<double>(z) / reference * 30) : 0;
++		updateBounds();
++	}
++	unsigned int nearStep() const { return 0; }
++	unsigned int farStep() const { return farPosition_ - nearPosition_; }
++	unsigned int stepCount() const { return farStep() + 1; }
++	unsigned int coarseStep(bool lowLight = false) const
++	{
++		return lowLight ? coarseStepLowLight_ : coarseStepNormal_;
++	}
++	unsigned int fineStep(bool lowLight = false) const
++	{
++		return lowLight ? fineStepLowLight_ : fineStepNormal_;
++	}
++
++	double lensPositionFromCode(int code) const
++	{
++		int position = codeToPosition(std::clamp(code, codeMin(), codeMax()));
++		if (position <= nearPosition_)
++			return lensPositionMax();
++		if (position >= infinityPosition())
++			return kLensPositionMin;
++
++		double distance = focalLengthMm_ +
++			(calibrationDistanceMm_ - focalLengthMm_) *
++			(infinityPosition_ - macroPosition_) /
++			(infinityPosition_ - position - gravityOffset_);
++		return std::clamp(1000.0 / distance,
++				  kLensPositionMin, lensPositionMax());
++	}
++
++	int lensPositionToCode(double position) const
++	{
++		position = std::clamp(position, kLensPositionMin, lensPositionMax());
++		if (position <= kLensPositionMin)
++			return infinityCode();
++		if (position >= lensPositionMax())
++			return codeMax();
++
++		double distance = 1000.0 / position;
++		if (distance <= nearDistanceMm_)
++			return codeMax();
++
++		return positionToCode(positionForDistance(distance));
++	}
++
++	int afStepToCode(unsigned int step) const
++	{
++		step = std::min(step, farStep());
++		return positionToCode(nearPosition_ + step);
++	}
++
++	unsigned int afCodeToStep(int code) const
++	{
++		int position = codeToPosition(std::clamp(code, codeMin(), codeMax()));
++		return std::clamp(position - nearPosition_, 0,
++				  static_cast<int>(farStep()));
++	}
++
++	int positionForDistance(double distance) const
++	{
++		double displacement = focalLengthMm_ * focalLengthMm_ /
++				      (distance - focalLengthMm_);
++		double reference = focalLengthMm_ * focalLengthMm_ /
++				   (calibrationDistanceMm_ - focalLengthMm_);
++		return std::clamp(static_cast<int>(std::fma(
++			-static_cast<double>(infinityPosition_ - macroPosition_),
++			displacement / reference, static_cast<double>(infinityPosition_))) -
++			gravityOffset_, 0, 1023);
++	}
++
++private:
++	static constexpr double kFarDistanceMm = 10000.0;
++
++	void updateBounds()
++	{
++		nearPosition_ = std::max(1, positionForDistance(nearDistanceMm_));
++		int farTarget = positionForDistance(kFarDistanceMm);
++		int farMargin = static_cast<int>(static_cast<float>(farTarget - nearPosition_) * 0.08f);
++		int candidate = farTarget + farMargin;
++		/* The factory endpoint allows 1024 and maps overflow to 1023. */
++		farPosition_ = candidate > 1024 ? 1023 : candidate;
++	}
++
++	static int codeToPosition(int code)
++	{
++		return 1024 - (code + 1023) / 2;
++	}
++
++	static int positionToCode(int position)
++	{
++		return 2 * (1024 - position) - 1023;
++	}
++
++	unsigned int cameraId_ = 0;
++	uint16_t checksum_ = 0;
++	int rawInfinityDac_ = 0;
++	int rawMacroDac_ = 0;
++	double focalLengthMm_ = 0.0;
++	double calibrationDistanceMm_ = 0.0;
++	double nearDistanceMm_ = 0.0;
++	int gravityOffset_ = 0;
++	float stepFraction_ = 0.0f;
++	int infinityPosition_ = 0;
++	int macroPosition_ = 0;
++	int nearPosition_ = 0;
++	int farPosition_ = 0;
++	unsigned int coarseStepNormal_ = 0;
++	unsigned int fineStepNormal_ = 0;
++	unsigned int coarseStepLowLight_ = 0;
++	unsigned int fineStepLowLight_ = 0;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5_tuning.h b/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
+new file mode 100644
+index 0000000..ef69630
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
+@@ -0,0 +1,73 @@
++/* Generated by tools/gen-s5k3m5-ife-tuning.py. */
++constexpr CcmEntry kCcmEntries[] = {
++	{ 2500, { 226, -159, 61, -34, 127, 35, -13, -192, 332 } },
++	{ 3200, { 212, -102, 18, -26, 125, 29, 5, -214, 337 } },
++	{ 4250, { 214, -93, 7, -38, 170, -5, 6, -157, 279 } },
++	{ 7000, { 209, -79, -1, -18, 160, -14, 3, -147, 272 } },
++	{ 10000, { 209, -79, -1, -18, 160, -14, 3, -147, 272 } }
++};
++
++constexpr CctReference kCctReferences[] = {
++	{ 2856, 1.034621954, 0.342722595 },
++	{ 5000, 0.644243002, 0.574822009 },
++	{ 6500, 0.592698872, 0.613973022 },
++	{ 7500, 0.562896788, 0.661324978 }
++};
++
++constexpr double kAeAggressiveness = 0.649999976;
++constexpr double kAeLuxFilterFactor = 0.500000000;
++constexpr double kAeLuxReferenceLuma8 = 50.0;
++constexpr double kAeLuxLumaMinimum8 = 0.1;
++constexpr double kAeLuxLogScale = 77.89852905273438;
++constexpr double kAeToleranceSteps = 2.0;
++constexpr double kAeUnitStep = 0.500000000;
++constexpr double kAeRgbWeights[] = { 0.298799992, 0.586899996, 0.113700002 };
++struct AeLuxZone {
++	double start;
++	double end;
++	double target8;
++};
++constexpr AeLuxZone kAeLuxZones[] = {
++	{ 0.0, 120.0, 40.0 },
++	{ 200.0, 240.0, 37.5 },
++	{ 300.0, 340.0, 35.0 },
++	{ 380.0, 420.0, 28.0 },
++	{ 450.0, 1000.0, 26.0 }
++};
++struct AeExposureKnee {
++	double gain;
++	double exposureNs;
++	double index;
++};
++constexpr AeExposureKnee kAeExposureKnees[] = {
++	{ 1.000000000, 74906, 0.000000000 },
++	{ 1.000000000, 33333333, 206.303298950 },
++	{ 4.000000000, 33333333, 253.202896118 },
++	{ 4.000000000, 41666667, 260.752014160 },
++	{ 10.000000000, 41666667, 291.750885010 },
++	{ 10.000000000, 50000000, 297.919006348 },
++	{ 24.000000000, 50000000, 327.536895752 },
++	{ 24.000000000, 62500000, 335.085998535 },
++	{ 34.000000000, 62500000, 346.869506836 },
++	{ 34.000000000, 76923077, 353.894104004 },
++	{ 64.000000000, 76923077, 375.292907715 },
++	{ 64.000000000, 99831461, 384.111785889 }
++};
++constexpr float kAeMetering[16][16] = {
++	{ 0.028400, 0.035500, 0.057200, 0.084400, 0.114200, 0.141800, 0.161500, 0.168600, 0.168600, 0.161500, 0.141800, 0.114200, 0.084400, 0.057200, 0.035500, 0.028400 },
++	{ 0.035500, 0.044400, 0.071500, 0.105500, 0.142800, 0.177300, 0.201800, 0.210700, 0.210700, 0.201800, 0.177300, 0.142800, 0.105500, 0.071500, 0.044400, 0.035500 },
++	{ 0.057200, 0.071500, 0.115000, 0.169800, 0.229800, 0.285300, 0.324800, 0.339100, 0.339100, 0.324800, 0.285300, 0.229800, 0.169800, 0.115000, 0.071500, 0.057200 },
++	{ 0.084400, 0.105500, 0.169800, 0.250600, 0.339100, 0.421000, 0.479400, 0.500600, 0.500600, 0.479400, 0.421000, 0.339100, 0.250600, 0.169800, 0.105500, 0.084400 },
++	{ 0.114200, 0.142800, 0.229800, 0.339100, 0.459100, 0.569900, 0.648900, 0.677500, 0.677500, 0.648900, 0.569900, 0.459100, 0.339100, 0.229800, 0.142800, 0.114200 },
++	{ 0.141800, 0.177300, 0.285300, 0.421000, 0.569900, 0.707500, 0.805500, 0.841100, 0.841100, 0.805500, 0.707500, 0.569900, 0.421000, 0.285300, 0.177300, 0.141800 },
++	{ 0.161500, 0.201800, 0.324800, 0.479400, 0.648900, 0.805500, 0.917100, 0.957700, 0.957700, 0.917100, 0.805500, 0.648900, 0.479400, 0.324800, 0.201800, 0.161500 },
++	{ 0.168600, 0.210700, 0.339100, 0.500600, 0.677500, 0.841100, 0.957700, 1.000000, 1.000000, 0.957700, 0.841100, 0.677500, 0.500600, 0.339100, 0.210700, 0.168600 },
++	{ 0.168600, 0.210700, 0.339100, 0.500600, 0.677500, 0.841100, 0.957700, 1.000000, 1.000000, 0.957700, 0.841100, 0.677500, 0.500600, 0.339100, 0.210700, 0.168600 },
++	{ 0.161500, 0.201800, 0.324800, 0.479400, 0.648900, 0.805500, 0.917100, 0.957700, 0.957700, 0.917100, 0.805500, 0.648900, 0.479400, 0.324800, 0.201800, 0.161500 },
++	{ 0.141800, 0.177300, 0.285300, 0.421000, 0.569900, 0.707500, 0.805500, 0.841100, 0.841100, 0.805500, 0.707500, 0.569900, 0.421000, 0.285300, 0.177300, 0.141800 },
++	{ 0.114200, 0.142800, 0.229800, 0.339100, 0.459100, 0.569900, 0.648900, 0.677500, 0.677500, 0.648900, 0.569900, 0.459100, 0.339100, 0.229800, 0.142800, 0.114200 },
++	{ 0.084400, 0.105500, 0.169800, 0.250600, 0.339100, 0.421000, 0.479400, 0.500600, 0.500600, 0.479400, 0.421000, 0.339100, 0.250600, 0.169800, 0.105500, 0.084400 },
++	{ 0.057200, 0.071500, 0.115000, 0.169800, 0.229800, 0.285300, 0.324800, 0.339100, 0.339100, 0.324800, 0.285300, 0.229800, 0.169800, 0.115000, 0.071500, 0.057200 },
++	{ 0.035500, 0.044400, 0.071500, 0.105500, 0.142800, 0.177300, 0.201800, 0.210700, 0.210700, 0.201800, 0.177300, 0.142800, 0.105500, 0.071500, 0.044400, 0.035500 },
++	{ 0.028400, 0.035500, 0.057200, 0.084400, 0.114200, 0.141800, 0.161500, 0.168600, 0.168600, 0.161500, 0.141800, 0.114200, 0.084400, 0.057200, 0.035500, 0.028400 }
++};
+diff --git a/src/libcamera/pipeline/qcom/ssc_accelerometer.cpp b/src/libcamera/pipeline/qcom/ssc_accelerometer.cpp
+new file mode 100644
+index 0000000..761dcb4
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ssc_accelerometer.cpp
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include "ssc_accelerometer.h"
++
++#include <cerrno>
++#include <pthread.h>
++#include <utility>
++#include <libssc-sensor-accelerometer.h>
++
++#include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
++
++namespace libcamera::qcom {
++
++LOG_DEFINE_CATEGORY(QcomAccelerometer)
++
++struct SscAccelerometer::State {
++	SscAccelerometer *owner;
++	std::promise<int> *ready;
++	GSource *timeout;
++};
++
++SscAccelerometer::SscAccelerometer()
++	: context_(g_main_context_new()), loop_(g_main_loop_new(context_, false))
++{
++}
++
++SscAccelerometer::~SscAccelerometer()
++{
++	stop();
++	g_main_loop_unref(loop_);
++	g_main_context_unref(context_);
++}
++
++int SscAccelerometer::start()
++{
++	std::promise<int> ready;
++	auto result = ready.get_future();
++	thread_ = std::thread(&SscAccelerometer::run, this, std::move(ready));
++	int ret = result.get();
++	if (ret)
++		stop();
++	return ret;
++}
++
++void SscAccelerometer::stop()
++{
++	if (!thread_.joinable())
++		return;
++	g_main_loop_quit(loop_);
++	thread_.join();
++}
++
++std::array<float, 3> SscAccelerometer::sample() const
++{
++	std::lock_guard lock(mutex_);
++	return sample_;
++}
++
++void SscAccelerometer::measured(void *, float x, float y, float z, void *data)
++{
++	State *state = static_cast<State *>(data);
++	{
++		std::lock_guard lock(state->owner->mutex_);
++		state->owner->sample_ = { x, y, z };
++	}
++	if (state->ready) {
++		g_source_destroy(state->timeout);
++		state->ready->set_value(0);
++		state->ready = nullptr;
++	}
++}
++
++int SscAccelerometer::timedOut(void *data)
++{
++	State *state = static_cast<State *>(data);
++	LOG(QcomAccelerometer, Error) << "Timed out waiting for the first acceleration sample";
++	state->ready->set_value(-ETIMEDOUT);
++	state->ready = nullptr;
++	g_main_loop_quit(state->owner->loop_);
++	return G_SOURCE_REMOVE;
++}
++
++void SscAccelerometer::run(std::promise<int> ready)
++{
++	pthread_setname_np(pthread_self(), "qcom-accel");
++	g_main_context_push_thread_default(context_);
++	auto contextGuard = utils::scope_exit{ [&]() { g_main_context_pop_thread_default(context_); } };
++	g_autoptr(GError) error = nullptr;
++	g_autoptr(SSCSensorAccelerometer) sensor = ssc_sensor_accelerometer_new_sync(nullptr, &error);
++	if (!sensor) {
++		LOG(QcomAccelerometer, Error) << "Failed to discover accelerometer: "
++					    << (error ? error->message : "sensor unavailable");
++		ready.set_value(-ENODEV);
++		return;
++	}
++	if (!ssc_sensor_accelerometer_open_sync(sensor, nullptr, &error)) {
++		LOG(QcomAccelerometer, Error) << "Failed to open accelerometer: " << error->message;
++		ready.set_value(-EIO);
++		return;
++	}
++
++	GSource *timeout = g_timeout_source_new(1000);
++	State state{ this, &ready, timeout };
++	g_source_set_callback(timeout, timedOut, &state, nullptr);
++	g_source_attach(timeout, context_);
++	gulong handler = g_signal_connect(sensor, "measurement", G_CALLBACK(measured), &state);
++	g_main_loop_run(loop_);
++	g_signal_handler_disconnect(sensor, handler);
++	g_source_unref(timeout);
++	if (!ssc_sensor_accelerometer_close_sync(sensor, nullptr, &error))
++		LOG(QcomAccelerometer, Error) << "Failed to close accelerometer: " << error->message;
++	while (g_main_context_iteration(context_, false))
++		;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/ssc_accelerometer.h b/src/libcamera/pipeline/qcom/ssc_accelerometer.h
+new file mode 100644
+index 0000000..645e370
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ssc_accelerometer.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <future>
++#include <mutex>
++#include <thread>
++
++struct _GMainContext;
++struct _GMainLoop;
++
++namespace libcamera::qcom {
++
++class SscAccelerometer
++{
++public:
++	SscAccelerometer();
++	~SscAccelerometer();
++
++	int start();
++	void stop();
++	std::array<float, 3> sample() const;
++
++private:
++	struct State;
++	void run(std::promise<int> ready);
++	static void measured(void *sensor, float x, float y, float z, void *data);
++	static int timedOut(void *data);
++
++	_GMainContext *context_;
++	_GMainLoop *loop_;
++	std::thread thread_;
++	mutable std::mutex mutex_;
++	std::array<float, 3> sample_{};
++};
++
++} /* namespace libcamera::qcom */

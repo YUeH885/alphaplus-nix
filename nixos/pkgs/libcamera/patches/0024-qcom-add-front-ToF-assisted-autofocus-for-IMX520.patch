@@ -1,0 +1,1085 @@
+From f0dc250673f1a4d5f57aa146f946b89d1739706e Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu@local>
+Date: Tue, 24 Nov 2026 10:50:07 +0800
+Subject: [PATCH] qcom: add front ToF-assisted autofocus for IMX520
+
+---
+ src/libcamera/pipeline/qcom/qcom.cpp          | 361 +++++++++++++++++-
+ src/libcamera/pipeline/qcom/tof_camera.h      | 246 +++++++++++-
+ src/libcamera/pipeline/qcom/tof_demodulator.h |  87 ++++-
+ 3 files changed, 674 insertions(+), 20 deletions(-)
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 8111f29..f6ce98f 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -443,6 +443,8 @@ constexpr unsigned int kBufferCount = 4;
+ 
+ constexpr uint64_t kAfSettleNs = 50ULL * 1000 * 1000;
+ constexpr uint64_t kAfSettleFrames = 2;
++constexpr uint64_t kTofCalWaitNs = 120ULL * 1000 * 1000;
++constexpr uint64_t kTofAssistTimeoutNs = 350ULL * 1000 * 1000;
+ 
+ using namespace qcom;
+ 
+@@ -1063,6 +1065,14 @@ public:
+ 	void syncPdaf();
+ 	const PdafModeSpec *activePdafMode() const;
+ 	PdafResult measurePdaf();
++	void setTofAssist(TofCameraData *tof) { tofAssist_ = tof; }
++	bool tofAssistEligible() const
++	{
++		return afEnabled_ && tofAssist_ &&
++		       testPatternMode_ == controls::draft::TestPatternModeOff;
++	}
++	void stopTofAssistIfActive();
++	TofDepthRoiSample measureTofDepth(uint64_t minTimestampNs) const;
+ 	void syncLsc(bool force = false);
+ 	float estimateLux() const;
+ 	int32_t activeFlickerPeriod() const;
+@@ -1319,6 +1329,7 @@ public:
+ 		Idle,
+ 		Warmup,
+ 		Pdaf,
++		Tof,
+ 		Coarse,
+ 		Fine,
+ 		Confirm,
+@@ -1331,6 +1342,15 @@ public:
+ 	unsigned int afPdafAttempts_ = 0;
+ 	unsigned int afPdafIdleCounter_ = 0;
+ 	unsigned int afPdafDefocusStreak_ = 0;
++	TofCameraData *tofAssist_ = nullptr;
++	bool afUsedTof_ = false;
++	bool afTofPendingStart_ = false;
++	uint64_t afTofScanStartNs_ = 0;
++	uint64_t afTofWaitDeadlineNs_ = 0;
++	int afFineStartStep_ = 0;
++	unsigned int afTofFineExtensions_ = 0;
++	unsigned int afTofIdleCounter_ = 0;
++	unsigned int afTofDefocusStreak_ = 0;
+ 	int32_t afMetering_ = controls::AfMeteringAuto;
+ 	std::vector<Rectangle> afWindows_;
+ 	std::array<double, QCOM_CAMSS_BF_ROIS> afWeights_{};
+@@ -4011,6 +4031,120 @@ PdafResult QcomCameraData::measurePdaf()
+ 	return result;
+ }
+ 
++void QcomCameraData::stopTofAssistIfActive()
++{
++	if (tofAssist_)
++		tofAssist_->stopAssist();
++}
++
++TofDepthRoiSample QcomCameraData::measureTofDepth(uint64_t minTimestampNs) const
++{
++	if (!tofAssist_)
++		return {};
++
++	const Size arraySize = analogCrop_.width && analogCrop_.height
++				       ? analogCrop_.size()
++				       : Size{ 3280, 2460 };
++	const Rectangle arrayBounds(analogCrop_.width && analogCrop_.height
++					      ? analogCrop_
++					      : Rectangle(arraySize));
++	Rectangle roi;
++	bool haveRoi = false;
++
++	if (afMetering_ == controls::AfMeteringWindows && !afWindows_.empty()) {
++		int minX = arrayBounds.x + static_cast<int>(arrayBounds.width);
++		int minY = arrayBounds.y + static_cast<int>(arrayBounds.height);
++		int maxX = arrayBounds.x;
++		int maxY = arrayBounds.y;
++		for (const Rectangle &w : afWindows_) {
++			Rectangle bounded = w.boundedTo(arrayBounds);
++			if (!bounded.width || !bounded.height)
++				continue;
++			minX = std::min(minX, bounded.x);
++			minY = std::min(minY, bounded.y);
++			maxX = std::max(maxX, bounded.x + static_cast<int>(bounded.width));
++			maxY = std::max(maxY, bounded.y + static_cast<int>(bounded.height));
++		}
++		if (maxX > minX && maxY > minY) {
++			roi = Rectangle(minX, minY, static_cast<unsigned int>(maxX - minX),
++					static_cast<unsigned int>(maxY - minY));
++			haveRoi = true;
++		}
++	} else if (afMetering_ == controls::AfMeteringAuto &&
++		   faceDetectMode_ != controls::draft::FaceDetectModeOff &&
++		   !hwFaces_.empty() &&
++		   statsInputSize_.width > 0 && statsInputSize_.height > 0) {
++		Rectangle face = hwFaces_.front().rect.boundedTo(Rectangle(statsInputSize_));
++		if (face.width && face.height) {
++			if (!!(transform_ & Transform::HFlip))
++				face.x = statsInputSize_.width - (face.x + static_cast<int>(face.width));
++			if (!!(transform_ & Transform::VFlip))
++				face.y = statsInputSize_.height - (face.y + static_cast<int>(face.height));
++			roi = face.transformedBetween(Rectangle(statsInputSize_), arrayBounds);
++			haveRoi = roi.width > 0 && roi.height > 0;
++		}
++	} else if (hasScalerCrop_) {
++		Rectangle crop = scalerCropRectangle().boundedTo(arrayBounds);
++		if (crop.width && crop.height) {
++			unsigned int rw = std::max(1U, crop.width * 2 / 5);
++			unsigned int rh = std::max(1U, crop.height * 2 / 5);
++			roi = Rectangle(crop.x + static_cast<int>((crop.width - rw) / 2),
++					crop.y + static_cast<int>((crop.height - rh) / 2),
++					rw, rh);
++			haveRoi = true;
++		}
++	}
++
++	if (!haveRoi) {
++		unsigned int rw = std::max(1U, arrayBounds.width * 3 / 10);
++		unsigned int rh = std::max(1U, arrayBounds.height * 3 / 10);
++		roi = Rectangle(arrayBounds.x + static_cast<int>((arrayBounds.width - rw) / 2),
++				arrayBounds.y + static_cast<int>((arrayBounds.height - rh) / 2),
++				rw, rh);
++	}
++
++	/* Project IMX520 (0x0101=0x02, Y-inverted vs IRS2381C) onto ToF intrinsics. */
++	static constexpr double kImx520FocalPx = 2.92 / 0.00112;
++	static constexpr double kImx520Cx = 1640.0;
++	static constexpr double kImx520Cy = 1232.0;
++	const TofIntrinsics lens = tofAssist_->intrinsics();
++
++	auto projectX = [&](double ax) -> double {
++		return lens.cx + ((ax - kImx520Cx) / kImx520FocalPx) * lens.fx;
++	};
++	auto projectY = [&](double ay) -> double {
++		return lens.cy - ((ay - kImx520Cy) / kImx520FocalPx) * lens.fy;
++	};
++
++	const double fx0 = projectX(roi.x);
++	const double fy0 = projectY(roi.y);
++	const double fx1 = projectX(roi.x + roi.width);
++	const double fy1 = projectY(roi.y + roi.height);
++
++	int tx0 = static_cast<int>(std::floor(std::min(fx0, fx1)));
++	int ty0 = static_cast<int>(std::floor(std::min(fy0, fy1)));
++	int tx1 = static_cast<int>(std::ceil(std::max(fx0, fx1)));
++	int ty1 = static_cast<int>(std::ceil(std::max(fy0, fy1)));
++
++	if (tx1 - tx0 < 16) {
++		int cx = (tx0 + tx1) / 2;
++		tx0 = cx - 8;
++		tx1 = cx + 8;
++	}
++	if (ty1 - ty0 < 16) {
++		int cy = (ty0 + ty1) / 2;
++		ty0 = cy - 8;
++		ty1 = cy + 8;
++	}
++
++	tx0 = std::clamp(tx0, 0, static_cast<int>(TofDemodulator::kWidth));
++	ty0 = std::clamp(ty0, 0, static_cast<int>(TofDemodulator::kHeight));
++	tx1 = std::clamp(tx1, tx0, static_cast<int>(TofDemodulator::kWidth));
++	ty1 = std::clamp(ty1, ty0, static_cast<int>(TofDemodulator::kHeight));
++
++	return tofAssist_->sampleDepth(tx0, ty0, tx1, ty1, minTimestampNs);
++}
++
+ void QcomCameraData::syncLsc(bool force)
+ {
+ 	if (!hasLsc_ || !pix_ || !pix_->isOpen())
+@@ -4158,10 +4292,18 @@ void QcomCameraData::startAfScan(uint64_t timestamp)
+ 	afPdafConfirmed_ = false;
+ 	afPdafAttempts_ = 0;
+ 	afPdafDefocusStreak_ = 0;
++	afUsedTof_ = false;
++	afTofPendingStart_ = false;
++	afTofFineExtensions_ = 0;
++	afTofDefocusStreak_ = 0;
+ 	afSearch_.reset();
+ 	afSceneChange_.reset();
++	if (tofAssistEligible())
++		tofAssist_->ensureCalibrationAsync();
+ 	afNextEval_ = timestamp
+-		? (pdafActive_ ? timestamp : timestamp + kAfSettleFrames * frameDurationNs_)
++		? ((pdafActive_ || tofAssistEligible())
++			   ? timestamp
++			   : timestamp + kAfSettleFrames * frameDurationNs_)
+ 		: 0;
+ 	afState_ = controls::AfStateScanning;
+ 	afStage_ = AfStage::Warmup;
+@@ -4170,6 +4312,7 @@ void QcomCameraData::startAfScan(uint64_t timestamp)
+ 
+ void QcomCameraData::completeAfScan(bool success)
+ {
++	stopTofAssistIfActive();
+ 	if (success) {
+ 		refreshAfModel();
+ 		afBestStep_ = afModel_->afCodeToStep(afPosition_);
+@@ -4207,8 +4350,9 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 
+ 	if (afPaused_) {
+ 		if (afStage_ == AfStage::Warmup || afStage_ == AfStage::Pdaf ||
+-		    afStage_ == AfStage::Coarse || afStage_ == AfStage::Fine ||
+-		    afStage_ == AfStage::Confirm || afStage_ == AfStage::Restore)
++		    afStage_ == AfStage::Tof || afStage_ == AfStage::Coarse ||
++		    afStage_ == AfStage::Fine || afStage_ == AfStage::Confirm ||
++		    afStage_ == AfStage::Restore)
+ 			return;
+ 	}
+ 
+@@ -4239,13 +4383,43 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 					afPdafDefocusStreak_ = 0;
+ 				}
+ 			}
++			if (tofAssistEligible() && tofAssist_->isUserStreaming() &&
++			    (++afTofIdleCounter_ % 5U == 0)) {
++				const uint64_t now = monotonicNs();
++				const uint64_t minTs = now > 200ULL * 1000 * 1000
++							       ? now - 200ULL * 1000 * 1000
++							       : 0;
++				TofDepthRoiSample sample = measureTofDepth(minTs);
++				if (sample.valid) {
++					int targetPos = afModel_->positionForDistance(sample.depthMm);
++					int targetStep = std::clamp(targetPos - afModel_->nearPosition(),
++								    static_cast<int>(afModel_->nearStep()),
++								    static_cast<int>(afModel_->farStep()));
++					int curStep = static_cast<int>(afModel_->afCodeToStep(afPosition_));
++					double thresh = afModel_->fineStep(false) * 2.5;
++					if (std::abs(targetStep - curStep) >= thresh) {
++						if (++afTofDefocusStreak_ >= 3U) {
++							LOG(QcomPipeline, Debug)
++								<< "ToF defocus trigger: depth="
++								<< sample.depthMm << " mm, curStep="
++								<< curStep << " targetStep=" << targetStep;
++							startAfScan(timestamp);
++						}
++					} else {
++						afTofDefocusStreak_ = 0;
++					}
++				} else {
++					afTofDefocusStreak_ = 0;
++				}
++			}
+ 		}
+ 		return;
+ 	}
+ 
+ 	if (!afNextEval_) {
+-		afNextEval_ = timestamp + (pdafActive_ ? frameDurationNs_
+-						       : kAfSettleFrames * frameDurationNs_);
++		afNextEval_ = timestamp + ((pdafActive_ || tofAssistEligible())
++						   ? frameDurationNs_
++						   : kAfSettleFrames * frameDurationNs_);
+ 		return;
+ 	}
+ 
+@@ -4313,6 +4487,28 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 			}
+ 		}
+ 
++		if (tofAssistEligible()) {
++			if (tofAssist_->isCalibrationLoading()) {
++				afTofPendingStart_ = true;
++				afTofWaitDeadlineNs_ = monotonicNs() + kTofCalWaitNs;
++				afNextEval_ = timestamp;
++				afStage_ = AfStage::Tof;
++				return;
++			}
++			if (tofAssist_->startAssist() == 0) {
++				const uint64_t now = monotonicNs();
++				afTofPendingStart_ = false;
++				afTofScanStartNs_ = (tofAssist_->isUserStreaming() &&
++						     now > 100ULL * 1000 * 1000)
++							    ? now - 100ULL * 1000 * 1000
++							    : now;
++				afTofWaitDeadlineNs_ = now + kTofAssistTimeoutNs;
++				afNextEval_ = timestamp;
++				afStage_ = AfStage::Tof;
++				return;
++			}
++		}
++
+ 		afStep_ = afModel_->farStep();
+ 		if (startAfMove(afStep_))
+ 			return;
+@@ -4321,6 +4517,89 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 		return;
+ 	}
+ 
++	if (afStage_ == AfStage::Tof) {
++		auto fallbackToCoarse = [&]() {
++			stopTofAssistIfActive();
++			afUsedTof_ = false;
++			afTofPendingStart_ = false;
++			afSearch_.reset();
++			afStep_ = afModel_->farStep();
++			if (startAfMove(afStep_))
++				return;
++			afNextEval_ = timestamp + kAfSettleNs;
++			afStage_ = AfStage::Coarse;
++		};
++
++		if (afTofPendingStart_) {
++			if (tofAssist_->isCalibrationLoading()) {
++				if (monotonicNs() < afTofWaitDeadlineNs_)
++					return;
++				fallbackToCoarse();
++				return;
++			}
++			afTofPendingStart_ = false;
++			if (tofAssist_->startAssist() == 0) {
++				const uint64_t now = monotonicNs();
++				afTofScanStartNs_ = (tofAssist_->isUserStreaming() &&
++						     now > 100ULL * 1000 * 1000)
++							    ? now - 100ULL * 1000 * 1000
++							    : now;
++				afTofWaitDeadlineNs_ = now + kTofAssistTimeoutNs;
++				return;
++			}
++			fallbackToCoarse();
++			return;
++		}
++
++		TofDepthRoiSample sample = measureTofDepth(afTofScanStartNs_);
++		if (!sample.haveFreshFrame) {
++			if (monotonicNs() < afTofWaitDeadlineNs_)
++				return;
++			LOG(QcomPipeline, Debug) << "ToF AF timed out waiting for frame; falling back to CDAF";
++			fallbackToCoarse();
++			return;
++		}
++
++		stopTofAssistIfActive();
++		if (!sample.valid) {
++			LOG(QcomPipeline, Debug)
++				<< "ToF AF invalid ROI (valid=" << sample.validPixels
++				<< "/" << sample.roiPixels << ", depth=" << sample.depthMm
++				<< " mm); falling back to CDAF";
++			fallbackToCoarse();
++			return;
++		}
++
++		int targetPos = afModel_->positionForDistance(sample.depthMm);
++		int targetStep = std::clamp(targetPos - afModel_->nearPosition(),
++					    static_cast<int>(afModel_->nearStep()),
++					    static_cast<int>(afModel_->farStep()));
++		int fineStep = static_cast<int>(afModel_->fineStep(afLowLight_));
++
++		afUsedTof_ = true;
++		afTofFineExtensions_ = 0;
++		afBestStep_ = targetStep;
++		afBestScore_ = -1.0;
++		afSearch_.reset();
++		afFineSamples_ = 0;
++
++		LOG(QcomPipeline, Info)
++			<< "ToF AF: depth=" << sample.depthMm << " mm"
++			<< " (valid=" << sample.validPixels << "/" << sample.roiPixels
++			<< ", iqr=" << sample.iqrMm << " mm)"
++			<< " -> target step=" << targetStep
++			<< " (fineStep=" << fineStep << ")";
++
++		afFineStartStep_ = std::max<int>(afModel_->nearStep(), targetStep - fineStep);
++		afFineEndStep_ = std::min<int>(afModel_->farStep(), targetStep + fineStep);
++		afStep_ = afFineStartStep_;
++		if (startAfMove(afStep_))
++			return;
++		afNextEval_ = timestamp + kAfSettleNs;
++		afStage_ = AfStage::Fine;
++		return;
++	}
++
+ 	if (afStage_ == AfStage::Pdaf) {
+ 		if (score > afBestScore_) {
+ 			afBestScore_ = score;
+@@ -4434,6 +4713,35 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 		afFineSamples_++;
+ 		afSearch_.update(score, afLowLight_);
+ 		if (afStep_ >= afFineEndStep_) {
++			if (afUsedTof_ && afTofFineExtensions_ < 2) {
++				int fineStep = static_cast<int>(afModel_->fineStep(afLowLight_));
++				if (afBestStep_ == afFineEndStep_ &&
++				    afFineEndStep_ < static_cast<int>(afModel_->farStep())) {
++					int nextStep = std::min<int>(afModel_->farStep(),
++								     afFineEndStep_ + fineStep);
++					afFineEndStep_ = std::min<int>(afModel_->farStep(),
++								       afFineEndStep_ + 2 * fineStep);
++					afTofFineExtensions_++;
++					afStep_ = nextStep;
++					if (startAfMove(afStep_))
++						return;
++					afNextEval_ = timestamp + kAfSettleNs;
++					return;
++				}
++				if (afBestStep_ == afFineStartStep_ &&
++				    afFineStartStep_ > static_cast<int>(afModel_->nearStep())) {
++					int newStart = std::max<int>(afModel_->nearStep(),
++								     afFineStartStep_ - 2 * fineStep);
++					afFineEndStep_ = std::max<int>(newStart, afFineStartStep_ - fineStep);
++					afFineStartStep_ = newStart;
++					afTofFineExtensions_++;
++					afStep_ = newStart;
++					if (startAfMove(afStep_))
++						return;
++					afNextEval_ = timestamp + kAfSettleNs;
++					return;
++				}
++			}
+ 			afStep_ = afBestStep_;
+ 			if (startAfMove(afBestStep_))
+ 				return;
+@@ -4456,11 +4764,13 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 			result, afModel_->nearPosition() + afBestStep_,
+ 			afModel_->positionForDistance(200),
+ 			afModel_->positionForDistance(700));
+-		bool success = score > 0.0 && ((afUsedPdaf_ && afPdafConfirmed_) || cdafOk);
++		bool success = score > 0.0 &&
++			       ((afUsedPdaf_ && afPdafConfirmed_) || afUsedTof_ || cdafOk);
+ 		LOG(QcomPipeline, Debug) << "AF result peak " << result.peakScore
+ 			<< " range " << result.focusRange << " rise " << result.maximumRise
+ 			<< " fine samples " << result.fineSamples
+ 			<< " pdaf " << (afUsedPdaf_ && afPdafConfirmed_)
++			<< " tof " << afUsedTof_
+ 			<< " success " << success;
+ 		completeAfScan(success);
+ 		return;
+@@ -4843,6 +5153,10 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 			afPauseState_ = controls::AfPauseStateRunning;
+ 			afState_ = controls::AfStateIdle;
+ 			afStage_ = AfStage::Idle;
++			if (afMode_ == controls::AfModeManual)
++				stopTofAssistIfActive();
++			else if (tofAssistEligible())
++				tofAssist_->ensureCalibrationAsync();
+ 			if (afMode_ == controls::AfModeContinuous)
+ 				startAfScan(statsTimestamp_);
+ 		}
+@@ -4865,6 +5179,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 			startAfScan(statsTimestamp_);
+ 		}
+ 		else if (trigger == controls::AfTriggerCancel) {
++			stopTofAssistIfActive();
+ 			afState_ = controls::AfStateIdle;
+ 			afStage_ = AfStage::Restore;
+ 			afStep_ = afModel_->afCodeToStep(afOriginalPosition_);
+@@ -4883,6 +5198,8 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 			afPauseState_ = controls::AfPauseStateRunning;
+ 		} else if (afStage_ == AfStage::Idle ||
+ 			   pause == controls::AfPauseImmediate) {
++			if (pause == controls::AfPauseImmediate)
++				stopTofAssistIfActive();
+ 			afPaused_ = true;
+ 			afDeferredPause_ = false;
+ 			afPauseState_ = controls::AfPauseStatePaused;
+@@ -5528,6 +5845,13 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->afPauseState_ = controls::AfPauseStateRunning;
+ 	data->afState_ = controls::AfStateIdle;
+ 	data->afStage_ = QcomCameraData::AfStage::Idle;
++	data->afUsedTof_ = false;
++	data->afTofPendingStart_ = false;
++	data->afTofScanStartNs_ = 0;
++	data->afTofWaitDeadlineNs_ = 0;
++	data->afTofFineExtensions_ = 0;
++	data->afTofIdleCounter_ = 0;
++	data->afTofDefocusStreak_ = 0;
+ 	data->testPatternMode_ = controls::draft::TestPatternModeOff;
+ 	data->bfRoiProgrammed_ = false;
+ 	data->programmedBfRoi_ = {};
+@@ -5559,6 +5883,9 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 			return ret;
+ 	}
+ 
++	if (data->tofAssistEligible() && data->afMode_ != controls::AfModeManual)
++		data->tofAssist_->ensureCalibrationAsync();
++
+ 	if (data->pixConfigured_) {
+ 		data->resetAwb();
+ 		data->syncDemux();
+@@ -5640,6 +5967,14 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 	data->afUsedPdaf_ = false;
+ 	data->afPdafConfirmed_ = false;
+ 	data->afPdafDefocusStreak_ = 0;
++	data->stopTofAssistIfActive();
++	data->afUsedTof_ = false;
++	data->afTofPendingStart_ = false;
++	data->afTofScanStartNs_ = 0;
++	data->afTofWaitDeadlineNs_ = 0;
++	data->afTofFineExtensions_ = 0;
++	data->afTofIdleCounter_ = 0;
++	data->afTofDefocusStreak_ = 0;
+ 	data->resetTestPattern();
+ 	data->teardownLinks();
+ 	data->closeCaptureDevices();
+@@ -5735,6 +6070,8 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+ 	MediaEntity *tofRdi = media_->getEntityByName("msm_vfe3_rdi0");
+ 	MediaEntity *tofVideo = findOutputVideo(tofRdi);
+ 	std::vector<MediaEntity *> tofSensors;
++	QcomCameraData *imx520Data = nullptr;
++	TofCameraData *primaryTofData = nullptr;
+ 
+ 	unsigned int registered = 0;
+ 	for (MediaEntity *entity : media_->entities()) {
+@@ -5769,12 +6106,15 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+ 			continue;
+ 		}
+ 
++		QcomCameraData *rawDataPtr = data.get();
+ 		std::set<Stream *> streams{ &data->stream_ };
+ 		if (data->rawVideo_)
+ 			streams.insert(&data->rawStream_);
+ 		std::shared_ptr<Camera> camera =
+ 			Camera::create(std::move(data), entity->name(), streams);
+ 		registerCamera(std::move(camera));
++		if (profile == &kImx520Profile)
++			imx520Data = rawDataPtr;
+ 		registered++;
+ 	}
+ 
+@@ -5789,6 +6129,7 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+ 			continue;
+ 		}
+ 
++		TofCameraData *rawTofPtr = tofData.get();
+ 		std::set<Stream *> streams{
+ 			&tofData->processedStream_,
+ 			&tofData->rawStream_,
+@@ -5797,9 +6138,17 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+ 			Camera::create(std::move(tofData), entity->name(), streams);
+ 		tofCameras_.insert(camera.get());
+ 		registerCamera(std::move(camera));
++		if (!primaryTofData)
++			primaryTofData = rawTofPtr;
+ 		registered++;
+ 	}
+ 
++	if (imx520Data && primaryTofData) {
++		imx520Data->setTofAssist(primaryTofData);
++		LOG(QcomPipeline, Info)
++			<< "Linked front ToF assist (irs2381c) to imx520";
++	}
++
+ 	if (!registered)
+ 		LOG(QcomPipeline, Debug) << "No supported sensor found";
+ 
+diff --git a/src/libcamera/pipeline/qcom/tof_camera.h b/src/libcamera/pipeline/qcom/tof_camera.h
+index 71135e0..3bd8902 100644
+--- a/src/libcamera/pipeline/qcom/tof_camera.h
++++ b/src/libcamera/pipeline/qcom/tof_camera.h
+@@ -9,15 +9,19 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdint>
++#include <cstring>
+ #include <ctime>
+ #include <deque>
+ #include <map>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <string>
++#include <thread>
+ #include <utility>
+ #include <vector>
+ 
+@@ -99,6 +103,13 @@ public:
+ 	{
+ 	}
+ 
++	~TofCameraData()
++	{
++		stopAssist();
++		if (calThread_.joinable())
++			calThread_.join();
++	}
++
+ 	int init(MediaEntity *sensorEntity, MediaEntity *rdiEntity,
+ 		 MediaEntity *videoEntity)
+ 	{
+@@ -300,6 +311,9 @@ public:
+ 		const StreamConfiguration &cfg = stream->configuration();
+ 
+ 		if (stream == &rawStream_) {
++			if (assistStreaming_)
++				stopAssist();
++
+ 			int ret = video_->open();
+ 			if (ret < 0)
+ 				return ret;
+@@ -332,8 +346,143 @@ public:
+ 		return -EINVAL;
+ 	}
+ 
++	void ensureCalibrationAsync()
++	{
++		if (calReady_.load() || calLoading_.load() || calAttempted_ ||
++		    userStreaming_ || assistStreaming_)
++			return;
++		if (calThread_.joinable())
++			calThread_.join();
++
++		calAttempted_ = true;
++		calLoading_.store(true);
++		calThread_ = std::thread([this]() {
++			TofDemodulator local;
++			const bool ok = local.loadCalibrationFromSysfs();
++			{
++				std::lock_guard<std::mutex> lock(calMutex_);
++				if (ok && local.isCalibrated()) {
++					demodulator_ = std::move(local);
++					calibrationLoaded_ = true;
++					calReady_.store(true);
++					LOG(QcomPipeline, Info)
++						<< "Loaded IRS2381C Zwetschge/PMDJGF calibration ("
++						<< demodulator_.serial() << ")";
++				} else {
++					LOG(QcomPipeline, Warning)
++						<< "IRS2381C calibration nvmem unavailable for AF assist";
++				}
++			}
++			calLoading_.store(false);
++		});
++	}
++
++	bool isCalibrationLoading() const { return calLoading_.load(); }
++	bool isCalibrationReady() const { return calReady_.load(); }
++
++	TofIntrinsics intrinsics() const
++	{
++		std::lock_guard<std::mutex> lock(calMutex_);
++		return demodulator_.intrinsics();
++	}
++
++	bool isUserStreaming() const { return userStreaming_; }
++	bool isAssistStreaming() const { return assistStreaming_; }
++
++	int startAssist()
++	{
++		assistRequested_ = true;
++		if (userStreaming_ || assistStreaming_)
++			return 0;
++		if (calLoading_.load())
++			return -EAGAIN;
++		if (calThread_.joinable())
++			calThread_.join();
++		if (!calReady_.load() || !demodulator_.isCalibrated())
++			return -ENODATA;
++		if (!rawFormatCache_.count(kRaw9Size))
++			return -EINVAL;
++
++		int ret = openCaptureDevices();
++		if (ret < 0)
++			return ret;
++
++		auto errorCleanup = utils::scope_exit{ [&]() {
++			const bool wasStreaming = assistStreaming_;
++			assistStreaming_ = false;
++			if (wasStreaming)
++				video_->streamOff();
++			video_->releaseBuffers();
++			internalRawBuffers_.clear();
++			freeRawBuffers_.clear();
++			teardownLinks();
++			closeCaptureDevices();
++		} };
++
++		ret = setupLinks();
++		if (ret < 0)
++			return ret;
++
++		ret = applyFormatsAndFps(kRaw9Size, 15, nullptr);
++		if (ret < 0)
++			return ret;
++
++		applyExposureUs(defaultExposureUs_);
++
++		ret = video_->allocateBuffers(kBufferCount, &internalRawBuffers_);
++		if (ret < 0)
++			return ret;
++
++		ret = video_->streamOn();
++		if (ret < 0)
++			return ret;
++
++		assistStreaming_ = true;
++		for (const auto &buf : internalRawBuffers_) {
++			ret = video_->queueBuffer(buf.get());
++			if (ret < 0)
++				return ret;
++		}
++
++		errorCleanup.release();
++		return 0;
++	}
++
++	void stopAssist()
++	{
++		assistRequested_ = false;
++		if (!assistStreaming_)
++			return;
++
++		/* Clear assist flag before streamOff so cancelled callbacks do not re-queue. */
++		assistStreaming_ = false;
++		video_->streamOff();
++		video_->releaseBuffers();
++		internalRawBuffers_.clear();
++		freeRawBuffers_.clear();
++		teardownLinks();
++		closeCaptureDevices();
++	}
++
++	TofDepthRoiSample sampleDepth(int x0, int y0, int x1, int y1,
++				      uint64_t minTimestampNs) const
++	{
++		if (!latestDepthValid_ || latestDepthSubframes_ != 9 ||
++		    latestDepthTimestamp_ < minTimestampNs)
++			return {};
++
++		TofDepthRoiSample s =
++			TofDemodulator::sampleDepthRoi(latestDepthMm_.data(), x0, y0, x1, y1);
++		s.haveFreshFrame = true;
++		return s;
++	}
++
+ 	int start(const ControlList *controls)
+ 	{
++		stopAssist();
++		if (calThread_.joinable())
++			calThread_.join();
++
+ 		/*
+ 		 * Load Zwetschge/PMDJGF calibration while the sensor is idle:
+ 		 * the kernel nvmem driver rejects Flash reads during active streaming
+@@ -342,6 +488,7 @@ public:
+ 		if (!calibrationLoaded_) {
+ 			calibrationLoaded_ = true;
+ 			if (demodulator_.loadCalibrationFromSysfs()) {
++				calReady_.store(demodulator_.isCalibrated());
+ 				LOG(QcomPipeline, Info)
+ 					<< "Loaded IRS2381C Zwetschge/PMDJGF calibration ("
+ 					<< demodulator_.serial() << ")";
+@@ -359,6 +506,7 @@ public:
+ 			return ret;
+ 
+ 		auto errorCleanup = utils::scope_exit{ [&]() {
++			userStreaming_ = false;
+ 			video_->releaseBuffers();
+ 			internalRawBuffers_.clear();
+ 			freeRawBuffers_.clear();
+@@ -371,7 +519,7 @@ public:
+ 		if (ret < 0)
+ 			return ret;
+ 
+-		ret = applyFormatsAndFps();
++		ret = applyFormatsAndFps(rawSize_, activeFps_, &activeFps_);
+ 		if (ret < 0)
+ 			return ret;
+ 
+@@ -398,12 +546,14 @@ public:
+ 		if (ret < 0)
+ 			return ret;
+ 
++		userStreaming_ = true;
+ 		errorCleanup.release();
+ 		return 0;
+ 	}
+ 
+ 	void stopDevice()
+ 	{
++		userStreaming_ = false;
+ 		video_->streamOff();
+ 
+ 		while (!pendingRequests_.empty()) {
+@@ -462,6 +612,14 @@ public:
+ 	std::map<Size, FormatGeometry> rawFormatCache_;
+ 
+ private:
++	static uint64_t monotonicNs()
++	{
++		struct timespec ts;
++		if (clock_gettime(CLOCK_MONOTONIC, &ts))
++			return 0;
++		return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
++	}
++
+ 	static int64_t boottimeOffsetNs()
+ 	{
+ 		struct timespec bootTime;
+@@ -646,11 +804,12 @@ private:
+ 		}
+ 	}
+ 
+-	int applyFormatsAndFps()
++	int applyFormatsAndFps(const Size &rawSize, unsigned int fps,
++			       unsigned int *appliedFps = nullptr)
+ 	{
+ 		V4L2SubdeviceFormat fmt{};
+ 		fmt.code = MEDIA_BUS_FMT_SBGGR12_1X12;
+-		fmt.size = rawSize_;
++		fmt.size = rawSize;
+ 
+ 		int ret = sensor_->setFormat(0, &fmt);
+ 		if (ret < 0)
+@@ -659,10 +818,11 @@ private:
+ 		struct v4l2_subdev_frame_interval fi{};
+ 		fi.pad = 0;
+ 		fi.interval.numerator = 1;
+-		fi.interval.denominator = activeFps_;
++		fi.interval.denominator = fps;
+ 		ret = sensor_->ioctl(VIDIOC_SUBDEV_S_FRAME_INTERVAL, &fi);
+-		if (ret == 0 && fi.interval.numerator > 0 && fi.interval.denominator > 0)
+-			activeFps_ = fi.interval.denominator / fi.interval.numerator;
++		if (appliedFps && ret == 0 && fi.interval.numerator > 0 &&
++		    fi.interval.denominator > 0)
++			*appliedFps = fi.interval.denominator / fi.interval.numerator;
+ 
+ 		/* Refresh eye-safety exposure bounds for the active use case. */
+ 		sensor_->updateControlInfo();
+@@ -700,7 +860,7 @@ private:
+ 
+ 		V4L2DeviceFormat devFmt{};
+ 		devFmt.fourcc = video_->toV4L2PixelFormat(formats::SBGGR12_CSI2P);
+-		devFmt.size = rawSize_;
++		devFmt.size = rawSize;
+ 		devFmt.colorSpace = ColorSpace::Raw;
+ 		return video_->setFormat(&devFmt);
+ 	}
+@@ -719,6 +882,34 @@ private:
+ 
+ 	void rawBufferReady(FrameBuffer *rawBuffer)
+ 	{
++		if (!userStreaming_) {
++			if (!assistStreaming_)
++				return;
++
++			if (rawBuffer->metadata().status == FrameMetadata::FrameSuccess) {
++				DmaSyncer rawSync(rawBuffer->planes()[0].fd, DmaSyncer::SyncType::Read);
++				MappedFrameBuffer rawMap(rawBuffer, MappedFrameBuffer::MapFlag::Read);
++				if (rawMap.isValid() && !rawMap.planes().empty()) {
++					TofFrameResult res = demodulator_.demodulate(
++						rawMap.planes()[0].data(),
++						rawMap.planes()[0].size(),
++						latestDepthMm_.data(),
++						nullptr, 0, nullptr, 0);
++					/* M2453_B11 frame 0 is an unmodulated warmup superframe after STREAM_CTRL=1. */
++					if (!res.eyeSafetyError && res.subframes == 9 &&
++					    res.frameNumber > 0 && res.validPixels > 0) {
++						latestDepthTimestamp_ = monotonicNs();
++						latestDepthSubframes_ = res.subframes;
++						latestDepthValid_ = true;
++					}
++				}
++			}
++
++			if (assistStreaming_)
++				video_->queueBuffer(rawBuffer);
++			return;
++		}
++
+ 		if (pendingRequests_.empty())
+ 			return;
+ 
+@@ -765,17 +951,48 @@ private:
+ 							res = demodulator_.demodulate(
+ 								rawData, rawBytes, dst,
+ 								nullptr, 0, nullptr, 0);
++							if (!res.eyeSafetyError && res.subframes == 9 &&
++							    res.validPixels > 0) {
++								std::memcpy(latestDepthMm_.data(), dst,
++									    latestDepthMm_.size() * sizeof(uint16_t));
++								latestDepthTimestamp_ = monotonicNs();
++								latestDepthSubframes_ = res.subframes;
++								latestDepthValid_ = true;
++							}
+ 						} else if (procMap.planes().size() >= 2) {
+ 							res = demodulator_.demodulate(
+-								rawData, rawBytes, nullptr,
++								rawData, rawBytes, latestDepthMm_.data(),
+ 								procMap.planes()[0].data(),
+ 								processedStride_,
+ 								procMap.planes()[1].data(),
+ 								processedStride_);
++							if (!res.eyeSafetyError && res.subframes == 9 &&
++							    res.validPixels > 0) {
++								latestDepthTimestamp_ = monotonicNs();
++								latestDepthSubframes_ = res.subframes;
++								latestDepthValid_ = true;
++							}
+ 						}
+ 						haveTemp = res.temperatureMeasured;
+ 						tempC = res.temperatureC;
+ 					}
++				} else if (assistRequested_) {
++					res = demodulator_.demodulate(
++						rawData, rawBytes, latestDepthMm_.data(),
++						nullptr, 0, nullptr, 0);
++					if (!res.eyeSafetyError && res.subframes == 9 &&
++					    res.validPixels > 0) {
++						latestDepthTimestamp_ = monotonicNs();
++						latestDepthSubframes_ = res.subframes;
++						latestDepthValid_ = true;
++					}
++					if (res.temperatureMeasured) {
++						haveTemp = true;
++						tempC = res.temperatureC;
++					} else {
++						haveTemp = demodulator_.measureTemperature(
++							rawData, rawBytes, tempC);
++					}
+ 				} else {
+ 					haveTemp = demodulator_.measureTemperature(
+ 						rawData, rawBytes, tempC);
+@@ -831,6 +1048,19 @@ private:
+ 
+ 	TofDemodulator demodulator_;
+ 	bool calibrationLoaded_ = false;
++	mutable std::mutex calMutex_;
++	std::thread calThread_;
++	std::atomic<bool> calLoading_{ false };
++	std::atomic<bool> calReady_{ false };
++	bool calAttempted_ = false;
++
++	bool userStreaming_ = false;
++	bool assistStreaming_ = false;
++	bool assistRequested_ = false;
++	std::array<uint16_t, TofDemodulator::kPixels> latestDepthMm_{};
++	uint64_t latestDepthTimestamp_ = 0;
++	uint32_t latestDepthSubframes_ = 0;
++	bool latestDepthValid_ = false;
+ 
+ 	bool processedConfigured_ = true;
+ 	bool rawConfigured_ = false;
+diff --git a/src/libcamera/pipeline/qcom/tof_demodulator.h b/src/libcamera/pipeline/qcom/tof_demodulator.h
+index 2ece611..0538977 100644
+--- a/src/libcamera/pipeline/qcom/tof_demodulator.h
++++ b/src/libcamera/pipeline/qcom/tof_demodulator.h
+@@ -10,12 +10,14 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cerrno>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstring>
++#include <fcntl.h>
+ #include <filesystem>
+-#include <fstream>
+ #include <string>
++#include <unistd.h>
+ #include <vector>
+ 
+ namespace libcamera {
+@@ -53,6 +55,17 @@ struct TofFrameResult {
+ 	bool temperatureMeasured = false;
++	uint16_t frameNumber = 0;
+ };
+ 
++struct TofDepthRoiSample {
++	bool haveFreshFrame = false;
++	bool valid = false;
++	float depthMm = 0.0f;
++	float medianMm = 0.0f;
++	float iqrMm = 0.0f;
++	uint32_t validPixels = 0;
++	uint32_t roiPixels = 0;
++};
++
+ class TofDemodulator
+ {
+ public:
+@@ -112,17 +125,80 @@ public:
+ 		}
+ 
+ 		for (const auto &path : candidates) {
+-			std::ifstream ifs(path, std::ios::binary);
+-			if (!ifs)
++			int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++			if (fd < 0)
+ 				continue;
+-			std::vector<uint8_t> data((std::istreambuf_iterator<char>(ifs)),
+-						  std::istreambuf_iterator<char>());
+-			if (loadCalibration(data.data(), data.size()))
++
++			std::vector<uint8_t> data;
++			uint8_t buf[16384];
++			bool readOk = true;
++			while (true) {
++				ssize_t n = ::read(fd, buf, sizeof(buf));
++				if (n > 0) {
++					data.insert(data.end(), buf, buf + n);
++				} else if (n == 0) {
++					break;
++				} else if (errno == EINTR) {
++					continue;
++				} else {
++					readOk = false;
++					break;
++				}
++			}
++			::close(fd);
++
++			if (readOk && loadCalibration(data.data(), data.size()))
+ 				return true;
+ 		}
+ 		return false;
+ 	}
+ 
++	static TofDepthRoiSample sampleDepthRoi(const uint16_t *depthMm,
++						int x0, int y0, int x1, int y1)
++	{
++		TofDepthRoiSample sample{};
++		if (!depthMm)
++			return sample;
++
++		const int cx0 = std::clamp(x0, 0, static_cast<int>(kWidth));
++		const int cy0 = std::clamp(y0, 0, static_cast<int>(kHeight));
++		const int cx1 = std::clamp(x1, cx0, static_cast<int>(kWidth));
++		const int cy1 = std::clamp(y1, cy0, static_cast<int>(kHeight));
++		if (cx1 <= cx0 || cy1 <= cy0)
++			return sample;
++
++		sample.roiPixels = static_cast<uint32_t>((cx1 - cx0) * (cy1 - cy0));
++		std::vector<uint16_t> vals;
++		vals.reserve(sample.roiPixels);
++
++		for (int y = cy0; y < cy1; ++y) {
++			const uint16_t *row = depthMm + y * kWidth;
++			for (int x = cx0; x < cx1; ++x) {
++				const uint16_t z = row[x];
++				if (z >= 100 && z <= 6500)
++					vals.push_back(z);
++			}
++		}
++
++		sample.validPixels = static_cast<uint32_t>(vals.size());
++		if (sample.validPixels < 16 ||
++		    sample.validPixels * 100 < sample.roiPixels * 15)
++			return sample;
++
++		std::sort(vals.begin(), vals.end());
++		const size_t n = vals.size();
++		const uint16_t q25 = vals[n / 4];
++		const uint16_t q35 = vals[(n * 35) / 100];
++		const uint16_t q50 = vals[n / 2];
++		const uint16_t q75 = vals[(n * 3) / 4];
++
++		sample.depthMm = static_cast<float>(q35);
++		sample.medianMm = static_cast<float>(q50);
++		sample.iqrMm = static_cast<float>(q75 - q25);
++		sample.valid = true;
++		return sample;
++	}
++
+ 	bool loadCalibration(const uint8_t *blob, size_t len)
+ 	{
+ 		if (!blob || len < 16)
+@@ -191,6 +267,8 @@ public:
+ 			if (pseudo[24] != kWidth - 1 || pseudo[26] != kHeight - 1)
+ 				break;
+ 			if (pseudo[5] != b)
+ 				return res;
++			if (b == 0)
++				res.frameNumber = pseudo[3];
+ 
+ 			uint32_t eyeErr = (pseudo[42] & 0x0fffU) | ((pseudo[43] & 0x0f00U) << 8);
+-- 
+2.55.0
+

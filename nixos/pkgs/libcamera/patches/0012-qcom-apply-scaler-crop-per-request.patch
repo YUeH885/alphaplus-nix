@@ -1,0 +1,242 @@
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index fa25e05..ef50a2e 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -813,6 +813,9 @@ public:
+ 	int openCaptureDevices();
+ 	void closeCaptureDevices();
+ 	int refreshSensorInfo(bool updateControls = true);
++	void setScalerCrop(const Rectangle &crop);
++	Rectangle scalerCropRectangle() const;
++	Rectangle minScalerCropRectangle() const;
+ 	void resetAwb();
+ 	void resetAwbProcessing();
+ 	int recordFrameState();
+@@ -900,6 +903,7 @@ public:
+ 		int32_t flickerPeriod;
+ 		std::array<int64_t, 2> frameDurationLimits;
+ 		int64_t frameDuration = 0;
++		Rectangle scalerCrop;
+ 		int32_t flashMode;
+ 		int32_t flashState;
+ 		int32_t precaptureTrigger;
+@@ -994,6 +998,10 @@ public:
+ 	int32_t awbFrame_ = 0;
+ 	Size statsInputSize_;
+ 	Rectangle analogCrop_;
++	bool hasScalerCrop_ = false;
++	Size scalerOutput_;
++	qcom_camss_ife_crop defaultScaler_ = {};
++	qcom_camss_ife_crop activeScaler_ = {};
+ 	double colourTemperature_ = 4250.0;
+ 	int16_t ccmQ7_[9] = { 214, -93, 7, -38, 170, -5, 6, -157, 279 };
+ 
+@@ -1418,6 +1426,7 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 		return -EINVAL;
+ 	}
+ 
++	hasScalerCrop_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_IFE_CROP);
+ 	video_->bufferReady.connect(this, &QcomCameraData::imageBufferReady);
+ 
+ 	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
+@@ -1515,6 +1524,9 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 	}
+ 	properties_ = sensor_->properties();
+ 	properties_.set(properties::ScalerCropMaximum, analogCrop_);
++	if (hasScalerCrop_)
++		ctrls[&controls::ScalerCrop] = ControlInfo(Rectangle(0, 0, 1, 1),
++							  analogCrop_, analogCrop_);
+ 	if (afEnabled_) {
+ 		ctrls[&controls::AfMetering] = ControlInfo(
+ 			controls::AfMeteringValues, ControlValue(controls::AfMeteringAuto));
+@@ -1751,6 +1763,13 @@ int QcomCameraData::setFormats(const Size &size, bool updateControls)
+ 				if (ret < 0)
+ 					return ret;
+ 
++				scalerOutput_ = crop.size();
++				defaultScaler_ = { static_cast<uint16_t>(compose.width),
++						   static_cast<uint16_t>(compose.height),
++						   static_cast<uint16_t>(crop.x),
++						   static_cast<uint16_t>(crop.y) };
++				activeScaler_ = defaultScaler_;
++
+ 				V4L2SubdeviceFormat sourceFormat = format;
+ 				sourceFormat.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
+ 				sourceFormat.size = size;
+@@ -1789,7 +1808,20 @@ int QcomCameraData::setFormats(const Size &size, bool updateControls)
+ 	    videoFormat.size != format.size)
+ 		return -EINVAL;
+ 
+-	return refreshSensorInfo(updateControls);
++	ret = refreshSensorInfo(updateControls);
++	if (!ret && updateControls && hasScalerCrop_) {
++		const Rectangle maxCrop = scalerCropRectangle();
++		const Rectangle minCrop = minScalerCropRectangle();
++		properties_.set(properties::ScalerCropMaximum, maxCrop);
++		if (!controlInfo_.empty()) {
++			ControlInfoMap::Map map;
++			for (const auto &[id, range] : controlInfo_)
++				map.emplace(id, range);
++			map[&libcamera::controls::ScalerCrop] = ControlInfo(minCrop, maxCrop, maxCrop);
++			controlInfo_ = ControlInfoMap(std::move(map), libcamera::controls::controls);
++		}
++	}
++	return ret;
+ }
+ 
+ void QcomCameraData::setIfeWb(double gainR, double gainG, double gainB)
+@@ -1866,6 +1898,81 @@ void QcomCameraData::setManualAwb(double gainR, double gainB, std::optional<int3
+ 	setIfeWb(awbGainR_, 1.0, awbGainB_);
+ }
+ 
++Rectangle QcomCameraData::scalerCropRectangle() const
++{
++	const double scaleX = static_cast<double>(analogCrop_.width) / activeScaler_.compose_width;
++	const double scaleY = static_cast<double>(analogCrop_.height) / activeScaler_.compose_height;
++	const unsigned int width = static_cast<unsigned int>(std::lround(scalerOutput_.width * scaleX));
++	const unsigned int height = static_cast<unsigned int>(std::lround(scalerOutput_.height * scaleY));
++	int offsetX = static_cast<int>(std::lround(activeScaler_.left * scaleX));
++	int offsetY = static_cast<int>(std::lround(activeScaler_.top * scaleY));
++	if (!!(transform_ & Transform::HFlip))
++		offsetX = std::max(0, static_cast<int>(analogCrop_.width) - offsetX - static_cast<int>(width));
++	if (!!(transform_ & Transform::VFlip))
++		offsetY = std::max(0, static_cast<int>(analogCrop_.height) - offsetY - static_cast<int>(height));
++
++	return { analogCrop_.x + offsetX, analogCrop_.y + offsetY, width, height };
++}
++
++Rectangle QcomCameraData::minScalerCropRectangle() const
++{
++	const unsigned int maxComposeW = std::max<unsigned int>(defaultScaler_.compose_width,
++								statsInputSize_.width & ~1U);
++	const unsigned int maxComposeH = std::max<unsigned int>(defaultScaler_.compose_height,
++								statsInputSize_.height & ~1U);
++	if (!maxComposeW || !maxComposeH || !scalerOutput_.width || !scalerOutput_.height)
++		return analogCrop_;
++
++	const unsigned int minW = std::max<unsigned int>(
++		1U, static_cast<unsigned int>(std::lround(static_cast<double>(analogCrop_.width) *
++							  scalerOutput_.width / maxComposeW)));
++	const unsigned int minH = std::max<unsigned int>(
++		1U, static_cast<unsigned int>(std::lround(static_cast<double>(analogCrop_.height) *
++							  scalerOutput_.height / maxComposeH)));
++	return { analogCrop_.x, analogCrop_.y,
++		 std::min(minW, analogCrop_.width),
++		 std::min(minH, analogCrop_.height) };
++}
++
++void QcomCameraData::setScalerCrop(const Rectangle &request)
++{
++	const Rectangle crop = request.boundedTo(analogCrop_);
++	if (!crop.width || !crop.height) {
++		activeScaler_ = defaultScaler_;
++		return;
++	}
++
++	const double fullWidth = static_cast<double>(analogCrop_.width) * scalerOutput_.width /
++				 defaultScaler_.compose_width;
++	const double fullHeight = static_cast<double>(analogCrop_.height) * scalerOutput_.height /
++				  defaultScaler_.compose_height;
++	const double maxZoom = std::min(static_cast<double>(statsInputSize_.width) /
++						defaultScaler_.compose_width,
++					static_cast<double>(statsInputSize_.height) /
++						defaultScaler_.compose_height);
++	const double zoom = std::clamp(std::min(fullWidth / crop.width, fullHeight / crop.height),
++				       1.0, maxZoom);
++	const auto roundEven = [](double value) { return std::lround(value / 2) * 2; };
++	const long width = std::min<long>(roundEven(defaultScaler_.compose_width * zoom),
++					  statsInputSize_.width & ~1U);
++	const long height = std::min<long>(roundEven(defaultScaler_.compose_height * zoom),
++					   statsInputSize_.height & ~1U);
++	double centreX = crop.x - analogCrop_.x + crop.width / 2.0;
++	double centreY = crop.y - analogCrop_.y + crop.height / 2.0;
++	if (!!(transform_ & Transform::HFlip))
++		centreX = analogCrop_.width - centreX;
++	if (!!(transform_ & Transform::VFlip))
++		centreY = analogCrop_.height - centreY;
++	const long left = std::clamp(roundEven(centreX * width / analogCrop_.width -
++					       scalerOutput_.width / 2.0),
++				     0L, width - scalerOutput_.width);
++	const long top = std::clamp(roundEven(centreY * height / analogCrop_.height -
++					      scalerOutput_.height / 2.0),
++				    0L, height - scalerOutput_.height);
++	activeScaler_ = { static_cast<uint16_t>(width), static_cast<uint16_t>(height),
++			  static_cast<uint16_t>(left), static_cast<uint16_t>(top) };
++}
++
+ qcom_camss_ife_config QcomCameraData::ifeConfiguration() const
+ {
+ 	qcom_camss_ife_config config = {};
+@@ -1883,15 +1990,18 @@ qcom_camss_ife_config QcomCameraData::ifeConfiguration() const
+ int QcomCameraData::transferIfe(qcom_camss_ife_config &config,
+ 			      const V4L2Request *request, bool read)
+ {
+-	struct v4l2_ext_control control = {};
++	std::array<v4l2_ext_control, 2> control = {};
+ 	struct v4l2_ext_controls controls = {};
+-	control.id = V4L2_CID_QCOM_CAMSS_IFE_CONFIG;
+-	control.size = sizeof(config);
+-	control.ptr = &config;
++	control[0].id = V4L2_CID_QCOM_CAMSS_IFE_CONFIG;
++	control[0].size = sizeof(config);
++	control[0].ptr = &config;
++	control[1].id = V4L2_CID_QCOM_CAMSS_IFE_CROP;
++	control[1].size = sizeof(activeScaler_);
++	control[1].ptr = &activeScaler_;
+ 	controls.which = request ? V4L2_CTRL_WHICH_REQUEST_VAL : V4L2_CTRL_WHICH_CUR_VAL;
+-	controls.count = 1;
++	controls.count = request && !read && hasScalerCrop_ ? 2 : 1;
+ 	controls.request_fd = request ? request->fd() : -1;
+-	controls.controls = &control;
++	controls.controls = control.data();
+ 	return pix_->ioctl(read ? VIDIOC_G_EXT_CTRLS : VIDIOC_S_EXT_CTRLS, &controls);
+ }
+ 
+@@ -1993,6 +2103,8 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 	context.ife.cct = colourTemperature_;
+ 	context.ife.awbEnabled = awbEnabled_;
+ 	context.ife.awbLocked = awbLocked_;
++	if (hasScalerCrop_)
++		context.scalerCrop = scalerCropRectangle();
+ 	for (unsigned int i = 0; i < context.ife.ccm.size(); i++)
+ 		context.ife.ccm[i] = config.ccm_q7[i] / 128.0f;
+ 	ret = transferIfe(config, context.request.get(), false);
+@@ -3114,6 +3226,9 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 			return ret;
+ 	}
+ 
++	if (auto crop = controls.get(controls::ScalerCrop); hasScalerCrop_ && crop)
++		setScalerCrop(*crop);
++
+ 	if (controls.contains(controls::AwbEnable.id())) {
+ 		bool enabled = *controls.get(controls::AwbEnable);
+ 		if (enabled != awbEnabled_) {
+@@ -3267,6 +3382,8 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 		metadata.set(controls::ExposureTime, us);
+ 	}
+ 	metadata.set(controls::FrameDuration, context.frameDuration);
++	if (hasScalerCrop_)
++		metadata.set(controls::ScalerCrop, context.scalerCrop);
+ 	metadata.set(controls::FrameDurationLimits, context.frameDurationLimits);
+ 
+ 	if (applied.contains(V4L2_CID_ANALOGUE_GAIN)) {
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+index 604c2f1..78f54e6 100644
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -8,6 +8,15 @@
+ 
+ #define QCOM_CAMSS_IFE_CONFIG_VERSION 6
+ 
++#define V4L2_CID_QCOM_CAMSS_IFE_CROP (V4L2_CID_USER_BASE + 0x1251)
++
++struct qcom_camss_ife_crop {
++	uint16_t compose_width;
++	uint16_t compose_height;
++	uint16_t left;
++	uint16_t top;
++};
++
+ #define QCOM_CAMSS_IFE_CONFIG_BLACK_LEVEL (1U << 0)
+ #define QCOM_CAMSS_IFE_CONFIG_WHITE_BALANCE (1U << 1)
+ #define QCOM_CAMSS_IFE_CONFIG_CCM (1U << 2)

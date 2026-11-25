@@ -1,0 +1,3241 @@
+From d0df5903a15f6efed5f0b23f213a6ed509c6fdda Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu23234@gmail.com>
+Date: Sat, 7 Nov 2026 13:33:34 +0800
+Subject: [PATCH] libcamera: qcom: add QTI front AWB engine and IMX520
+ calibration
+
+Implement the factory QTI AWB pipeline for the front IMX520 camera,
+including 64x48 BG statistics screening, white-balance locus projection,
+distance/intensity weights, mixed-light classification, scene analysis,
+temporal convergence, mesh gain adjustment, face-assist analysis, dynamic
+frame skipping, and EEPROM module calibration.
+---
+ src/libcamera/pipeline/qcom/awb_accumulator.h |  135 ++
+ src/libcamera/pipeline/qcom/awb_calibration.h |  124 ++
+ src/libcamera/pipeline/qcom/awb_eeprom.h      |   26 +
+ src/libcamera/pipeline/qcom/awb_face.h        |  131 ++
+ .../pipeline/qcom/awb_face_analysis.h         |  115 ++
+ src/libcamera/pipeline/qcom/awb_frame_skip.h  |  102 ++
+ src/libcamera/pipeline/qcom/awb_front.h       |  221 ++++
+ .../pipeline/qcom/awb_front_configuration.h   |   62 +
+ .../pipeline/qcom/awb_gain_adjustment.h       |  198 +++
+ src/libcamera/pipeline/qcom/awb_locus.h       |  121 ++
+ src/libcamera/pipeline/qcom/awb_mlc.h         |   63 +
+ src/libcamera/pipeline/qcom/awb_output.h      |   59 +
+ src/libcamera/pipeline/qcom/awb_scenes.h      |  170 +++
+ src/libcamera/pipeline/qcom/awb_statistics.h  |   66 +
+ src/libcamera/pipeline/qcom/awb_temporal.h    |   59 +
+ src/libcamera/pipeline/qcom/awb_triggers.h    |   59 +
+ src/libcamera/pipeline/qcom/awb_weights.h     |  103 ++
+ src/libcamera/pipeline/qcom/awb_zones.h       |   63 +
+ .../pipeline/qcom/imx520_awb_calibration.h    |   37 +
+ .../pipeline/qcom/imx520_awb_tuning.h         | 1153 +++++++++++++++++
+ 20 files changed, 3067 insertions(+)
+ create mode 100644 src/libcamera/pipeline/qcom/awb_accumulator.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_calibration.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_eeprom.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_face.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_face_analysis.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_frame_skip.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_front.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_front_configuration.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_gain_adjustment.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_locus.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_mlc.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_output.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_scenes.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_statistics.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_temporal.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_triggers.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_weights.h
+ create mode 100644 src/libcamera/pipeline/qcom/awb_zones.h
+ create mode 100644 src/libcamera/pipeline/qcom/imx520_awb_calibration.h
+ create mode 100644 src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+
+diff --git a/src/libcamera/pipeline/qcom/awb_accumulator.h b/src/libcamera/pipeline/qcom/awb_accumulator.h
+new file mode 100644
+index 0000000..4197cfb
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_accumulator.h
+@@ -0,0 +1,135 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <vector>
++
++#include "awb_locus.h"
++#include "awb_zones.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbRegion {
++	float rg;
++	float bg;
++	float cct;
++	float distanceWeight;
++	float illuminantWeight;
++	uint32_t valid;
++};
++
++inline void qtiAwbFilterZeroWeights(QtiAwbRegion &region)
++{
++	if (region.distanceWeight == 0 || region.illuminantWeight == 0)
++		region.valid = 0;
++}
++
++struct QtiAwbDetectionZone {
++	unsigned int group;
++	QtiAwbGeometry geometry;
++	QtiAwbCoordinates coordinates;
++};
++
++struct QtiAwbDetectionGroup {
++	uint32_t count;
++	QtiAwbPoint mean;
++};
++
++class QtiAwbDetectionAccumulator
++{
++public:
++	void reset() { groups_ = {}; }
++
++	void add(const std::vector<QtiAwbDetectionZone> &zones, const QtiAwbRegion &region)
++	{
++		std::array<bool, 4> hit{};
++		for (const auto &zone : zones) {
++			/* Overlap counts once per group, independently for each scene. */
++			if (hit[zone.group] || !qtiAwbZoneContains(zone.geometry, zone.coordinates,
++								region.rg, region.bg, region.cct, region.valid))
++				continue;
++			hit[zone.group] = true;
++			auto &group = groups_[zone.group];
++			group.count++;
++			group.sum.rg += region.rg;
++			group.sum.bg += region.bg;
++		}
++	}
++
++	std::array<QtiAwbDetectionGroup, 4> result() const
++	{
++		std::array<QtiAwbDetectionGroup, 4> result{};
++		for (std::size_t i = 0; i < groups_.size(); i++) {
++			const auto &group = groups_[i];
++			result[i].count = group.count;
++			if (group.count) {
++				result[i].mean.rg = group.sum.rg / group.count;
++				result[i].mean.bg = group.sum.bg / group.count;
++			}
++		}
++		return result;
++	}
++
++private:
++	struct Group {
++		uint32_t count;
++		QtiAwbPoint sum;
++	};
++	std::array<Group, 4> groups_{};
++};
++
++struct QtiAwbAgwStatistics {
++	uint32_t valid;
++	uint32_t total;
++	QtiAwbPoint weightedMean;
++	QtiAwbPoint mean;
++	float weight;
++};
++
++class QtiAwbAgwAccumulator
++{
++public:
++	void reset() { statistics_ = {}; }
++
++	void add(const QtiAwbRegion &region)
++	{
++		statistics_.total++;
++		statistics_.sum.rg += region.rg;
++		statistics_.sum.bg += region.bg;
++		if (region.valid) {
++			float weight = region.distanceWeight * region.illuminantWeight;
++			statistics_.weightedSum.rg = std::fma(region.rg, weight, statistics_.weightedSum.rg);
++			statistics_.weightedSum.bg = std::fma(region.bg, weight, statistics_.weightedSum.bg);
++			statistics_.weight += weight;
++			statistics_.valid++;
++		}
++	}
++
++	QtiAwbAgwStatistics result() const
++	{
++		QtiAwbAgwStatistics result{ statistics_.valid, statistics_.total, {}, {}, statistics_.weight };
++		if (result.weight) {
++			result.weightedMean.rg = statistics_.weightedSum.rg / result.weight;
++			result.weightedMean.bg = statistics_.weightedSum.bg / result.weight;
++		}
++		if (result.total) {
++			result.mean.rg = statistics_.sum.rg / result.total;
++			result.mean.bg = statistics_.sum.bg / result.total;
++		}
++		return result;
++	}
++
++private:
++	struct Accumulation {
++		uint32_t valid;
++		uint32_t total;
++		QtiAwbPoint weightedSum;
++		QtiAwbPoint sum;
++		float weight;
++	};
++	Accumulation statistics_{};
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_calibration.h b/src/libcamera/pipeline/qcom/awb_calibration.h
+new file mode 100644
+index 0000000..c29cffb
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_calibration.h
+@@ -0,0 +1,124 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <vector>
++
++#include "awb_output.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbCalibrationConfiguration {
++	bool enabled;
++	unsigned int illuminantCount;
++	std::array<float, 6> ccts;
++	std::array<QtiAwbPoint, 15> golden;
++};
++
++struct QtiAwbIlluminantCalibration {
++	uint32_t valid;
++	uint32_t cct;
++	QtiAwbPoint measured;
++};
++
++class QtiAwbCalibration
++{
++public:
++	QtiAwbCalibration()
++	{
++		factors_.fill({ 1, 1 });
++	}
++
++	bool configure(const QtiAwbCalibrationConfiguration &config,
++		       const std::vector<QtiAwbIlluminantCalibration> &measured)
++	{
++		if (!config.enabled || measured.empty()) {
++			factors_.fill({ 1, 1 });
++			return true;
++		}
++		/* Configure seeds the output slots with golden points before computing factors. */
++		std::copy_n(config.golden.begin(), factors_.size(), factors_.begin());
++		if (measured.size() != config.illuminantCount)
++			return false;
++
++		struct Entry {
++			bool valid = false;
++			QtiAwbPoint measured{}, golden{};
++		};
++		std::array<Entry, 10> entries{};
++		for (unsigned int i = 0; i < measured.size(); i++) {
++			unsigned int index = calibrationIndex(config.ccts[i]);
++			if (index < entries.size())
++				entries[index] = { bool(measured[i].valid), measured[i].measured, config.golden[i] };
++		}
++		bool fluorescent = entries[4].valid;
++		bool warmFluorescent = entries[6].valid;
++		bool incandescent = entries[7].valid;
++		bool horizon = entries[8].valid;
++		unsigned int first = 0;
++		while (first < entries.size() && !entries[first].valid)
++			first++;
++		if (first == entries.size())
++			return false;
++		for (unsigned int i = first + 1; i < entries.size(); i++)
++			if (!entries[i].valid)
++				entries[i] = entries[i - 1];
++		for (unsigned int i = first; i > 0; i--)
++			entries[i - 1] = entries[i];
++
++		/* Fluorescent slots share their nearest available calibrated illuminant. */
++		if (fluorescent && warmFluorescent)
++			entries[5] = entries[4];
++		else if (warmFluorescent)
++			entries[4] = entries[5] = entries[6];
++		else if (fluorescent)
++			entries[5] = entries[6] = entries[4];
++		if (incandescent && !horizon)
++			entries[8] = entries[7];
++		else if (!incandescent && horizon)
++			entries[7] = entries[8];
++		if (!fluorescent && !warmFluorescent && config.illuminantCount == 2) {
++			Entry middle{ true,
++				{ (entries[3].measured.rg + entries[7].measured.rg) * 0.5f,
++				  (entries[3].measured.bg + entries[7].measured.bg) * 0.5f },
++				{ (entries[3].golden.rg + entries[7].golden.rg) * 0.5f,
++				  (entries[3].golden.bg + entries[7].golden.bg) * 0.5f } };
++			entries[4] = entries[5] = entries[6] = middle;
++		}
++		for (unsigned int i = 0; i < entries.size(); i++)
++			factors_[i] = { entries[i].measured.rg / entries[i].golden.rg,
++					entries[i].measured.bg / entries[i].golden.bg };
++		return true;
++	}
++
++	const std::array<QtiAwbPoint, 10> &factors() const { return factors_; }
++
++	QtiAwbPoint forCct(float cct) const { return factors_[qtiAwbLightId(cct)]; }
++
++	QtiAwbPoint toSensor(QtiAwbPoint point, unsigned int lightId) const
++	{
++		return { point.rg * factors_[lightId].rg, point.bg * factors_[lightId].bg };
++	}
++
++	QtiAwbPoint toGolden(QtiAwbPoint point, unsigned int lightId) const
++	{
++		return { point.rg / factors_[lightId].rg, point.bg / factors_[lightId].bg };
++	}
++
++private:
++	static unsigned int calibrationIndex(float cct)
++	{
++		constexpr std::array<float, 5> thresholds{ 6000, 4500, 4000, 3425, 2575 };
++		constexpr std::array<unsigned int, 6> indices{ 2, 3, 4, 6, 7, 8 };
++		for (unsigned int i = 0; i < thresholds.size(); i++)
++			if (cct >= thresholds[i])
++				return indices[i];
++		return cct >= 0 ? indices.back() : 10;
++	}
++
++	std::array<QtiAwbPoint, 10> factors_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_eeprom.h b/src/libcamera/pipeline/qcom/awb_eeprom.h
+new file mode 100644
+index 0000000..a7b4684
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_eeprom.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <optional>
++
++namespace libcamera::qcom {
++
++inline std::optional<std::array<float, 3>> awbEepromRatios(const std::array<uint8_t, 8> &block)
++{
++	auto word = [&block](unsigned int offset) -> uint16_t {
++		return block[offset] | static_cast<uint16_t>(block[offset + 1]) << 8;
++	};
++	unsigned int sum = 0;
++	for (unsigned int i = 0; i < 6; i++)
++		sum += block[i];
++	if (!sum || sum != word(6))
++		return std::nullopt;
++	std::array<float, 3> ratios;
++	for (unsigned int i = 0; i < ratios.size(); i++)
++		ratios[i] = static_cast<int16_t>(word(i * 2)) / 1024.0f;
++	return ratios;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_face.h b/src/libcamera/pipeline/qcom/awb_face.h
+new file mode 100644
+index 0000000..f22719e
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_face.h
+@@ -0,0 +1,131 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++#include "awb_locus.h"
++#include "awb_statistics.h"
++#include "awb_triggers.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbFaceRectangle {
++	float x, y, width, height;
++};
++
++inline QtiAwbFaceRectangle qtiAwbNormalizeFace(QtiAwbFaceRectangle face,
++					    QtiAwbFaceRectangle crop,
++					    float imageWidth, float imageHeight)
++{
++	if (crop.x >= 0 && crop.y >= 0 && crop.width > 0 && crop.height > 0) {
++		float left = std::min(std::max(face.x - crop.x, 0.0f), crop.width);
++		float top = std::min(std::max(face.y - crop.y, 0.0f), crop.height);
++		float right = std::max((face.x + face.width) - crop.x, 0.0f);
++		float bottom = std::max((face.y + face.height) - crop.y, 0.0f);
++		return { left / crop.width, top / crop.height,
++			 std::min(right - left, crop.width - left) / crop.width,
++			 std::min(bottom - top, crop.height - top) / crop.height };
++	}
++	if (imageWidth > 0 && imageHeight > 0)
++		return { face.x / imageWidth, face.y / imageHeight,
++			 face.width / imageWidth, face.height / imageHeight };
++	return {};
++}
++
++struct QtiAwbFaceFrameConfiguration {
++	float halfWidth, halfHeight;
++	int32_t detectionFrames, absenceFrames;
++	float convergenceSpeed;
++};
++
++struct QtiAwbFaceFrameState {
++	float left, right, top, bottom;
++	int32_t detectedFrames, absentFrames;
++	uint32_t speedRegistered, stable;
++};
++
++class QtiAwbFaceFrame
++{
++public:
++	explicit QtiAwbFaceFrame(QtiAwbFaceFrameConfiguration config)
++		: config_(config)
++	{
++	}
++
++	void reset() { state_ = {}; }
++
++	QtiAwbFaceFrameState process(const QtiAwbFaceRectangle *face,
++				     unsigned int columns, unsigned int rows)
++	{
++		state_.left = state_.right = state_.top = state_.bottom = 0;
++		if (face) {
++			state_.stable = state_.detectedFrames >= config_.detectionFrames;
++			state_.detectedFrames = std::min(state_.detectedFrames + 1, config_.detectionFrames);
++			state_.absentFrames = 0;
++			/* Preserve the separate products used by the factory ROI arithmetic. */
++			volatile float centerX = std::fma(face->width, 0.5f, face->x) * columns;
++			volatile float centerY = std::fma(face->height, 0.5f, face->y) * rows;
++			volatile float halfWidth = (face->width * columns) * config_.halfWidth;
++			volatile float halfHeight = (face->height * rows) * config_.halfHeight;
++			state_.left = std::max((centerX - halfWidth) + 0.5f, 0.0f);
++			state_.right = std::min((centerX + halfWidth) + 0.5f, float(columns - 1));
++			state_.top = std::max((centerY - halfHeight) + 0.5f, 0.0f);
++			state_.bottom = std::min((centerY + halfHeight) + 0.5f, float(rows - 1));
++		} else {
++			state_.stable = state_.detectedFrames = 0;
++			state_.absentFrames = std::min(state_.absentFrames + 1, config_.absenceFrames);
++		}
++		state_.speedRegistered = state_.absentFrames > 0 && state_.absentFrames < config_.absenceFrames;
++		return state_;
++	}
++
++private:
++	QtiAwbFaceFrameConfiguration config_;
++	QtiAwbFaceFrameState state_{};
++};
++
++struct QtiAwbFaceStatisticsConfiguration {
++	QtiAwbTriggerTable<1, 3> minimumRgb;
++	QtiAwbTriggerTable<1, 3> maximumRgb;
++};
++
++struct QtiAwbFaceStatistics {
++	QtiAwbPoint mean;
++	uint32_t count;
++};
++
++inline QtiAwbFaceStatistics qtiAwbCollectFaceStatistics(
++	const QtiAwbFaceStatisticsConfiguration &config, const QtiAwbFaceFrameState &frame,
++	const uint32_t *bg, unsigned int columns, unsigned int rows,
++	unsigned int bitDepth, unsigned int pixels, float lux)
++{
++	QtiAwbFaceStatistics result{};
++	if (!frame.stable)
++		return result;
++	auto minimum = qtiAwbEvaluateTrigger(config.minimumRgb, &lux);
++	auto maximum = qtiAwbEvaluateTrigger(config.maximumRgb, &lux);
++	for (unsigned int i = 0; i < columns * rows; i++) {
++		float x = i % columns, y = i / columns;
++		if (x < frame.left || x > frame.right || y < frame.top || y > frame.bottom)
++			continue;
++		auto stat = qtiAwbParseBg(bg + i * 12, bitDepth, pixels);
++		bool valid = true;
++		for (unsigned int channel = 0; channel < stat.rgb.size(); channel++)
++			if (stat.rgb[channel] <= minimum[channel] || stat.rgb[channel] >= maximum[channel])
++				valid = false;
++		if (valid) {
++			result.mean.rg += stat.rg;
++			result.mean.bg += stat.bg;
++			result.count++;
++		}
++	}
++	if (result.count) {
++		result.mean.rg /= result.count;
++		result.mean.bg /= result.count;
++	}
++	return result;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_face_analysis.h b/src/libcamera/pipeline/qcom/awb_face_analysis.h
+new file mode 100644
+index 0000000..7ab3b73
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_face_analysis.h
+@@ -0,0 +1,115 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <utility>
++#include <vector>
++
++#include "awb_face.h"
++
++namespace libcamera::qcom {
++
++using QtiAwbFaceMetrics = std::array<float, 9>;
++
++template<std::size_t Width>
++struct QtiAwbFaceTable {
++	std::array<unsigned int, 2> indices;
++	QtiAwbTriggerTable<2, Width> table;
++
++	std::array<float, Width> evaluate(const QtiAwbFaceMetrics &metrics) const
++	{
++		float triggers[] = { metrics[indices[0]], metrics[indices[1]] };
++		for (float &value : triggers)
++			if (std::isnan(value))
++				value = 0;
++		return qtiAwbEvaluateTrigger(table, triggers);
++	}
++};
++
++struct QtiAwbFaceAnalysisConfiguration {
++	float weight;
++	std::array<QtiAwbFaceTable<2>, 2> targets;
++	std::array<QtiAwbFaceTable<1>, 3> skinWeights;
++	std::vector<QtiAwbFaceTable<1>> confidences;
++};
++
++struct QtiAwbFaceAnalysisState {
++	std::array<QtiAwbPoint, 2> skinReferences;
++	std::array<QtiAwbPoint, 2> points;
++	std::array<QtiAwbPoint, 2> gains;
++	std::array<float, 2> ccts;
++	float blend;
++	float distanceRatio;
++	QtiAwbPoint target;
++	float confidence;
++};
++
++struct QtiAwbFaceResult {
++	QtiAwbPoint point;
++	float confidence;
++	float weight;
++};
++
++class QtiAwbFaceAnalysis
++{
++public:
++	explicit QtiAwbFaceAnalysis(QtiAwbFaceAnalysisConfiguration config)
++		: config_(std::move(config))
++	{
++	}
++
++	void reset() { state_ = {}; }
++	const QtiAwbFaceAnalysisState &state() const { return state_; }
++
++	QtiAwbFaceResult process(const QtiAwbFaceStatistics &face, QtiAwbPoint global,
++				 float lux, float cct, unsigned int admitted,
++				 unsigned int regions, const QtiAwbLocus &locus)
++	{
++		QtiAwbFaceMetrics metrics{ lux, cct, float(admitted) / regions,
++			float(face.count) / regions, state_.ccts[0], state_.ccts[1],
++			state_.distanceRatio, global.rg, global.bg };
++		state_.blend = state_.confidence = 1;
++		for (unsigned int i = 0; i < 2; i++) {
++			auto reference = config_.targets[1 - i].evaluate(metrics);
++			state_.skinReferences[i] = { reference[0], reference[1] };
++		}
++		if (!face.count)
++			return { state_.target, 0, config_.weight };
++		for (unsigned int i = 0; i < 2; i++) {
++			const auto &reference = state_.skinReferences[i];
++			state_.points[i] = { face.mean.rg / reference.rg, face.mean.bg / reference.bg };
++			state_.gains[i] = { 1.0f / state_.points[i].rg, 1.0f / state_.points[i].bg };
++		}
++		QtiAwbPoint inverse{ 1.0f / global.rg, 1.0f / global.bg };
++		float firstRed = state_.gains[0].rg - inverse.rg;
++		float firstBlue = state_.gains[0].bg - inverse.bg;
++		float secondRed = state_.gains[1].rg - inverse.rg;
++		float secondBlue = state_.gains[1].bg - inverse.bg;
++		float denominator = std::fma(firstRed, firstRed, firstBlue * firstBlue);
++		state_.distanceRatio = denominator == 0 ? 9999.0f :
++			std::fma(secondRed, secondRed, secondBlue * secondBlue) / denominator;
++		for (unsigned int i = 0; i < 2; i++)
++			state_.ccts[i] = locus.evaluate(state_.points[i]).cct;
++		metrics[4] = state_.ccts[0];
++		metrics[5] = state_.ccts[1];
++		metrics[6] = state_.distanceRatio;
++		float first = config_.skinWeights[0].evaluate(metrics)[0];
++		float second = config_.skinWeights[1].evaluate(metrics)[0];
++		float third = 1.0f - config_.skinWeights[2].evaluate(metrics)[0];
++		state_.blend = std::fma(second, first, third * (1.0f - first));
++		state_.target = {
++			std::fma(state_.points[0].rg, state_.blend, state_.points[1].rg * (1.0f - state_.blend)),
++			std::fma(state_.points[0].bg, state_.blend, state_.points[1].bg * (1.0f - state_.blend)),
++		};
++		for (const auto &table : config_.confidences)
++			state_.confidence *= table.evaluate(metrics)[0];
++		return { state_.target, state_.confidence, config_.weight };
++	}
++
++private:
++	QtiAwbFaceAnalysisConfiguration config_;
++	QtiAwbFaceAnalysisState state_{};
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_frame_skip.h b/src/libcamera/pipeline/qcom/awb_frame_skip.h
+new file mode 100644
+index 0000000..7bcabb1
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_frame_skip.h
+@@ -0,0 +1,102 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++#include "awb_locus.h"
++#include "awb_weights.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbFrameSkipConfiguration {
++	QtiAwbWeightCurve change;
++	unsigned int historySize;
++};
++
++struct QtiAwbFrameSkipState {
++	uint32_t skipped;
++	int32_t remaining;
++	float change;
++	float average;
++};
++
++class QtiAwbFrameSkip
++{
++public:
++	explicit QtiAwbFrameSkip(QtiAwbFrameSkipConfiguration config)
++		: config_(std::move(config)), history_(config_.historySize)
++	{
++	}
++
++	void reset()
++	{
++		std::fill(history_.begin(), history_.end(), Record{});
++		position_ = frames_ = 0;
++		state_ = {};
++	}
++
++	bool beginFrame()
++	{
++		state_.skipped = frames_++ >= 30 && state_.remaining > 0;
++		if (state_.skipped)
++			state_.remaining--;
++		return state_.skipped;
++	}
++
++	int32_t frameCount() const { return frames_; }
++
++	QtiAwbFrameSkipState finishFrame(QtiAwbPoint current, QtiAwbPoint previous)
++	{
++		Record &record = history_[position_];
++		record.processed = !state_.skipped;
++		if (!state_.skipped) {
++			state_.change = 0;
++			float redSum = current.rg + previous.rg;
++			float blueSum = current.bg + previous.bg;
++			if (redSum != 0 && blueSum != 0) {
++				float red = (2.0f * std::abs(current.rg - previous.rg)) * 100.0f / redSum;
++				float blue = (2.0f * std::abs(current.bg - previous.bg)) * 100.0f / blueSum;
++				record.change = std::fmax(red, blue);
++				state_.change = std::fmax(record.change, average());
++				state_.remaining = static_cast<int32_t>(qtiAwbInterpolateWeight(
++					config_.change, state_.change, [](float value) { return value; }));
++			}
++		}
++		state_.average = average();
++		position_ = (position_ + 1) % history_.size();
++		return state_;
++	}
++
++private:
++	struct Record {
++		bool processed = false;
++		float change = 0;
++	};
++
++	float average() const
++	{
++		unsigned int count = 0;
++		float sum = 0;
++		for (unsigned int i = 0; i < history_.size(); i++) {
++			const Record &record = history_[(position_ + history_.size() - i) % history_.size()];
++			if (!record.processed)
++				continue;
++			sum += record.change;
++			if (++count == 5)
++				return sum / 5.0f;
++		}
++		return 100.0f;
++	}
++
++	QtiAwbFrameSkipConfiguration config_;
++	std::vector<Record> history_;
++	unsigned int position_ = 0;
++	int32_t frames_ = 0;
++	QtiAwbFrameSkipState state_{};
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_front.h b/src/libcamera/pipeline/qcom/awb_front.h
+new file mode 100644
+index 0000000..3bf456d
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_front.h
+@@ -0,0 +1,221 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++#include "awb_front_configuration.h"
++#include "awb_output.h"
++
++namespace libcamera::qcom {
++
++/* CAMSS BG regions contain six normal and six saturated-statistics words. */
++struct QtiAwbBgFrame {
++	const uint32_t *regions;
++	unsigned int bitDepth;
++	unsigned int pixelsPerRegion;
++	float lux;
++	float mlcTrigger15;
++	const QtiAwbFaceRectangle *face = nullptr;
++};
++
++struct QtiAwbFrontResult {
++	uint32_t samples;
++	uint32_t admitted;
++	uint32_t mlcDetected;
++	QtiAwbAgwStatistics agw;
++	std::vector<QtiAwbDecision> scenes;
++	QtiAwbAggregatedTarget target;
++	QtiAwbTemporalResult filtered;
++	QtiAwbGainResult adjusted;
++	std::array<float, 3> gains;
++	uint32_t cct;
++	uint32_t lightId;
++	QtiAwbFrameSkipState frameSkip;
++	QtiAwbFaceFrameState faceFrame;
++	QtiAwbFaceStatistics faceStatistics;
++	QtiAwbFaceResult faceResult;
++};
++
++/* Normal streaming with sensor calibration and SFSubSmpV1 mode 0. */
++class QtiAwbFront
++{
++public:
++	static constexpr unsigned int Width = 64;
++	static constexpr unsigned int Height = 48;
++
++	explicit QtiAwbFront(QtiAwbFrontConfiguration config, QtiAwbCalibration calibration = {})
++		: config_(std::move(config)), calibration_(std::move(calibration)),
++		  reference_(calibratedReference()), locus_(reference_),
++		  mlc_(config_.mlcDetection, config_.mlcExclusion),
++		  temporal_(config_.temporal), gain_(config_.gain), frameSkip_(config_.frameSkip),
++		  faceFrame_(config_.faceFrame), faceAnalysis_(config_.faceAnalysis)
++	{
++		reset();
++	}
++
++	uint32_t colourTemperature(QtiAwbPoint point) const
++	{
++		return static_cast<uint32_t>(locus_.evaluate(point).cct);
++	}
++
++	std::array<float, 3> initialGains() const { return qtiAwbRgbGains(initialPoint()); }
++
++	std::array<float, 2> manualGains(float cct) const
++	{
++		auto gains = QtiAwbReferenceGains(reference_).fromCct(cct);
++		return { gains.rg, gains.bg };
++	}
++
++	void reset()
++	{
++		QtiAwbPoint initial = initialPoint();
++		mlc_.reset();
++		temporal_.reset();
++		frameSkip_.reset();
++		faceFrame_.reset();
++		faceAnalysis_.reset();
++		analysis_ = {};
++		previousTarget_ = previousFiltered_ = retainedTarget_ = initial;
++	}
++
++	QtiAwbFrontResult process(const QtiAwbBgFrame &frame)
++	{
++		auto faceState = faceFrame_.process(frame.face, Width, Height);
++		if (!frameSkip_.beginFrame())
++			analysis_ = analyze(frame, faceState);
++		QtiAwbFrontResult result = analysis_;
++		result.faceFrame = faceState;
++		if (result.target.confidence && result.target.point.rg && result.target.point.bg)
++			retainedTarget_ = result.target.point;
++		float speed = (faceState.stable || faceState.speedRegistered) ? config_.faceFrame.convergenceSpeed : 0.0f;
++		result.filtered = temporal_.run(frameSkip_.frameCount(), result.target.point, result.target.confidence,
++			previousFiltered_, retainedTarget_, locus_, speed);
++		auto factor = calibration_.factors()[locus_.evaluate(result.filtered.point).illuminant];
++		QtiAwbPoint gainReference{ result.filtered.point.rg * (1.0f / factor.rg),
++					   result.filtered.point.bg * (1.0f / factor.bg) };
++		result.adjusted = gain_.run(frame.lux, result.filtered.point, gainReference, locus_);
++		result.gains = qtiAwbRgbGains(result.adjusted.point);
++		/* Process publishes the filtered CCT before gain adjustment. */
++		result.cct = static_cast<uint32_t>(result.filtered.cct);
++		result.lightId = qtiAwbLightId(result.cct);
++		result.frameSkip = frameSkip_.finishFrame(result.target.point, previousTarget_);
++		previousTarget_ = result.target.point;
++		previousFiltered_ = result.filtered.point;
++		return result;
++	}
++
++private:
++	QtiAwbFrontResult analyze(const QtiAwbBgFrame &frame, const QtiAwbFaceFrameState &faceState)
++	{
++		QtiAwbFrontResult result{};
++		/* The factory sampler fixes the tile offsets to a 64x48 grid. */
++		result.samples = Width * Height / 4;
++		mlc_.startFrame(frame.lux, result.samples, frame.mlcTrigger15,
++			[this](auto geometry, auto coordinates) { return calibrateZone(geometry, coordinates); });
++		std::vector<QtiAwbDetectionAccumulator> detectors(config_.scenes.size());
++		std::vector<std::vector<QtiAwbDetectionZone>> zones(config_.scenes.size());
++		for (unsigned int i = 0; i < config_.scenes.size(); i++)
++			for (const auto &zone : config_.scenes[i].zones)
++				zones[i].push_back({ zone.group, zone.geometry,
++					calibrateZone(zone.geometry, qtiAwbEvaluateCoordinates(zone.coordinates, &frame.lux)) });
++		QtiAwbAgwAccumulator accumulator;
++		for (unsigned int i = 0; i < result.samples; i++) {
++			unsigned int index = qtiAwbSampleIndex(i, Width);
++			auto stat = qtiAwbParseBg(frame.regions + index * 12,
++						frame.bitDepth, frame.pixelsPerRegion);
++			if (qtiAwbScreen(stat, config_.screening) != QtiAwbRegionStatus::Valid)
++				continue;
++			result.admitted++;
++			auto reference = locus_.evaluate({ stat.rg, stat.bg });
++			QtiAwbRegion region{ stat.rg, stat.bg, reference.cct,
++				config_.regionWeights.distanceWeight(frame.lux, reference.cct, reference.distance),
++				config_.regionWeights.illuminantWeight(frame.lux, reference.cct), 1 };
++			qtiAwbFilterZeroWeights(region);
++			for (unsigned int s = 0; s < detectors.size(); s++)
++				detectors[s].add(zones[s], region);
++			result.mlcDetected += qtiAwbZoneContains(QtiAwbGeometry::Cct,
++				mlc_.detectionCoordinates(), region.rg, region.bg, region.cct, region.valid);
++			region.valid = mlc_.process(region.rg, region.bg, region.cct, region.valid).valid;
++			accumulator.add(region);
++		}
++		mlc_.finishFrame(result.mlcDetected);
++		result.agw = accumulator.result();
++		QtiAwbSceneMetrics metrics{};
++		metrics[0] = frame.lux;
++		metrics[1] = locus_.evaluate(result.agw.weightedMean).cct;
++		metrics[2] = qtiAwbCountRatio(result.agw.valid, result.samples);
++		std::array<float, 1> confidence{};
++		qtiAwbSceneValue(config_.agw.table, config_.agw.indices, metrics, confidence);
++		std::vector<QtiAwbDecision> decisions{
++			{ result.agw.weightedMean, confidence[0], 1, 1, 1 }
++		};
++		for (unsigned int i = 0; i < config_.scenes.size(); i++) {
++			auto groups = detectors[i].result();
++			auto sceneMetrics = qtiAwbSceneStatistics(metrics, groups, result.agw, result.samples, locus_);
++			result.scenes.push_back(qtiAwbAnalyzeScene(config_.scenes[i].analysis, sceneMetrics,
++				result.agw.weightedMean, groups, [this](auto point) { return calibratePoint(point); }));
++			decisions.push_back(result.scenes.back());
++		}
++		if (faceState.stable) {
++			result.faceStatistics = qtiAwbCollectFaceStatistics(
++				config_.faceStatistics, faceState, frame.regions,
++				Width, Height, frame.bitDepth, frame.pixelsPerRegion, frame.lux);
++			result.faceResult = faceAnalysis_.process(
++				result.faceStatistics, result.agw.weightedMean, frame.lux,
++				metrics[1], result.admitted, Width * Height, locus_);
++			decisions.push_back({ result.faceResult.point, result.faceResult.confidence,
++					      0, 0, result.faceResult.weight });
++		}
++		result.target = qtiAwbAggregate(config_.aggregation, std::move(decisions), previousTarget_);
++		return result;
++	}
++
++	QtiAwbPoint initialPoint() const
++	{
++		return qtiAwbInitialPoint(config_.initial, calibration_.forCct(config_.initial.cct));
++	}
++
++	std::array<QtiAwbPoint, 15> calibratedReference() const
++	{
++		auto reference = config_.reference;
++		for (unsigned int i = 0; i < calibration_.factors().size(); i++)
++			reference[i] = calibration_.toSensor(reference[i], i);
++		return reference;
++	}
++
++	QtiAwbPoint calibratePoint(QtiAwbPoint point) const
++	{
++		return calibration_.toSensor(point, locus_.evaluate(point).illuminant);
++	}
++
++	QtiAwbCoordinates calibrateZone(QtiAwbGeometry geometry, QtiAwbCoordinates coordinates) const
++	{
++		if (geometry != QtiAwbGeometry::Cct)
++			for (unsigned int i = 0; i < coordinates.size(); i += 2) {
++				auto point = calibratePoint({ coordinates[i], coordinates[i + 1] });
++				coordinates[i] = point.rg;
++				coordinates[i + 1] = point.bg;
++			}
++		return coordinates;
++	}
++
++	QtiAwbFrontConfiguration config_;
++	QtiAwbCalibration calibration_;
++	std::array<QtiAwbPoint, 15> reference_;
++	QtiAwbLocus locus_;
++	QtiAwbImx520Mlc mlc_;
++	QtiAwbTemporalConvergence temporal_;
++	QtiAwbGainAdjustment gain_;
++	QtiAwbFrameSkip frameSkip_;
++	QtiAwbFaceFrame faceFrame_;
++	QtiAwbFaceAnalysis faceAnalysis_;
++	QtiAwbFrontResult analysis_{};
++	QtiAwbPoint previousTarget_{};
++	QtiAwbPoint previousFiltered_{};
++	QtiAwbPoint retainedTarget_{};
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_front_configuration.h b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+new file mode 100644
+index 0000000..7916b89
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <vector>
++
++#include "awb_calibration.h"
++#include "awb_gain_adjustment.h"
++#include "awb_frame_skip.h"
++#include "awb_face.h"
++#include "awb_face_analysis.h"
++#include "awb_mlc.h"
++#include "awb_scenes.h"
++#include "awb_statistics.h"
++#include "awb_temporal.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbSceneZone {
++	unsigned int group;
++	QtiAwbGeometry geometry;
++	QtiAwbCoordinateTable<1> coordinates;
++};
++
++struct QtiAwbFrontScene {
++	QtiAwbSceneConfiguration analysis;
++	std::vector<QtiAwbSceneZone> zones;
++};
++
++struct QtiAwbInitialConfiguration {
++	std::array<float, 3> gains;
++	float cct;
++};
++
++inline QtiAwbPoint qtiAwbInitialPoint(const QtiAwbInitialConfiguration &config,
++				    QtiAwbPoint calibration)
++{
++	float red = config.gains[0] / calibration.rg;
++	float blue = config.gains[2] / calibration.bg;
++	return { config.gains[1] / red, config.gains[1] / blue };
++}
++
++struct QtiAwbFrontConfiguration {
++	std::array<QtiAwbPoint, 15> reference;
++	QtiAwbInitialConfiguration initial;
++	QtiAwbCalibrationConfiguration calibration;
++	QtiAwbScreening screening;
++	QtiAwbRegionWeights regionWeights;
++	QtiAwbCoordinateTable<1> mlcDetection;
++	QtiAwbCoordinateTable<3> mlcExclusion;
++	std::vector<QtiAwbFrontScene> scenes;
++	QtiAwbSceneConfidence agw;
++	QtiAwbAggregationConfiguration aggregation;
++	QtiAwbTemporalConfiguration temporal;
++	QtiAwbFrameSkipConfiguration frameSkip;
++	QtiAwbFaceFrameConfiguration faceFrame;
++	QtiAwbFaceStatisticsConfiguration faceStatistics;
++	QtiAwbFaceAnalysisConfiguration faceAnalysis;
++	QtiAwbGainConfiguration gain;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_gain_adjustment.h b/src/libcamera/pipeline/qcom/awb_gain_adjustment.h
+new file mode 100644
+index 0000000..8c7edb9
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_gain_adjustment.h
+@@ -0,0 +1,198 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++#include "awb_locus.h"
++#include "awb_triggers.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbGainTriangle {
++	std::array<int32_t, 3> vertices;
++	std::array<int32_t, 3> neighbours;
++};
++
++struct QtiAwbGainVertex {
++	QtiAwbPoint point;
++	QtiAwbTriggerTable<1, 3> gains;
++};
++
++struct QtiAwbGainConfiguration {
++	std::vector<QtiAwbGainTriangle> triangles;
++	std::vector<QtiAwbGainVertex> vertices;
++	std::array<int32_t, 4> seeds;
++	QtiAwbTriggerTable<2, 3> compensation;
++};
++
++struct QtiAwbGainResult {
++	std::array<int32_t, 3> vertices;
++	std::array<float, 3> weights;
++	std::array<float, 3> gains;
++	std::array<float, 3> compensation;
++	QtiAwbPoint point;
++	float cct;
++	float inputCct;
++};
++
++class QtiAwbGainAdjustment
++{
++public:
++	explicit QtiAwbGainAdjustment(QtiAwbGainConfiguration config)
++		: config_(std::move(config))
++	{
++	}
++
++	QtiAwbGainResult run(float lux, QtiAwbPoint input, QtiAwbPoint referencePoint,
++			     const QtiAwbLocus &locus) const
++	{
++		QtiAwbGainResult result{};
++		result.inputCct = locus.evaluate(input).cct;
++		float triggers[] = { lux, result.inputCct };
++		result.compensation = qtiAwbEvaluateTrigger(config_.compensation, triggers);
++		for (float &value : result.compensation)
++			if (value < 1e-5f)
++				value = 1;
++		select(referencePoint, result.vertices, result.weights);
++		if (result.vertices[2] < 0) {
++			auto first = qtiAwbEvaluateTrigger(config_.vertices[result.vertices[0]].gains, &lux);
++			auto last = qtiAwbEvaluateTrigger(config_.vertices[result.vertices[1]].gains, &lux);
++			for (unsigned int c = 0; c < 3; c++)
++				result.gains[c] = qtiAwbBlend(first[c], last[c], result.weights[0]);
++		} else {
++			for (unsigned int i = 0; i < 3; i++) {
++				auto gain = qtiAwbEvaluateTrigger(config_.vertices[result.vertices[i]].gains, &lux);
++				for (unsigned int c = 0; c < 3; c++)
++					result.gains[c] = std::fma(gain[c], result.weights[i], result.gains[c]);
++			}
++		}
++		for (unsigned int c = 0; c < 3; c++)
++			result.gains[c] *= result.compensation[c];
++		result.point = { input.rg / result.gains[0], input.bg / result.gains[2] };
++		result.cct = locus.evaluate(result.point).cct;
++		return result;
++	}
++
++private:
++	QtiAwbPoint centroid(int triangle) const
++	{
++		const auto &ids = config_.triangles[triangle].vertices;
++		const auto &a = config_.vertices[ids[0]].point;
++		const auto &b = config_.vertices[ids[1]].point;
++		const auto &c = config_.vertices[ids[2]].point;
++		return { ((a.rg + b.rg) + c.rg) / 3.0f, ((a.bg + b.bg) + c.bg) / 3.0f };
++	}
++
++	static float cross(QtiAwbPoint a, QtiAwbPoint b, QtiAwbPoint p)
++	{
++		return std::fma(p.rg - b.rg, a.bg - b.bg, -((a.rg - b.rg) * (p.bg - b.bg)));
++	}
++
++	static int sign(float value)
++	{
++		return value < -1e-7f ? -1 : value <= 1e-7f ? 0 : 1;
++	}
++
++	void triangleWeights(int triangle, QtiAwbPoint p, std::array<int32_t, 3> &ids,
++			     std::array<float, 3> &weights) const
++	{
++		ids = config_.triangles[triangle].vertices;
++		const auto &a = config_.vertices[ids[0]].point;
++		const auto &b = config_.vertices[ids[1]].point;
++		const auto &c = config_.vertices[ids[2]].point;
++		float first = std::fma(c.rg, p.bg - b.bg, std::fma(b.bg - c.bg, p.rg, b.rg * (c.bg - p.bg)));
++		float second = std::fma(a.rg, p.bg - c.bg, std::fma(c.bg - a.bg, p.rg, c.rg * (a.bg - p.bg)));
++		float third = std::fma(b.rg, p.bg - a.bg, std::fma(a.bg - b.bg, p.rg, a.rg * (b.bg - p.bg)));
++		weights = { std::abs(first), std::abs(second), std::abs(third) };
++		float total = weights[2] + (weights[0] + weights[1]);
++		for (float &value : weights)
++			value /= total;
++	}
++
++	void edgeWeights(int triangle, unsigned int edge, QtiAwbPoint p,
++			 std::array<int32_t, 3> &ids, std::array<float, 3> &weights) const
++	{
++		const auto &vertices = config_.triangles[triangle].vertices;
++		ids = edge == 2 ? std::array<int32_t, 3>{ vertices[0], vertices[2], -1 }
++			       : std::array<int32_t, 3>{ vertices[edge], vertices[edge + 1], -1 };
++		const auto &a = config_.vertices[ids[0]].point;
++		const auto &b = config_.vertices[ids[1]].point;
++		float dx = a.rg - b.rg;
++		float dy = a.bg - b.bg;
++		float length = std::fma(dy, dy, dx * dx);
++		float weight = 1;
++		if (length != 0) {
++			float ax = a.rg - p.rg, ay = a.bg - p.bg;
++			float bx = b.rg - p.rg, by = b.bg - p.bg;
++			float first = std::fma(ay, ay, ax * ax);
++			float last = std::fma(by, by, bx * bx);
++			weight = ((length + (last - first)) * 0.5f) / length;
++			/* The factory replaces a negative first coefficient with one. */
++			if (weight < 0)
++				weight = 1;
++		}
++		weights = { weight, 0, 0 };
++	}
++
++	void select(QtiAwbPoint p, std::array<int32_t, 3> &ids, std::array<float, 3> &weights) const
++	{
++		int triangle = config_.seeds[0];
++		float nearest = 0;
++		for (unsigned int i = 0; i < config_.seeds.size(); i++) {
++			auto center = centroid(config_.seeds[i]);
++			float dx = p.rg - center.rg, dy = p.bg - center.bg;
++			float distance = dx * dx + dy * dy;
++			if (i == 0 || distance < nearest) {
++				nearest = distance;
++				triangle = config_.seeds[i];
++			}
++		}
++		std::vector<unsigned int> visits(config_.triangles.size());
++		for (;;) {
++			const auto &t = config_.triangles[triangle];
++			std::array<QtiAwbPoint, 3> v;
++			for (unsigned int i = 0; i < 3; i++)
++				v[i] = config_.vertices[t.vertices[i]].point;
++			int a = sign(cross(v[0], v[1], p));
++			int b = sign(cross(v[1], v[2], p));
++			int c = sign(cross(v[2], v[0], p));
++			if (a * b != -1 && b * c != -1 && c * a != -1) {
++				triangleWeights(triangle, p, ids, weights);
++				return;
++			}
++			auto center = centroid(triangle);
++			unsigned int mask = 0;
++			for (unsigned int i = 0; i < 3; i++)
++				if (cross(v[i], v[(i + 1) % 3], p) * cross(v[i], v[(i + 1) % 3], center) < 0)
++					mask |= 1U << i;
++			if (mask == 1 || mask == 2 || mask == 4 || mask == 0) {
++				unsigned int edge = mask >> 1;
++				if (t.neighbours[edge] == 255) {
++					edgeWeights(triangle, edge, p, ids, weights);
++					return;
++				}
++				triangle = t.neighbours[edge];
++			} else {
++				/* Factory meshes have at most one boundary edge per triangle. */
++				int next = triangle;
++				for (unsigned int i = 0; i < 3; i++)
++					if ((mask & (1U << i)) && t.neighbours[i] != 255)
++						next = t.neighbours[i];
++				triangle = next;
++			}
++			/* The stock walk resolves its third visit with centroid weights. */
++			if (visits[triangle]++ >= 2) {
++				triangleWeights(triangle, centroid(triangle), ids, weights);
++				return;
++			}
++		}
++	}
++
++	QtiAwbGainConfiguration config_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_locus.h b/src/libcamera/pipeline/qcom/awb_locus.h
+new file mode 100644
+index 0000000..5ee5d71
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_locus.h
+@@ -0,0 +1,121 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++
++namespace libcamera::qcom {
++
++struct QtiAwbPoint {
++	float rg;
++	float bg;
++};
++
++struct QtiAwbLocusResult {
++	float distance;
++	float cct;
++	unsigned int illuminant;
++};
++
++class QtiAwbLocus
++{
++public:
++	explicit QtiAwbLocus(const std::array<QtiAwbPoint, 15> &points)
++		: points_(points)
++	{
++		constexpr std::array<unsigned int, 8> anchors{ 0, 1, 2, 3, 5, 7, 8, 9 };
++		constexpr std::array<unsigned int, 8> first{ 0, 1, 2, 2, 3, 5, 7, 8 };
++		constexpr std::array<unsigned int, 8> last{ 1, 2, 3, 3, 5, 7, 8, 9 };
++		for (unsigned int i = 0; i < normals_.size(); i++) {
++			float slope = (points_[last[i]].bg - points_[first[i]].bg) /
++				      (points_[last[i]].rg - points_[first[i]].rg);
++			float normal = -1.0f / slope;
++			normals_[i] = { normal, std::fma(-points_[anchors[i]].rg,
++						       normal, points_[anchors[i]].bg) };
++		}
++	}
++
++	QtiAwbLocusResult project(QtiAwbPoint point, unsigned int first,
++				 unsigned int last) const
++	{
++		QtiAwbPoint a = points_[first];
++		QtiAwbPoint b = points_[last];
++		float dx = b.rg - a.rg;
++		float dy = b.bg - a.bg;
++		float length = std::fma(dx, dx, dy * dy);
++		float slope = dy / dx;
++		float intercept = std::fma(-b.rg, slope, b.bg);
++		float residual = std::fma(point.rg, slope, -point.bg) + intercept;
++		float signedResidual = slope * residual;
++		float ar = point.rg - a.rg;
++		float ab = point.bg - a.bg;
++		float br = point.rg - b.rg;
++		float bb = point.bg - b.bg;
++		float firstDistance = std::fma(ar, ar, ab * ab);
++		float lastDistance = std::fma(br, br, bb * bb);
++		/* The factory uses squared endpoint distance when the residual is exactly zero. */
++		float numerator = signedResidual != 0
++					? (length + (firstDistance - lastDistance)) * 0.5f
++					: firstDistance;
++		float coefficient = numerator / length;
++		float twice = coefficient + coefficient;
++		float polynomial = std::fma(coefficient, twice, -twice) + 1.0f;
++		float radicand = std::fma(-length, polynomial, firstDistance + lastDistance) * 0.5f;
++		float distance = std::sqrt(radicand);
++		if (coefficient < 0) {
++			coefficient = 0;
++			distance = std::sqrt(firstDistance);
++		}
++		distance *= signedResidual > 0 ? 1.0f : -1.0f;
++		/* Match the factory result when cancellation makes the radicand negative. */
++		if (std::isnan(distance))
++			distance = 0;
++		float weight = std::clamp(coefficient, 0.0f, 1.0f);
++		float cct = std::fma(weight, ccts_[last], (1.0f - weight) * ccts_[first]);
++		return { distance, cct, coefficient > 0.5f ? last : first };
++	}
++
++	QtiAwbLocusResult evaluate(QtiAwbPoint point) const
++	{
++		int boundary = 4;
++		int direction = 0;
++		while (boundary >= 0 && boundary < static_cast<int>(normals_.size())) {
++			/* The separator uses a rounded product, not a fused multiply-subtract. */
++			volatile float product = point.rg * normals_[boundary].rg;
++			float residual = (product - point.bg) + normals_[boundary].bg;
++			if (residual > 0) {
++				if (direction < 0)
++					break;
++				direction = 1;
++				boundary++;
++			} else if (residual < 0) {
++				if (direction > 0)
++					break;
++				direction = -1;
++				boundary--;
++			} else {
++				break;
++			}
++		}
++		if (boundary == -1 || boundary == 8) {
++			unsigned int endpoint = boundary == -1 ? 0 : 9;
++			float dx = point.rg - points_[endpoint].rg;
++			float dy = point.bg - points_[endpoint].bg;
++			return { std::sqrt(std::fma(dx, dx, dy * dy)), ccts_[endpoint],
++				 endpoint == 0 ? 1U : 8U };
++		}
++		constexpr std::array<unsigned int, 8> first{ 0, 1, 2, 3, 3, 5, 7, 8 };
++		constexpr std::array<unsigned int, 8> last{ 1, 2, 3, 5, 5, 7, 8, 9 };
++		return project(point, first[boundary], last[boundary]);
++	}
++
++private:
++	static constexpr std::array<float, 10> ccts_{
++		12000, 7500, 6500, 5000, 0, 4000, 0, 2850, 2300, 1500,
++	};
++	std::array<QtiAwbPoint, 15> points_;
++	std::array<QtiAwbPoint, 8> normals_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_mlc.h b/src/libcamera/pipeline/qcom/awb_mlc.h
+new file mode 100644
+index 0000000..02af179
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_mlc.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <cstdint>
++#include <utility>
++
++#include "awb_zones.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbMlcRegion {
++	uint32_t valid;
++	bool excluded;
++};
++
++class QtiAwbImx520Mlc
++{
++public:
++	QtiAwbImx520Mlc(QtiAwbCoordinateTable<1> detection,
++			QtiAwbCoordinateTable<3> exclusion)
++		: detection_(std::move(detection)), exclusion_(std::move(exclusion))
++	{
++	}
++
++	void reset()
++	{
++		detected_ = 0;
++	}
++
++	template<typename Calibrate>
++	void startFrame(float lux, unsigned int samples, float trigger15, Calibrate calibrate)
++	{
++		detectionCoordinates_ = qtiAwbEvaluateCoordinates(detection_, &lux);
++		/* The exclusion tree uses trigger indices 0, 5, 15 in the front profile. */
++		float triggers[] = { lux, static_cast<float>(detected_) / samples, trigger15 };
++		exclusionCoordinates_ = calibrate(QtiAwbGeometry::Rectangle,
++						qtiAwbEvaluateCoordinates(exclusion_, triggers));
++	}
++
++	/* The dispatcher supplies counts collected before MLC exclusion. */
++	void finishFrame(unsigned int detected) { detected_ = detected; }
++
++	QtiAwbMlcRegion process(float rg, float bg, float cct, uint32_t valid) const
++	{
++		bool excluded = qtiAwbZoneContains(QtiAwbGeometry::Rectangle,
++						 exclusionCoordinates_, rg, bg, cct, valid);
++		if (excluded)
++			valid = 0;
++		return { valid, excluded };
++	}
++
++	const QtiAwbCoordinates &detectionCoordinates() const { return detectionCoordinates_; }
++	const QtiAwbCoordinates &exclusionCoordinates() const { return exclusionCoordinates_; }
++
++private:
++	QtiAwbCoordinateTable<1> detection_;
++	QtiAwbCoordinateTable<3> exclusion_;
++	QtiAwbCoordinates detectionCoordinates_{};
++	QtiAwbCoordinates exclusionCoordinates_{};
++	unsigned int detected_ = 0;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_output.h b/src/libcamera/pipeline/qcom/awb_output.h
+new file mode 100644
+index 0000000..b63d63b
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_output.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cmath>
++
++#include "awb_locus.h"
++
++namespace libcamera::qcom {
++
++inline std::array<float, 3> qtiAwbRgbGains(QtiAwbPoint point)
++{
++	float scale = std::fmax(point.rg, 1.0f);
++	scale = point.bg > scale ? point.bg : scale;
++	return { scale / point.rg, scale, scale / point.bg };
++}
++
++class QtiAwbReferenceGains
++{
++public:
++	explicit QtiAwbReferenceGains(const std::array<QtiAwbPoint, 15> &reference)
++	{
++		constexpr std::array<unsigned int, 8> indices{ 0, 1, 2, 3, 5, 7, 8, 9 };
++		for (unsigned int i = 0; i < indices.size(); i++)
++			gains_[i] = { 1.0f / reference[indices[i]].rg, 1.0f / reference[indices[i]].bg };
++	}
++
++	QtiAwbPoint fromCct(float cct) const
++	{
++		if (cct >= ccts_.front())
++			return gains_.front();
++		for (unsigned int i = 0; i + 1 < ccts_.size(); i++) {
++			if (cct < ccts_[i + 1])
++				continue;
++			float cold = 1.0f - (cct - ccts_[i]) / (ccts_[i + 1] - ccts_[i]);
++			/* The factory rounds the complementary coefficient before the FMA. */
++			float warm = 1.0f - cold;
++			return { std::fma(gains_[i].rg, cold, gains_[i + 1].rg * warm),
++				 std::fma(gains_[i].bg, cold, gains_[i + 1].bg * warm) };
++		}
++		return gains_.back();
++	}
++
++private:
++	static constexpr std::array<float, 8> ccts_{ 12000, 7500, 6500, 5000, 4000, 2850, 2300, 1500 };
++	std::array<QtiAwbPoint, 8> gains_;
++};
++
++inline unsigned int qtiAwbLightId(float cct)
++{
++	constexpr std::array<float, 7> thresholds{ 8750, 7000, 6000, 4500, 3425, 2575, 1900 };
++	constexpr std::array<unsigned int, 8> ids{ 0, 1, 2, 3, 5, 7, 8, 9 };
++	for (unsigned int i = 0; i < thresholds.size(); i++)
++		if (cct > thresholds[i])
++			return ids[i];
++	return ids.back();
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_scenes.h b/src/libcamera/pipeline/qcom/awb_scenes.h
+new file mode 100644
+index 0000000..845a3d0
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_scenes.h
+@@ -0,0 +1,170 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <vector>
++
++#include "awb_accumulator.h"
++#include "awb_triggers.h"
++
++namespace libcamera::qcom {
++
++using QtiAwbSceneMetrics = std::array<float, 37>;
++
++template<std::size_t Width>
++bool qtiAwbSceneValue(const QtiAwbTriggerTable<2, Width> &table,
++		     const std::array<uint32_t, 2> &indices, const QtiAwbSceneMetrics &metrics,
++		     std::array<float, Width> &result)
++{
++	/* Trigger 37 preserves the caller's existing output in the factory API. */
++	if (indices[0] == 37 || indices[1] == 37)
++		return false;
++	float triggers[] = { metrics[indices[0]], metrics[indices[1]] };
++	result = qtiAwbEvaluateTrigger(table, triggers);
++	return true;
++}
++
++struct QtiAwbSceneConfidence {
++	std::array<uint32_t, 2> indices;
++	float weight;
++	QtiAwbTriggerTable<2, 1> table;
++};
++
++struct QtiAwbSceneTarget {
++	unsigned int mode;
++	std::array<uint32_t, 2> indices;
++	QtiAwbTriggerTable<2, 2> table;
++};
++
++struct QtiAwbSceneConfiguration {
++	uint32_t type;
++	uint32_t id;
++	float weight;
++	unsigned int combination;
++	std::vector<QtiAwbSceneConfidence> confidences;
++	QtiAwbSceneTarget target;
++};
++
++struct QtiAwbDecision {
++	QtiAwbPoint point;
++	float confidence;
++	uint32_t type;
++	uint32_t id;
++	float weight;
++};
++
++inline float qtiAwbCountRatio(uint32_t numerator, uint32_t denominator)
++{
++	return denominator ? static_cast<float>(numerator) / denominator : 0;
++}
++
++inline QtiAwbSceneMetrics qtiAwbSceneStatistics(QtiAwbSceneMetrics metrics,
++					       const std::array<QtiAwbDetectionGroup, 4> &groups,
++					       const QtiAwbAgwStatistics &agw, uint32_t samples,
++					       const QtiAwbLocus &locus)
++{
++	/* Screening removes callbacks but preserves the sampled-region denominator. */
++	metrics[2] = qtiAwbCountRatio(agw.valid, samples);
++	metrics[3] = agw.weightedMean.rg;
++	metrics[4] = agw.weightedMean.bg;
++	metrics[5] = groups[0].mean.rg;
++	metrics[6] = groups[0].mean.bg;
++	for (unsigned int i = 0; i < 4; i++)
++		metrics[7 + i] = qtiAwbCountRatio(groups[i].count, samples);
++	metrics[11] = qtiAwbCountRatio(agw.valid, agw.valid + groups[0].count);
++	unsigned int metric = 12;
++	for (unsigned int i = 0; i < 3; i++)
++		for (unsigned int j = i + 1; j < 4; j++)
++			metrics[metric++] = qtiAwbCountRatio(groups[i].count, groups[i].count + groups[j].count);
++	metrics[19] = locus.evaluate(groups[0].mean).cct;
++	return metrics;
++}
++
++template<typename Calibrate>
++QtiAwbDecision qtiAwbAnalyzeScene(const QtiAwbSceneConfiguration &config,
++				 const QtiAwbSceneMetrics &metrics, QtiAwbPoint global,
++				 const std::array<QtiAwbDetectionGroup, 4> &groups, Calibrate calibrate)
++{
++	float confidence = config.combination == 0 || config.combination == 2 ? 1.0f : 0.0f;
++	float totalWeight = 0;
++	for (const auto &level : config.confidences) {
++		std::array<float, 1> value{};
++		qtiAwbSceneValue(level.table, level.indices, metrics, value);
++		switch (config.combination) {
++		case 0:
++			confidence *= value[0];
++			break;
++		case 1:
++			confidence = std::fma(value[0], level.weight, confidence);
++			totalWeight += level.weight;
++			break;
++		case 2:
++			confidence = std::min(confidence, value[0]);
++			break;
++		case 3:
++			confidence = std::max(confidence, value[0]);
++			break;
++		}
++	}
++	if (config.combination == 1)
++		confidence = totalWeight ? confidence / totalWeight : 0;
++	std::array<float, 2> target{};
++	qtiAwbSceneValue(config.target.table, config.target.indices, metrics, target);
++	QtiAwbPoint point;
++	if (config.target.mode == 0) {
++		point = calibrate(QtiAwbPoint{ target[0], target[1] });
++	} else {
++		QtiAwbPoint source = config.target.mode == 1 ? global : groups[config.target.mode - 2].mean;
++		point = { source.rg * (1.0f / target[0]), source.bg * (1.0f / target[1]) };
++	}
++	return { point, confidence, config.type, config.id, config.weight };
++}
++
++struct QtiAwbAggregationConfiguration {
++	QtiAwbTriggerTable<1, 1> confidenceWeight;
++	QtiAwbTriggerTable<1, 1> rankWeight;
++	QtiAwbTriggerTable<1, 1> referenceWeight;
++};
++
++struct QtiAwbAggregatedTarget {
++	QtiAwbPoint point;
++	float confidence;
++};
++
++inline QtiAwbAggregatedTarget qtiAwbAggregate(const QtiAwbAggregationConfiguration &config,
++					     std::vector<QtiAwbDecision> decisions, QtiAwbPoint previous)
++{
++	const QtiAwbDecision &reference = decisions.front();
++	std::stable_sort(decisions.begin() + 1, decisions.end(),
++		[](const auto &a, const auto &b) { return a.confidence > b.confidence; });
++	auto curve = [](const QtiAwbTriggerTable<1, 1> &table, float value) {
++		return qtiAwbEvaluateTrigger(table, &value)[0];
++	};
++	float baseWeight = curve(config.referenceWeight, reference.confidence);
++	float sum = 0;
++	QtiAwbPoint weighted{};
++	unsigned int rank = 1;
++	for (std::size_t i = 1; i < decisions.size(); i++) {
++		const auto &scene = decisions[i];
++		if (i > 1 && scene.confidence < decisions[i - 1].confidence)
++			rank = i;
++		float probability = curve(config.rankWeight, rank) *
++				    (curve(config.confidenceWeight, scene.confidence) * scene.confidence);
++		float weight = probability * scene.weight;
++		float share = baseWeight * (1.0f - probability);
++		float rg = qtiAwbBlend(reference.point.rg, scene.point.rg, share);
++		float bg = qtiAwbBlend(reference.point.bg, scene.point.bg, share);
++		weighted.rg = std::fma(rg, weight, weighted.rg);
++		weighted.bg = std::fma(bg, weight, weighted.bg);
++		sum += weight;
++	}
++	QtiAwbAggregatedTarget result = sum ? QtiAwbAggregatedTarget{ { weighted.rg / sum, weighted.bg / sum }, 1 }
++					  : QtiAwbAggregatedTarget{ reference.point, reference.confidence != 0 ? 1.0f : 0.0f };
++	if (result.point.rg == 0 || result.point.bg == 0)
++		result = { previous, 0 };
++	return result;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_statistics.h b/src/libcamera/pipeline/qcom/awb_statistics.h
+new file mode 100644
+index 0000000..f8999a9
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_statistics.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++namespace libcamera::qcom {
++
++struct QtiAwbStatistics {
++	std::array<float, 3> rgb;
++	std::array<uint32_t, 3> counts;
++	float rg;
++	float bg;
++	float saturation;
++};
++
++struct QtiAwbScreening {
++	std::array<float, 3> minimumRgb;
++	float maximumSaturation;
++};
++
++enum class QtiAwbRegionStatus {
++	Valid,
++	Dark,
++	Saturated,
++};
++
++inline QtiAwbStatistics qtiAwbParseBg(const uint32_t *region,
++				     unsigned int bitDepth, unsigned int pixels)
++{
++	uint32_t red = region[4] & 0xffff;
++	uint32_t blue = region[4] >> 16;
++	uint32_t green = (region[5] & 0xffff) + (region[5] >> 16);
++	uint32_t scale = 1U << (bitDepth > 8 ? bitDepth - 8 : 0);
++	float r = red ? static_cast<float>(region[0] & 0x3fffffff) / (red * scale) : 0;
++	float b = blue ? static_cast<float>(region[1] & 0x3fffffff) / (blue * scale) : 0;
++	float g = green ? static_cast<float>((region[2] & 0x3fffffff) +
++					    (region[3] & 0x3fffffff)) / (green * scale) : 0;
++	float saturation = static_cast<float>(static_cast<int32_t>(pixels - red - blue - green)) *
++			   100.0f / pixels;
++
++	return { { r, g, b }, { red, green, blue },
++		 g ? r / g : 0, g ? b / g : 0, saturation };
++}
++
++inline QtiAwbRegionStatus qtiAwbScreen(const QtiAwbStatistics &stat,
++				      const QtiAwbScreening &tuning)
++{
++	if (stat.saturation >= tuning.maximumSaturation)
++		return QtiAwbRegionStatus::Saturated;
++	for (unsigned int i = 0; i < stat.rgb.size(); i++)
++		if (stat.rgb[i] <= tuning.minimumRgb[i])
++			return QtiAwbRegionStatus::Dark;
++	return QtiAwbRegionStatus::Valid;
++}
++
++inline unsigned int qtiAwbSampleIndex(unsigned int sample, unsigned int width)
++{
++	/* SFSubSmpV1 mode 0 selects the first column in each 4x3 tile. */
++	unsigned int tile = sample / 3;
++	unsigned int row = tile / (width / 4) * 3 + sample % 3;
++	unsigned int column = tile % (width / 4) * 4;
++	return row * width + column;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_temporal.h b/src/libcamera/pipeline/qcom/awb_temporal.h
+new file mode 100644
+index 0000000..567256d
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_temporal.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++#include "awb_locus.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbTemporalConfiguration {
++	float startupSpeed;
++	int32_t startupFrames;
++	float defaultSpeed;
++};
++
++struct QtiAwbTemporalResult {
++	QtiAwbPoint point;
++	float cct;
++	float speed;
++	uint32_t startupActive;
++};
++
++class QtiAwbTemporalConvergence
++{
++public:
++	explicit QtiAwbTemporalConvergence(QtiAwbTemporalConfiguration config)
++		: config_(config)
++	{
++	}
++
++	void reset() { startupActive_ = true; }
++
++	QtiAwbTemporalResult run(int32_t frame, QtiAwbPoint target, float confidence,
++				 QtiAwbPoint previousFiltered, QtiAwbPoint previousTarget,
++				 const QtiAwbLocus &locus, float registeredSpeed = 0.0f)
++	{
++		if (startupActive_ && frame > config_.startupFrames)
++			startupActive_ = false;
++		float speed = startupActive_ ? config_.startupSpeed
++					     : (registeredSpeed > 0 ? registeredSpeed : config_.defaultSpeed);
++		speed = std::min(speed, 1.0f);
++		/* Invalid decisions retain the prior target while filtering continues. */
++		if (target.rg == 0 || target.bg == 0 || confidence == 0)
++			target = previousTarget;
++		QtiAwbPoint point{
++			std::fma(speed, target.rg, (1.0f - speed) * previousFiltered.rg),
++			std::fma(speed, target.bg, (1.0f - speed) * previousFiltered.bg),
++		};
++		return { point, locus.evaluate(point).cct, speed, startupActive_ };
++	}
++
++private:
++	QtiAwbTemporalConfiguration config_;
++	bool startupActive_ = true;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_triggers.h b/src/libcamera/pipeline/qcom/awb_triggers.h
+new file mode 100644
+index 0000000..0d095fe
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_triggers.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <vector>
++
++#include "awb_weights.h"
++
++namespace libcamera::qcom {
++
++template<std::size_t Width>
++std::array<float, Width> qtiAwbBlendValues(const std::array<float, Width> &first,
++					 const std::array<float, Width> &last, float coefficient)
++{
++	std::array<float, Width> result;
++	for (std::size_t i = 0; i < Width; i++)
++		result[i] = qtiAwbBlend(first[i], last[i], coefficient);
++	return result;
++}
++
++template<unsigned int Depth, std::size_t Width>
++struct QtiAwbTriggerTable {
++	using Value = QtiAwbTriggerTable<Depth - 1, Width>;
++	std::vector<QtiAwbWeightZone<Value>> zones;
++};
++
++template<std::size_t Width>
++struct QtiAwbTriggerTable<1, Width> {
++	using Value = std::array<float, Width>;
++	std::vector<QtiAwbWeightZone<Value>> zones;
++};
++
++template<unsigned int Depth, std::size_t Width>
++std::array<float, Width> qtiAwbEvaluateTrigger(const QtiAwbTriggerTable<Depth, Width> &table,
++					     const float *triggers)
++{
++	const auto &zones = table.zones;
++	auto evaluate = [triggers](const typename QtiAwbTriggerTable<Depth, Width>::Value &value) {
++		if constexpr (Depth == 1)
++			return value;
++		else
++			return qtiAwbEvaluateTrigger(value, triggers + 1);
++	};
++	/* Scene and coordinate tables include the upper endpoint, unlike weight curves. */
++	for (std::size_t i = 0; i + 1 < zones.size(); i++) {
++		if (*triggers <= zones[i].end)
++			return evaluate(zones[i].value);
++		if (*triggers < zones[i + 1].start) {
++			float coefficient = 1.0f - (*triggers - zones[i].end) /
++						  (zones[i + 1].start - zones[i].end);
++			return qtiAwbBlendValues(evaluate(zones[i].value),
++						evaluate(zones[i + 1].value), coefficient);
++		}
++	}
++	return evaluate(zones.back().value);
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_weights.h b/src/libcamera/pipeline/qcom/awb_weights.h
+new file mode 100644
+index 0000000..0635da1
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_weights.h
+@@ -0,0 +1,103 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <cmath>
++#include <cstddef>
++#include <vector>
++
++namespace libcamera::qcom {
++
++template<typename T>
++struct QtiAwbWeightZone {
++	float start;
++	float end;
++	T value;
++};
++
++using QtiAwbWeightCurve = std::vector<QtiAwbWeightZone<float>>;
++using QtiAwbDistanceCctTable = std::vector<QtiAwbWeightZone<QtiAwbWeightCurve>>;
++using QtiAwbDistanceWeights = std::vector<QtiAwbWeightZone<QtiAwbDistanceCctTable>>;
++using QtiAwbIlluminantWeights = std::vector<QtiAwbWeightZone<QtiAwbWeightCurve>>;
++
++struct QtiAwbWeightSelection {
++	std::size_t first;
++	std::size_t last;
++	float coefficient;
++};
++
++inline float qtiAwbBlend(float first, float last, float coefficient)
++{
++	return std::fma(first, coefficient, (1.0f - coefficient) * last);
++}
++
++/* Tables are nonempty and retain the factory order, including overlapping zones. */
++template<typename T>
++QtiAwbWeightSelection qtiAwbSelectWeight(const std::vector<QtiAwbWeightZone<T>> &zones,
++				       float input)
++{
++	for (std::size_t i = 0; i + 1 < zones.size(); i++) {
++		if (input < zones[i].end)
++			return { i, i, 1 };
++		if (input < zones[i + 1].start) {
++			float coefficient = 1.0f - (input - zones[i].end) /
++						  (zones[i + 1].start - zones[i].end);
++			return { i, i + 1, coefficient };
++		}
++	}
++	return { zones.size() - 1, zones.size() - 1, 1 };
++}
++
++template<typename T, typename Evaluate>
++float qtiAwbInterpolateWeight(const std::vector<QtiAwbWeightZone<T>> &zones,
++			      float input, Evaluate evaluate)
++{
++	QtiAwbWeightSelection selection = qtiAwbSelectWeight(zones, input);
++	float first = evaluate(zones[selection.first].value);
++	if (selection.first == selection.last)
++		return first;
++	return qtiAwbBlend(first, evaluate(zones[selection.last].value), selection.coefficient);
++}
++
++inline float qtiAwbCurveWeight(const QtiAwbWeightCurve &curve, float input)
++{
++	return qtiAwbInterpolateWeight(curve, input, [](float value) { return value; });
++}
++
++inline float qtiAwbDistanceCctWeight(const QtiAwbDistanceCctTable &table,
++				    float cct, float distance)
++{
++	QtiAwbWeightSelection selection = qtiAwbSelectWeight(table, cct);
++	const auto &first = table[selection.first].value;
++	if (selection.first == selection.last)
++		return qtiAwbCurveWeight(first, distance);
++	const auto &last = table[selection.last].value;
++	/* Interpolate gray-zone limits before mapping distance into each CCT curve. */
++	float firstLimit = distance < 0 ? first[1].end : first.back().start;
++	float lastLimit = distance < 0 ? last[1].end : last.back().start;
++	float normalized = distance / qtiAwbBlend(firstLimit, lastLimit, selection.coefficient);
++	return qtiAwbBlend(qtiAwbCurveWeight(first, firstLimit * normalized),
++			   qtiAwbCurveWeight(last, lastLimit * normalized), selection.coefficient);
++}
++
++struct QtiAwbRegionWeights {
++	QtiAwbDistanceWeights distance;
++	QtiAwbIlluminantWeights illuminant;
++
++	float distanceWeight(float lux, float cct, float signedDistance) const
++	{
++		return qtiAwbInterpolateWeight(distance, lux,
++			[cct, signedDistance](const QtiAwbDistanceCctTable &table) {
++				return qtiAwbDistanceCctWeight(table, cct, signedDistance);
++			});
++	}
++
++	float illuminantWeight(float lux, float cct) const
++	{
++		return qtiAwbInterpolateWeight(illuminant, lux,
++			[cct](const QtiAwbWeightCurve &curve) {
++				return qtiAwbCurveWeight(curve, cct);
++			});
++	}
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_zones.h b/src/libcamera/pipeline/qcom/awb_zones.h
+new file mode 100644
+index 0000000..5999aa8
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_zones.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++#include "awb_triggers.h"
++
++namespace libcamera::qcom {
++
++using QtiAwbCoordinates = std::array<float, 6>;
++
++enum class QtiAwbGeometry {
++	Rectangle,
++	Triangle,
++	Cct,
++};
++
++inline bool qtiAwbZoneContains(QtiAwbGeometry geometry, const QtiAwbCoordinates &c,
++			       float rg, float bg, float cct, uint32_t valid)
++{
++	switch (geometry) {
++	case QtiAwbGeometry::Rectangle:
++		return c[0] <= rg && rg <= c[2] && c[3] <= bg && bg <= c[1];
++	case QtiAwbGeometry::Triangle: {
++		float dx = c[2] - c[0];
++		float dy = c[3] - c[1];
++		float ex = c[4] - c[0];
++		float ey = c[5] - c[1];
++		/* Keep the factory cross-product order at strict triangle boundaries. */
++		float denominator = std::fma(dx, ey, -(dy * ex));
++		float first = std::fma(dy, rg, -(dx * bg));
++		float firstOrigin = std::fma(c[0], dy, -(dx * c[1]));
++		float v = -(first - firstOrigin) / denominator;
++		float second = std::fma(ey, rg, -(ex * bg));
++		float secondOrigin = std::fma(c[0], ey, -(c[1] * ex));
++		float u = (second - secondOrigin) / denominator;
++		return u > 0 && v > 0 && u + v < 1;
++	}
++	case QtiAwbGeometry::Cct:
++		return valid == 1 && c[0] <= cct && cct <= c[1];
++	}
++	return false;
++}
++
++inline QtiAwbCoordinates qtiAwbBlendCoordinates(const QtiAwbCoordinates &first,
++					       const QtiAwbCoordinates &last,
++					       float coefficient)
++{
++	return qtiAwbBlendValues(first, last, coefficient);
++}
++
++template<unsigned int Depth>
++using QtiAwbCoordinateTable = QtiAwbTriggerTable<Depth, 6>;
++
++template<unsigned int Depth>
++QtiAwbCoordinates qtiAwbEvaluateCoordinates(const QtiAwbCoordinateTable<Depth> &table,
++					   const float *triggers)
++{
++	return qtiAwbEvaluateTrigger(table, triggers);
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/imx520_awb_calibration.h b/src/libcamera/pipeline/qcom/imx520_awb_calibration.h
+new file mode 100644
+index 0000000..16e997a
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/imx520_awb_calibration.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++#include "awb_calibration.h"
++#include "awb_eeprom.h"
++
++namespace libcamera::qcom {
++
++inline std::optional<std::vector<QtiAwbIlluminantCalibration>>
++imx520AwbCalibration(const std::array<uint8_t, 16> &block)
++{
++	std::array<std::array<float, 3>, 2> ratios;
++	for (unsigned int i = 0; i < ratios.size(); i++) {
++		std::array<uint8_t, 8> data;
++		std::copy_n(block.begin() + i * 8, data.size(), data.begin());
++		auto decoded = awbEepromRatios(data);
++		if (!decoded)
++			return std::nullopt;
++		ratios[i] = *decoded;
++	}
++	constexpr std::array<unsigned int, 5> ccts{ 6500, 3800, 2850, 5000, 2300 };
++	constexpr std::array<unsigned int, 5> groups{ 0, 0, 1, 0, 1 };
++	std::vector<QtiAwbIlluminantCalibration> result;
++	for (unsigned int i = 0; i < ccts.size(); i++) {
++		const auto &measured = ratios[groups[i]];
++		result.push_back({ 1, ccts[i], { measured[0], measured[1] } });
++	}
++	return result;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+new file mode 100644
+index 0000000..1beb0fe
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+@@ -0,0 +1,1153 @@
++/* Generated by tools/gen-imx520-awb-tuning.py. */
++#pragma once
++
++#include "awb_front_configuration.h"
++
++namespace libcamera::qcom {
++
++inline QtiAwbFrontConfiguration imx520AwbConfiguration()
++{
++	QtiAwbFrontConfiguration config{};
++	config.reference = { {
++		{ 0.147963792f, 0.890662193f },
++		{ 0.357652098f, 0.693407536f },
++		{ 0.412425041f, 0.634280205f },
++		{ 0.482321143f, 0.568528652f },
++		{ 0.496084481f, 0.415380836f },
++		{ 0.535232961f, 0.429675043f },
++		{ 0.574381411f, 0.44396922f },
++		{ 0.767592549f, 0.347797126f },
++		{ 0.946590364f, 0.288984716f },
++		{ 1.20695078f, 0.2034394f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.initial = { { 2.07330751f, 1.0f, 1.75892627f }, 5000.0f };
++	config.calibration = { true, 5, { 6500.0f, 3800.0f, 2850.0f, 5000.0f, 2300.0f, 5000.0f }, { {
++		{ 0.533203006f, 0.573242009f },
++		{ 0.533203006f, 0.573242009f },
++		{ 0.767578006f, 0.38964799f },
++		{ 0.533203006f, 0.573242009f },
++		{ 0.767578006f, 0.38964799f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++	} } };
++	config.screening = { { 1.0f, 1.0f, 1.0f }, 80.0f };
++	config.regionWeights.distance = {
++		{ 0.0f, 77.0f, {
++			{ 0.0f, 1500.0f, {
++				{ -0.528113127f, -0.0739358366f, 0.0f },
++				{ -0.0686547086f, -0.0633735731f, 0.0f },
++				{ -0.04224905f, 0.0528113134f, 0.0f },
++				{ 0.0633735731f, 0.0686547086f, 0.0f },
++				{ 0.0739358366f, 0.528113127f, 0.0f },
++			} },
++			{ 2400.0f, 3400.0f, {
++				{ -0.528113127f, -0.0633735731f, 0.0f },
++				{ -0.0580924451f, -0.0528113134f, 0.5f },
++				{ -0.0316867866f, 0.04224905f, 1.0f },
++				{ 0.0528113134f, 0.0580924451f, 0.5f },
++				{ 0.0633735731f, 0.528113127f, 0.0f },
++			} },
++			{ 3600.0f, 3800.0f, {
++				{ -0.528113127f, -0.0844981f, 0.0f },
++				{ -0.079216972f, -0.0739358366f, 0.00999999978f },
++				{ -0.04224905f, 0.0554518774f, 1.0f },
++				{ 0.0660141408f, 0.0712952688f, 0.00999999978f },
++				{ 0.0765764043f, 0.528113127f, 0.0f },
++			} },
++			{ 4100.0f, 4300.0f, {
++				{ -0.528113127f, -0.0977009311f, 0.0f },
++				{ -0.0924197957f, -0.0871386677f, 0.5f },
++				{ -0.0554518774f, 0.04224905f, 1.0f },
++				{ 0.0528113134f, 0.0580924451f, 0.5f },
++				{ 0.0633735731f, 0.528113127f, 0.0f },
++			} },
++			{ 5000.0f, 5800.0f, {
++				{ -0.528113127f, -0.0554518774f, 0.0500000007f },
++				{ -0.0501707457f, -0.044889614f, 0.5f },
++				{ -0.0316867866f, 0.04224905f, 1.0f },
++				{ 0.0528113134f, 0.0580924451f, 0.5f },
++				{ 0.0633735731f, 0.528113127f, 0.0f },
++			} },
++			{ 6000.0f, 7500.0f, {
++				{ -0.528113127f, -0.0528113134f, 0.00999999978f },
++				{ -0.0475301817f, -0.044889614f, 0.25f },
++				{ -0.04224905f, 0.0528113134f, 1.0f },
++				{ 0.0633735731f, 0.0686547086f, 0.5f },
++				{ 0.0739358366f, 0.528113127f, 0.0f },
++			} },
++			{ 9000.0f, 12000.0f, {
++				{ -0.728012681f, -0.0128009999f, 0.0f },
++				{ -0.0105210003f, -0.00888099987f, 0.0f },
++				{ -0.00624099979f, 0.0728012696f, 0.0f },
++				{ 0.087361522f, 0.0946416482f, 0.0f },
++				{ 0.101921797f, 0.728012681f, 0.0f },
++			} },
++		} },
++		{ 150.0f, 170.0f, {
++			{ 0.0f, 1500.0f, {
++				{ -0.528113127f, -0.0739358366f, 0.0f },
++				{ -0.0686547086f, -0.0633735731f, 0.0f },
++				{ -0.04224905f, 0.04224905f, 0.0f },
++				{ 0.0633735731f, 0.0686547086f, 0.0f },
++				{ 0.0739358366f, 0.528113127f, 0.0f },
++			} },
++			{ 2400.0f, 3400.0f, {
++				{ -0.528113127f, -0.0633735731f, 0.0f },
++				{ -0.0580924451f, -0.0528113134f, 0.5f },
++				{ -0.0316867866f, 0.04224905f, 1.0f },
++				{ 0.0739358366f, 0.079216972f, 0.5f },
++				{ 0.0844981f, 0.528113127f, 0.0f },
++			} },
++			{ 3600.0f, 3800.0f, {
++				{ -0.528113127f, -0.0844981f, 0.0f },
++				{ -0.079216972f, -0.0739358366f, 0.00999999978f },
++				{ -0.04224905f, 0.0554518774f, 1.0f },
++				{ 0.0871386677f, 0.0924197957f, 0.00999999978f },
++				{ 0.0977009311f, 0.528113127f, 0.0f },
++			} },
++			{ 4100.0f, 4300.0f, {
++				{ -0.528113127f, -0.0977009311f, 0.0f },
++				{ -0.0924197957f, -0.0871386677f, 0.600000024f },
++				{ -0.0633735731f, 0.0528113134f, 1.0f },
++				{ 0.0739358366f, 0.079216972f, 0.600000024f },
++				{ 0.0844981f, 0.528113127f, 0.0f },
++			} },
++			{ 5000.0f, 6500.0f, {
++				{ -0.528113127f, -0.0633735731f, 0.0f },
++				{ -0.0580924451f, -0.0528113134f, 0.5f },
++				{ -0.0369679183f, 0.04224905f, 1.0f },
++				{ 0.0739358366f, 0.079216972f, 0.5f },
++				{ 0.0844981f, 0.528113127f, 0.0f },
++			} },
++			{ 9000.0f, 12000.0f, {
++				{ -0.528113127f, -0.0528113134f, 0.0f },
++				{ -0.0475301817f, -0.044889614f, 0.0f },
++				{ -0.04224905f, 0.0528113134f, 0.0f },
++				{ 0.0633735731f, 0.0686547086f, 0.0f },
++				{ 0.0739358366f, 0.528113127f, 0.0f },
++			} },
++		} },
++		{ 227.0f, 819.0f, {
++			{ 0.0f, 1500.0f, {
++				{ -0.528113127f, -0.0739358366f, 0.0f },
++				{ -0.0686547086f, -0.0633735731f, 0.0f },
++				{ -0.04224905f, 0.0369679183f, 0.0f },
++				{ 0.0633735731f, 0.0686547086f, 0.0f },
++				{ 0.0739358366f, 0.528113127f, 0.0f },
++			} },
++			{ 1500.0f, 2100.0f, {
++				{ -0.528113127f, -0.0633735731f, 0.0f },
++				{ -0.0580924451f, -0.0528113134f, 0.100000001f },
++				{ -0.0316867866f, 0.04224905f, 0.5f },
++				{ 0.0528113134f, 0.079216972f, 0.100000001f },
++				{ 0.0844981f, 0.528113127f, 0.0f },
++			} },
++			{ 2300.0f, 3800.0f, {
++				{ -0.528113127f, -0.0844981f, 0.0f },
++				{ -0.079216972f, -0.0739358366f, 0.400000006f },
++				{ -0.04224905f, 0.0554518774f, 1.0f },
++				{ 0.0871386677f, 0.0924197957f, 0.400000006f },
++				{ 0.0977009311f, 0.528113127f, 0.0f },
++			} },
++			{ 4100.0f, 4300.0f, {
++				{ -0.528113127f, -0.0977009311f, 0.0f },
++				{ -0.0924197957f, -0.0871386677f, 0.699999988f },
++				{ -0.0554518774f, 0.04224905f, 1.0f },
++				{ 0.0739358366f, 0.079216972f, 0.699999988f },
++				{ 0.0844981f, 0.528113127f, 0.0f },
++			} },
++			{ 5000.0f, 6500.0f, {
++				{ -0.528113127f, -0.0739358366f, 0.0f },
++				{ -0.0686547086f, -0.0633735731f, 0.5f },
++				{ -0.0369679183f, 0.0528113134f, 1.0f },
++				{ 0.0844981f, 0.089779228f, 0.5f },
++				{ 0.0950603634f, 0.528113127f, 0.0f },
++			} },
++			{ 9000.0f, 12000.0f, {
++				{ -0.528113127f, -0.0739358366f, 0.0f },
++				{ -0.0686547086f, -0.0633735731f, 0.0f },
++				{ -0.04224905f, 0.04224905f, 0.0f },
++				{ 0.0633735731f, 0.0686547086f, 0.0f },
++				{ 0.0739358366f, 0.528113127f, 0.0f },
++			} },
++		} },
++		{ 227.0f, 280.0f, {
++			{ 0.0f, 1500.0f, {
++				{ -0.0528029986f, -0.0592200011f, 0.0f },
++				{ -0.0546419993f, -0.0473619998f, 0.0f },
++				{ -0.038240999f, 0.0209609997f, 0.0f },
++				{ 0.0373620018f, 0.0546419993f, 0.0f },
++				{ 0.0519220009f, 0.0580129996f, 0.0f },
++			} },
++			{ 1500.0f, 2100.0f, {
++				{ -0.728012681f, -0.0573620014f, 0.0f },
++				{ -0.0500809997f, -0.0428010002f, 0.100000001f },
++				{ -0.0336810015f, 0.0282409992f, 0.400000006f },
++				{ 0.0319220014f, 0.0492019989f, 0.100000001f },
++				{ 0.0564819984f, 0.728012681f, 0.0f },
++			} },
++			{ 2300.0f, 3800.0f, {
++				{ -0.728012681f, -0.076481998f, 0.0f },
++				{ -0.0692019984f, -0.0619219989f, 0.00999999978f },
++				{ -0.0482410006f, 0.0764413327f, 1.0f },
++				{ 0.120122097f, 0.127402201f, 0.00999999978f },
++				{ 0.134682298f, 0.728012681f, 0.0f },
++			} },
++			{ 4100.0f, 4300.0f, {
++				{ -0.728012979f, -0.0846820027f, 0.0f },
++				{ -0.0674019977f, -0.0601219982f, 0.5f },
++				{ -0.0473619998f, 0.0728010014f, 1.0f },
++				{ 0.101921797f, 0.109201901f, 0.5f },
++				{ 0.116481997f, 0.728012681f, 0.0f },
++			} },
++			{ 5000.0f, 6500.0f, {
++				{ -0.728012681f, -0.0873619989f, 0.0f },
++				{ -0.0800814033f, -0.0728012696f, 0.5f },
++				{ -0.0509608909f, 0.0582410097f, 1.0f },
++				{ 0.101921797f, 0.109201901f, 0.5f },
++				{ 0.116481997f, 0.728012681f, 0.0f },
++			} },
++			{ 9000.0f, 12000.0f, {
++				{ -0.728012681f, -0.0728012696f, 0.0f },
++				{ -0.0655211434f, -0.0618810803f, 0.0f },
++				{ -0.0582410097f, 0.0728012696f, 0.0f },
++				{ 0.087361522f, 0.0946416482f, 0.0f },
++				{ 0.101921797f, 0.728012681f, 0.0f },
++			} },
++		} },
++		{ 295.0f, 410.0f, {
++			{ 0.0f, 1500.0f, {
++				{ -0.0528029986f, -0.0592200011f, 0.0f },
++				{ -0.0546419993f, -0.0473619998f, 0.0f },
++				{ -0.038240999f, 0.0209609997f, 0.0f },
++				{ 0.0373620018f, 0.0546419993f, 0.0f },
++				{ 0.0519220009f, 0.0580129996f, 0.0f },
++			} },
++			{ 1500.0f, 2100.0f, {
++				{ -0.728012681f, -0.0573620014f, 0.0f },
++				{ -0.0500809997f, -0.0428010002f, 0.100000001f },
++				{ -0.0336810015f, 0.0282409992f, 0.400000006f },
++				{ 0.0319220014f, 0.0492019989f, 0.100000001f },
++				{ 0.0564819984f, 0.728012681f, 0.0f },
++			} },
++			{ 2300.0f, 3800.0f, {
++				{ -0.728012681f, -0.076481998f, 0.0f },
++				{ -0.0692019984f, -0.0619219989f, 0.00999999978f },
++				{ -0.0482410006f, 0.0764413327f, 0.699999988f },
++				{ 0.120122097f, 0.127402201f, 0.00999999978f },
++				{ 0.134682298f, 0.728012681f, 0.0f },
++			} },
++			{ 4100.0f, 4300.0f, {
++				{ -0.728012979f, -0.0846820027f, 0.0f },
++				{ -0.0674019977f, -0.0601219982f, 0.5f },
++				{ -0.0473619998f, 0.0728010014f, 1.0f },
++				{ 0.101921797f, 0.109201901f, 0.5f },
++				{ 0.116481997f, 0.728012681f, 0.0f },
++			} },
++			{ 5000.0f, 6500.0f, {
++				{ -0.728012681f, -0.0873619989f, 0.0f },
++				{ -0.0800814033f, -0.0728012696f, 0.5f },
++				{ -0.0509608909f, 0.0582410097f, 1.0f },
++				{ 0.101921797f, 0.109201901f, 0.5f },
++				{ 0.116481997f, 0.728012681f, 0.0f },
++			} },
++			{ 9000.0f, 12000.0f, {
++				{ -0.728012681f, -0.0728012696f, 0.0f },
++				{ -0.0655211434f, -0.0618810803f, 0.0f },
++				{ -0.0582410097f, 0.0728012696f, 0.0f },
++				{ 0.087361522f, 0.0946416482f, 0.0f },
++				{ 0.101921797f, 0.728012681f, 0.0f },
++			} },
++		} },
++		{ 450.0f, 999.0f, {
++			{ 0.0f, 1500.0f, {
++				{ -0.728012979f, -0.0819220021f, 0.0f },
++				{ -0.0546419993f, -0.0473619998f, 0.0f },
++				{ -0.038240999f, 0.0209609997f, 0.0f },
++				{ 0.0373620018f, 0.0546419993f, 0.0f },
++				{ 0.101921797f, 0.728012681f, 0.0f },
++			} },
++			{ 1900.0f, 2100.0f, {
++				{ -0.728012979f, -0.0819220021f, 0.0f },
++				{ -0.0546419993f, -0.0473619998f, 0.00999999978f },
++				{ -0.038240999f, 0.0209609997f, 0.100000001f },
++				{ 0.0373620018f, 0.0546419993f, 0.00999999978f },
++				{ 0.101921797f, 0.728012681f, 0.0f },
++			} },
++			{ 2400.0f, 3400.0f, {
++				{ -0.728012681f, -0.087361522f, 0.0f },
++				{ -0.0800814033f, -0.0728012696f, 0.5f },
++				{ -0.043680761f, 0.0582410097f, 1.0f },
++				{ 0.0728012696f, 0.109201901f, 0.5f },
++				{ 0.116481997f, 0.728012681f, 0.0f },
++			} },
++			{ 3600.0f, 3800.0f, {
++				{ -0.728012681f, -0.116481997f, 0.0f },
++				{ -0.109201901f, -0.101921797f, 0.5f },
++				{ -0.0582410097f, 0.0764413327f, 1.0f },
++				{ 0.120122097f, 0.127402201f, 0.5f },
++				{ 0.134682298f, 0.728012681f, 0.0f },
++			} },
++			{ 4100.0f, 4300.0f, {
++				{ -0.728012681f, -0.134682298f, 0.0f },
++				{ -0.127402201f, -0.120122097f, 0.5f },
++				{ -0.0764413327f, 0.0582410097f, 1.0f },
++				{ 0.101921797f, 0.109201901f, 0.5f },
++				{ 0.116481997f, 0.728012681f, 0.0f },
++			} },
++			{ 5000.0f, 6500.0f, {
++				{ -0.728012681f, -0.101921797f, 0.0f },
++				{ -0.0946416482f, -0.087361522f, 0.5f },
++				{ -0.0509608909f, 0.0728012696f, 1.0f },
++				{ 0.116481997f, 0.123762198f, 0.5f },
++				{ 0.131042302f, 0.728012681f, 0.0f },
++			} },
++			{ 9000.0f, 12000.0f, {
++				{ -0.728012681f, -0.101921797f, 0.0f },
++				{ -0.0946416482f, -0.087361522f, 0.0f },
++				{ -0.0582410097f, 0.0582410097f, 0.0f },
++				{ 0.087361522f, 0.0946416482f, 0.0f },
++				{ 0.101921797f, 0.728012681f, 0.0f },
++			} },
++		} },
++	};
++	config.regionWeights.illuminant = {
++		{ 0.0f, 58.0f, {
++			{ 0.0f, 4195.0f, 0.0f },
++			{ 4200.0f, 4600.0f, 0.800000012f },
++			{ 4800.0f, 7000.0f, 1.0f },
++			{ 7600.0f, 7800.0f, 0.400000006f },
++			{ 8000.0f, 15000.0f, 0.0f },
++		} },
++		{ 69.0f, 77.0f, {
++			{ 0.0f, 4195.0f, 0.0f },
++			{ 4200.0f, 4600.0f, 0.600000024f },
++			{ 4800.0f, 7000.0f, 1.0f },
++			{ 7400.0f, 7600.0f, 0.300000012f },
++			{ 7800.0f, 15000.0f, 0.0f },
++		} },
++		{ 80.0f, 100.0f, {
++			{ 0.0f, 4195.0f, 0.0f },
++			{ 4200.0f, 4600.0f, 0.600000024f },
++			{ 5000.0f, 7000.0f, 1.0f },
++			{ 7200.0f, 7400.0f, 0.200000003f },
++			{ 7505.0f, 15000.0f, 0.0f },
++		} },
++		{ 110.0f, 130.0f, {
++			{ 0.0f, 3595.0f, 0.0f },
++			{ 3600.0f, 4000.0f, 0.200000003f },
++			{ 4005.0f, 7000.0f, 1.0f },
++			{ 7200.0f, 7400.0f, 0.100000001f },
++			{ 7505.0f, 15000.0f, 0.0f },
++		} },
++		{ 160.0f, 180.0f, {
++			{ 0.0f, 2995.0f, 0.0f },
++			{ 3000.0f, 4300.0f, 0.200000003f },
++			{ 4400.0f, 7000.0f, 1.0f },
++			{ 7205.0f, 15000.0f, 0.0f },
++		} },
++		{ 187.0f, 200.0f, {
++			{ 0.0f, 2400.0f, 0.0f },
++			{ 2600.0f, 3400.0f, 0.400000006f },
++			{ 3800.0f, 4100.0f, 0.400000006f },
++			{ 4300.0f, 4600.0f, 0.699999988f },
++			{ 5000.0f, 6000.0f, 1.0f },
++			{ 6200.0f, 6800.0f, 0.699999988f },
++			{ 6900.0f, 7000.0f, 0.400000006f },
++			{ 9005.0f, 12000.0f, 0.0f },
++		} },
++		{ 227.0f, 280.0f, {
++			{ 0.0f, 2199.0f, 0.0f },
++			{ 2200.0f, 2400.0f, 0.300000012f },
++			{ 2800.0f, 3400.0f, 0.400000006f },
++			{ 3800.0f, 4100.0f, 0.600000024f },
++			{ 4300.0f, 4600.0f, 0.699999988f },
++			{ 5000.0f, 6000.0f, 1.0f },
++			{ 6300.0f, 6500.0f, 0.600000024f },
++			{ 6900.0f, 7000.0f, 0.300000012f },
++			{ 10000.0f, 12000.0f, 0.0f },
++		} },
++		{ 295.0f, 315.0f, {
++			{ 0.0f, 1500.0f, 0.0f },
++			{ 1500.0f, 2100.0f, 0.100000001f },
++			{ 2200.0f, 2400.0f, 0.300000012f },
++			{ 2800.0f, 3100.0f, 0.300000012f },
++			{ 3400.0f, 3800.0f, 0.5f },
++			{ 4000.0f, 4400.0f, 0.800000012f },
++			{ 4700.0f, 5500.0f, 1.0f },
++			{ 5700.0f, 6000.0f, 0.400000006f },
++			{ 6200.0f, 6500.0f, 0.300000012f },
++			{ 9000.0f, 12000.0f, 0.0f },
++		} },
++		{ 330.0f, 410.0f, {
++			{ 0.0f, 1500.0f, 0.0f },
++			{ 1500.0f, 2100.0f, 0.100000001f },
++			{ 2200.0f, 2400.0f, 0.300000012f },
++			{ 2800.0f, 3100.0f, 0.400000006f },
++			{ 3400.0f, 3800.0f, 0.5f },
++			{ 4000.0f, 4400.0f, 0.600000024f },
++			{ 4700.0f, 5400.0f, 1.0f },
++			{ 5600.0f, 6000.0f, 0.5f },
++			{ 6200.0f, 6500.0f, 0.300000012f },
++			{ 9000.0f, 12000.0f, 0.0f },
++		} },
++		{ 430.0f, 999.0f, {
++			{ 0.0f, 1500.0f, 0.0f },
++			{ 1700.0f, 2100.0f, 0.200000003f },
++			{ 2200.0f, 2400.0f, 0.300000012f },
++			{ 2800.0f, 3100.0f, 0.400000006f },
++			{ 3400.0f, 3800.0f, 0.5f },
++			{ 4000.0f, 4400.0f, 0.600000024f },
++			{ 4700.0f, 5200.0f, 1.0f },
++			{ 5400.0f, 6000.0f, 0.5f },
++			{ 6200.0f, 6500.0f, 0.300000012f },
++			{ 9000.0f, 12000.0f, 0.0f },
++		} },
++	};
++	config.mlcDetection = { {
++		{ 250.0f, 600.0f, { 2000.0f, 4000.0f, 1.20000005f, 0.200000003f, 0.0f, 0.0f } },
++	} };
++	config.mlcExclusion = { {
++		{ 260.0f, 400.0f, { {
++			{ 0.0f, 0.300000012f, { {
++				{ 0.0f, 0.0f, { 0.699999988f, 0.519999981f, 0.699999988f, 0.519999981f, 0.0f, 0.0f } },
++			} } },
++			{ 0.5f, 1.0f, { {
++				{ 0.0f, 0.0f, { 0.5f, 0.600000024f, 0.699999988f, 0.519999981f, 0.0f, 0.0f } },
++			} } },
++		} } },
++	} };
++	config.scenes = {
++		{ { 0, 2, 1.0f, 0, {
++			{ { 0, 2 }, 0.0f, { {
++				{ 0.0f, 61.0f, { {
++					{ 0.0f, 0.0500000007f, { 0.0f } },
++					{ 0.0799999982f, 0.100000001f, { 0.5f } },
++					{ 0.150000006f, 1.0f, { 1.0f } },
++				} } },
++				{ 65.0f, 69.0f, { {
++					{ 0.0f, 0.0500000007f, { 0.0f } },
++					{ 0.0799999982f, 0.100000001f, { 0.5f } },
++					{ 0.150000006f, 1.0f, { 1.0f } },
++				} } },
++				{ 80.0f, 280.0f, { {
++					{ 0.0f, 0.0500000007f, { 0.0f } },
++					{ 0.150000006f, 0.200000003f, { 0.300000012f } },
++					{ 0.300000012f, 1.0f, { 1.0f } },
++				} } },
++			} } },
++		}, { 1, { 0, 7 }, { {
++			{ 0.0f, 61.0f, { {
++				{ 0.0f, 0.400000006f, { 1.0f, 1.0f } },
++				{ 0.5f, 1.0f, { 1.0f, 1.0f } },
++			} } },
++			{ 80.0f, 140.0f, { {
++				{ 0.0f, 0.400000006f, { 1.0f, 1.0f } },
++				{ 0.5f, 1.0f, { 1.0f, 1.0f } },
++			} } },
++			{ 160.0f, 190.0f, { {
++				{ 0.0f, 0.300000012f, { 1.0f, 1.0f } },
++				{ 0.5f, 1.0f, { 1.0f, 1.0f } },
++			} } },
++			{ 215.0f, 240.0f, { {
++				{ 0.0f, 0.150000006f, { 1.0f, 1.0f } },
++				{ 0.25f, 0.5f, { 1.0f, 1.0f } },
++				{ 0.699999988f, 1.0f, { 1.0f, 1.0f } },
++			} } },
++			{ 250.0f, 999.0f, { {
++				{ 0.0f, 1.0f, { 1.0f, 1.0f } },
++			} } },
++		} } } }, {
++			{ 0, static_cast<QtiAwbGeometry>(0), { {
++				{ 1.0f, 180.0f, { 0.439999998f, 0.50999999f, 0.529999971f, 0.419999987f, 0.0f, 0.0f } },
++			} } },
++			{ 0, static_cast<QtiAwbGeometry>(0), { {
++				{ 980.0f, 999.0f, { 0.439999998f, 0.50999999f, 0.540000021f, 0.400000006f, 0.0f, 0.0f } },
++			} } },
++		} },
++		{ { 0, 6, 1.0f, 0, {
++			{ { 0, 7 }, 0.0f, { {
++				{ 0.0f, 160.0f, { {
++					{ 0.0f, 0.200000003f, { 0.0f } },
++					{ 0.300000012f, 1.0f, { 1.0f } },
++				} } },
++				{ 161.0f, 999.0f, { {
++					{ 0.0f, 1.0f, { 0.0f } },
++				} } },
++			} } },
++		}, { 1, { 0, 0 }, { {
++			{ 0.0f, 160.0f, { {
++				{ 0.0f, 160.0f, { 1.0f, 0.949999988f } },
++			} } },
++		} } } }, {
++			{ 0, static_cast<QtiAwbGeometry>(0), { {
++				{ 0.0f, 160.0f, { 0.439999998f, 0.50999999f, 0.540000021f, 0.310000002f, 0.0f, 0.0f } },
++			} } },
++		} },
++		{ { 0, 8, 8.0f, 0, {
++			{ { 0, 7 }, 0.0f, { {
++				{ 0.0f, 339.0f, { {
++					{ 0.0f, 1.0f, { 0.0f } },
++				} } },
++				{ 340.0f, 999.0f, { {
++					{ 0.0f, 0.200000003f, { 0.0f } },
++					{ 0.400000006f, 1.0f, { 1.0f } },
++				} } },
++			} } },
++			{ { 0, 0 }, 0.0f, { {
++				{ 0.0f, 999.0f, { {
++					{ 0.0f, 340.0f, { 0.0f } },
++					{ 370.0f, 999.0f, { 1.0f } },
++				} } },
++			} } },
++		}, { 0, { 0, 0 }, { {
++			{ 0.0f, 999.0f, { {
++				{ 0.0f, 369.0f, { 0.946590364f, 0.300000012f } },
++				{ 390.0f, 990.0f, { 0.939999998f, 0.319999993f } },
++			} } },
++		} } } }, {
++			{ 0, static_cast<QtiAwbGeometry>(0), { {
++				{ 340.0f, 999.0f, { 1.14999998f, 1.0f, 1.60000002f, 0.0f, 0.0f, 0.0f } },
++			} } },
++		} },
++		{ { 0, 10, 8.0f, 0, {
++			{ { 0, 0 }, 0.0f, { {
++				{ 0.0f, 299.0f, { {
++					{ 0.0f, 299.0f, { 0.0f } },
++				} } },
++				{ 300.0f, 999.0f, { {
++					{ 300.0f, 999.0f, { 1.0f } },
++				} } },
++			} } },
++			{ { 2, 7 }, 0.0f, { {
++				{ 0.0f, 0.400000006f, { {
++					{ 0.0f, 0.200000003f, { 0.0f } },
++					{ 0.25f, 1.0f, { 1.0f } },
++				} } },
++				{ 0.600000024f, 1.0f, { {
++					{ 0.0f, 1.0f, { 0.0f } },
++				} } },
++			} } },
++		}, { 0, { 0, 0 }, { {
++			{ 300.0f, 999.0f, { {
++				{ 300.0f, 999.0f, { 0.389059991f, 0.685248017f } },
++			} } },
++		} } } }, {
++			{ 0, static_cast<QtiAwbGeometry>(0), { {
++				{ 300.0f, 999.0f, { 0.100000001f, 1.60000002f, 0.200000003f, 0.699999988f, 0.0f, 0.0f } },
++			} } },
++		} },
++	};
++	config.agw = { { 0, 2 }, 1.0f, { {
++		{ 0.0f, 999.0f, { {
++			{ 0.0f, 1.0f, { 0.0f } },
++		} } },
++	} } };
++	config.aggregation.confidenceWeight = { {
++		{ 0.0f, 0.00999999978f, { 0.0f } },
++		{ 0.100000001f, 0.109999999f, { 1.0f } },
++		{ 0.5f, 1.0f, { 1.0f } },
++	} };
++	config.aggregation.rankWeight = { {
++		{ 0.0f, 2.0f, { 1.0f } },
++		{ 3.0f, 3.0f, { 0.5f } },
++		{ 4.0f, 10.0f, { 0.00999999978f } },
++	} };
++	config.aggregation.referenceWeight = { {
++		{ 0.0f, 0.00999999978f, { 0.0f } },
++		{ 0.0299999993f, 0.0500000007f, { 0.5f } },
++		{ 0.0700000003f, 1.0f, { 1.0f } },
++	} };
++	config.temporal = { 0.600000024f, 30, 0.150000006f };
++	config.frameSkip.change = {
++		{ 0.0f, 1.0f, 3.0f },
++		{ 2.0f, 3.0f, 2.0f },
++		{ 4.0f, 100.0f, 1.0f },
++	};
++	config.frameSkip.historySize = 30;
++	config.faceFrame = { 0.330000013f, 0.375f, 10, 30, 0.00999999978f };
++	config.faceStatistics.minimumRgb = { {
++		{ 0.0f, 999.0f, { 5.0f, 5.0f, 5.0f } },
++	} };
++	config.faceStatistics.maximumRgb = { {
++		{ 0.0f, 999.0f, { 240.0f, 240.0f, 240.0f } },
++	} };
++	config.faceAnalysis.weight = 4.0f;
++	config.faceAnalysis.targets = { {
++		{ { 0, 1 }, { {
++			{ 0.0f, 999.0f, { {
++				{ 0.0f, 2700.0f, { 1.42496002f, 0.885510027f } },
++				{ 3500.0f, 15000.0f, { 1.39075005f, 0.84325099f } },
++			} } },
++		} } },
++		{ { 0, 1 }, { {
++			{ 0.0f, 999.0f, { {
++				{ 0.0f, 2700.0f, { 1.33121002f, 0.892929971f } },
++				{ 3500.0f, 15000.0f, { 1.41706598f, 0.840417981f } },
++			} } },
++		} } },
++	} };
++	config.faceAnalysis.skinWeights = { {
++		{ { 0, 6 }, { {
++			{ 0.0f, 999.0f, { {
++				{ 0.0f, 0.300000012f, { 0.0f } },
++				{ 3.5f, 999.0f, { 1.0f } },
++			} } },
++		} } },
++		{ { 0, 4 }, { {
++			{ 0.0f, 190.0f, { {
++				{ 0.0f, 2800.0f, { 0.5f } },
++				{ 4500.0f, 9999.0f, { 0.949999988f } },
++			} } },
++			{ 290.0f, 999.0f, { {
++				{ 0.0f, 2800.0f, { 0.949999988f } },
++				{ 4500.0f, 9999.0f, { 0.800000012f } },
++			} } },
++		} } },
++		{ { 0, 5 }, { {
++			{ 0.0f, 190.0f, { {
++				{ 0.0f, 2800.0f, { 0.300000012f } },
++				{ 4500.0f, 9999.0f, { 0.949999988f } },
++			} } },
++			{ 290.0f, 999.0f, { {
++				{ 0.0f, 2800.0f, { 0.949999988f } },
++				{ 4500.0f, 9999.0f, { 0.300000012f } },
++			} } },
++		} } },
++	} };
++	config.faceAnalysis.confidences = {
++		{ { 0, 3 }, { {
++			{ 0.0f, 999.0f, { {
++				{ 0.0f, 0.00300000003f, { 0.0f } },
++				{ 0.00800000038f, 0.0250000004f, { 0.300000012f } },
++				{ 0.0350000001f, 0.0500000007f, { 0.400000006f } },
++				{ 0.180000007f, 1.0f, { 0.699999988f } },
++			} } },
++		} } },
++		{ { 1, 3 }, { {
++			{ 0.0f, 15000.0f, { {
++				{ 0.0f, 1.0f, { 1.0f } },
++			} } },
++		} } },
++		{ { 0, 4 }, { {
++			{ 0.0f, 120.0f, { {
++				{ 0.0f, 5500.0f, { 0.5f } },
++			} } },
++			{ 150.0f, 340.0f, { {
++				{ 0.0f, 5500.0f, { 1.0f } },
++				{ 6300.0f, 6300.0f, { 0.200000003f } },
++				{ 9999.0f, 10000.0f, { 0.0f } },
++			} } },
++			{ 355.0f, 999.0f, { {
++				{ 0.0f, 9999.0f, { 0.0f } },
++			} } },
++		} } },
++	};
++	config.gain.triangles = {
++		{ { 0, 22, 2 }, { 3, 1, 255 } },
++		{ { 23, 22, 2 }, { 5, 0, 7 } },
++		{ { 0, 12, 28 }, { 255, 8, 3 } },
++		{ { 0, 22, 28 }, { 0, 10, 2 } },
++		{ { 22, 1, 13 }, { 5, 255, 10 } },
++		{ { 1, 22, 23 }, { 4, 1, 6 } },
++		{ { 3, 1, 23 }, { 255, 5, 24 } },
++		{ { 14, 2, 23 }, { 255, 1, 24 } },
++		{ { 16, 12, 28 }, { 255, 2, 11 } },
++		{ { 28, 13, 29 }, { 10, 18, 11 } },
++		{ { 22, 28, 13 }, { 3, 9, 4 } },
++		{ { 28, 16, 29 }, { 8, 12, 9 } },
++		{ { 8, 16, 29 }, { 14, 11, 13 } },
++		{ { 31, 8, 29 }, { 16, 12, 21 } },
++		{ { 20, 16, 8 }, { 15, 12, 22 } },
++		{ { 6, 16, 20 }, { 255, 14, 28 } },
++		{ { 25, 31, 8 }, { 31, 13, 22 } },
++		{ { 29, 17, 26 }, { 18, 27, 21 } },
++		{ { 29, 13, 17 }, { 9, 255, 17 } },
++		{ { 9, 21, 17 }, { 30, 27, 255 } },
++		{ { 18, 25, 20 }, { 29, 22, 28 } },
++		{ { 31, 26, 29 }, { 23, 17, 13 } },
++		{ { 25, 20, 8 }, { 20, 14, 16 } },
++		{ { 7, 26, 31 }, { 26, 21, 33 } },
++		{ { 14, 3, 23 }, { 255, 6, 7 } },
++		{ { 19, 30, 25 }, { 36, 29, 31 } },
++		{ { 26, 7, 21 }, { 23, 32, 27 } },
++		{ { 26, 17, 21 }, { 17, 19, 26 } },
++		{ { 18, 6, 20 }, { 255, 15, 20 } },
++		{ { 25, 18, 30 }, { 20, 35, 25 } },
++		{ { 19, 9, 21 }, { 255, 19, 32 } },
++		{ { 19, 31, 25 }, { 33, 16, 25 } },
++		{ { 7, 21, 19 }, { 26, 30, 33 } },
++		{ { 19, 7, 31 }, { 32, 23, 31 } },
++		{ { 24, 4, 18 }, { 39, 255, 35 } },
++		{ { 24, 30, 18 }, { 37, 29, 34 } },
++		{ { 30, 19, 5 }, { 25, 255, 37 } },
++		{ { 30, 24, 5 }, { 35, 40, 36 } },
++		{ { 27, 10, 4 }, { 42, 255, 39 } },
++		{ { 27, 24, 4 }, { 41, 34, 38 } },
++		{ { 24, 5, 11 }, { 37, 255, 41 } },
++		{ { 24, 27, 11 }, { 39, 43, 40 } },
++		{ { 15, 10, 27 }, { 255, 38, 43 } },
++		{ { 15, 27, 11 }, { 42, 41, 255 } },
++	};
++	config.gain.vertices = {
++		{ { 0.496926099f, 0.71234864f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.327923924f, 0.55621177f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.445136398f, 0.768117666f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.270167798f, 0.618697345f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.819695532f, 0.45036602f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.735028088f, 0.283691525f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.647353053f, 0.532908738f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.501409709f, 0.355029643f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.575193286f, 0.498908699f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.416975707f, 0.331852913f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.971146524f, 0.40137735f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.931242824f, 0.218739301f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.562393844f, 0.651132941f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.402248323f, 0.485924453f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.147963807f, 0.890662193f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 1.20695102f, 0.2034394f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.586967885f, 0.583489597f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.430586129f, 0.414714068f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.704803705f, 0.465460509f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.598021746f, 0.3120116f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.611417592f, 0.51587832f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.459048301f, 0.343471706f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.412425011f, 0.634280205f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.357652098f, 0.693407476f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.76759249f, 0.347797096f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.574381411f, 0.44396919f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.496084511f, 0.415380806f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.946590424f, 0.288984686f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.482321113f, 0.568528712f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.508777022f, 0.499101847f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.651412725f, 0.388736039f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.535232961f, 0.429675013f }, { {
++			{ 0.0f, 69.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 77.0f, 120.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 130.0f, 150.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 170.0f, 194.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 207.0f, 240.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 247.0f, 274.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ { 0.0f, 0.0f }, { {
++			{ 0.0f, 69.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 77.0f, 120.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 130.0f, 150.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 170.0f, 194.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 207.0f, 240.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 247.0f, 274.0f, { 0.0f, 0.0f, 0.0f } },
++		} } },
++		{ { 0.0f, 0.0f }, { {
++			{ 0.0f, 69.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 77.0f, 120.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 130.0f, 150.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 170.0f, 194.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 207.0f, 240.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 247.0f, 274.0f, { 0.0f, 0.0f, 0.0f } },
++		} } },
++		{ { 0.0f, 0.0f }, { {
++			{ 0.0f, 69.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 77.0f, 120.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 130.0f, 150.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 170.0f, 194.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 207.0f, 240.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 247.0f, 274.0f, { 0.0f, 0.0f, 0.0f } },
++		} } },
++		{ { 0.0f, 0.0f }, { {
++			{ 0.0f, 69.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 77.0f, 120.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 130.0f, 150.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 170.0f, 194.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 207.0f, 240.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 247.0f, 274.0f, { 0.0f, 0.0f, 0.0f } },
++		} } },
++		{ { 0.0f, 0.0f }, { {
++			{ 0.0f, 69.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 77.0f, 120.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 130.0f, 150.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 170.0f, 194.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 207.0f, 240.0f, { 0.0f, 0.0f, 0.0f } },
++			{ 247.0f, 274.0f, { 0.0f, 0.0f, 0.0f } },
++		} } },
++	};
++	config.gain.seeds = { 5, 19, 38, 41 };
++	config.gain.compensation = { {
++		{ 0.0f, 30.0f, { {
++			{ 0.0f, 2000.0f, { 1.09000003f, 1.0f, 0.959999979f } },
++			{ 2200.0f, 2350.0f, { 1.09000003f, 1.0f, 0.959999979f } },
++			{ 2650.0f, 3100.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.00999999f, 1.0f, 0.99000001f } },
++			{ 5000.0f, 5200.0f, { 1.00999999f, 1.0f, 0.99000001f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 50.0f, 100.0f, { {
++			{ 0.0f, 2000.0f, { 1.09000003f, 1.0f, 0.959999979f } },
++			{ 2200.0f, 2350.0f, { 1.09000003f, 1.0f, 0.959999979f } },
++			{ 2650.0f, 3100.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.00999999f, 1.0f, 0.99000001f } },
++			{ 5000.0f, 5200.0f, { 1.00999999f, 1.0f, 0.99000001f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 120.0f, 150.0f, { {
++			{ 0.0f, 2000.0f, { 1.09000003f, 1.0f, 0.959999979f } },
++			{ 2200.0f, 2350.0f, { 1.09000003f, 1.0f, 0.959999979f } },
++			{ 2650.0f, 3100.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.00999999f, 1.0f, 0.99000001f } },
++			{ 5000.0f, 5200.0f, { 1.00999999f, 1.0f, 0.99000001f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 160.0f, 180.0f, { {
++			{ 0.0f, 2000.0f, { 1.08000004f, 1.0f, 0.899999976f } },
++			{ 2200.0f, 2350.0f, { 1.08000004f, 1.0f, 0.899999976f } },
++			{ 2650.0f, 3100.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.01999998f, 1.0f, 0.99000001f } },
++			{ 5000.0f, 5200.0f, { 1.01999998f, 1.0f, 0.99000001f } },
++			{ 6450.0f, 6500.0f, { 1.01999998f, 1.0f, 0.99000001f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 190.0f, 210.0f, { {
++			{ 0.0f, 2000.0f, { 1.08000004f, 1.0f, 0.899999976f } },
++			{ 2200.0f, 2350.0f, { 1.08000004f, 1.0f, 0.899999976f } },
++			{ 2650.0f, 3100.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.970000029f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.01999998f, 1.0f, 0.99000001f } },
++			{ 5000.0f, 5200.0f, { 1.01999998f, 1.0f, 0.99000001f } },
++			{ 6450.0f, 6500.0f, { 1.01999998f, 1.0f, 0.99000001f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 220.0f, 240.0f, { {
++			{ 0.0f, 2000.0f, { 1.08000004f, 1.0f, 0.899999976f } },
++			{ 2200.0f, 2350.0f, { 1.08000004f, 1.0f, 0.899999976f } },
++			{ 2650.0f, 3100.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 5000.0f, 5200.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 250.0f, 270.0f, { {
++			{ 0.0f, 2000.0f, { 1.09000003f, 1.0f, 0.879999995f } },
++			{ 2200.0f, 2350.0f, { 1.09000003f, 1.0f, 0.879999995f } },
++			{ 2650.0f, 3100.0f, { 1.04999995f, 1.0f, 0.959999979f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 5000.0f, 5200.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 280.0f, 300.0f, { {
++			{ 0.0f, 2000.0f, { 1.09000003f, 1.0f, 0.879999995f } },
++			{ 2200.0f, 2350.0f, { 1.09000003f, 1.0f, 0.879999995f } },
++			{ 2650.0f, 3100.0f, { 1.04999995f, 1.0f, 0.959999979f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 5000.0f, 5200.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 320.0f, 335.0f, { {
++			{ 0.0f, 2000.0f, { 1.09000003f, 1.0f, 0.819999993f } },
++			{ 2200.0f, 2350.0f, { 1.09000003f, 1.0f, 0.819999993f } },
++			{ 2650.0f, 3100.0f, { 1.04999995f, 1.0f, 0.959999979f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 5000.0f, 5200.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 345.0f, 360.0f, { {
++			{ 0.0f, 2000.0f, { 1.03999996f, 1.0f, 0.819999993f } },
++			{ 2200.0f, 2350.0f, { 1.03999996f, 1.0f, 0.819999993f } },
++			{ 2650.0f, 3100.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 5000.0f, 5200.0f, { 1.01999998f, 1.0f, 1.01999998f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 370.0f, 385.0f, { {
++			{ 0.0f, 2000.0f, { 1.00999999f, 1.0f, 0.800000012f } },
++			{ 2200.0f, 2350.0f, { 1.00999999f, 1.0f, 0.800000012f } },
++			{ 2650.0f, 3100.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 5000.0f, 5200.0f, { 1.01999998f, 1.0f, 1.01999998f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++		{ 410.0f, 999.0f, { {
++			{ 0.0f, 2000.0f, { 1.00999999f, 1.0f, 0.800000012f } },
++			{ 2200.0f, 2350.0f, { 1.00999999f, 1.0f, 0.800000012f } },
++			{ 2650.0f, 3100.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3300.0f, 3400.0f, { 1.03999996f, 1.0f, 0.959999979f } },
++			{ 3600.0f, 3650.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 3900.0f, 4100.0f, { 1.0f, 1.0f, 0.99000001f } },
++			{ 4400.0f, 4700.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 5000.0f, 5200.0f, { 1.01999998f, 1.0f, 1.01999998f } },
++			{ 6450.0f, 6500.0f, { 1.0f, 1.0f, 1.0f } },
++			{ 7000.0f, 12000.0f, { 1.0f, 1.0f, 1.0f } },
++		} } },
++	} };
++	return config;
++}
++
++} /* namespace libcamera::qcom */

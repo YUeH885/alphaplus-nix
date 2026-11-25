@@ -1,0 +1,886 @@
+From f0af4eff38b7b52ec775c6a46aa56f51da535362 Mon Sep 17 00:00:00 2001
+From: yuzu <yuzu@local>
+Date: Sun, 22 Nov 2026 10:28:07 +0800
+Subject: [PATCH] qcom: add hardware LSC, BPC/BCC, ABF, GTM, Demux Gr/Gb, and
+ ColorSpace support
+
+---
+ src/libcamera/pipeline/qcom/lsc_calibration.h | 154 +++++++
+ src/libcamera/pipeline/qcom/qcom.cpp          | 400 +++++++++++++++++-
+ src/libcamera/pipeline/qcom/qcom_camss.h      |  71 ++++
+ 3 files changed, 618 insertions(+), 7 deletions(-)
+ create mode 100644 src/libcamera/pipeline/qcom/lsc_calibration.h
+
+diff --git a/src/libcamera/pipeline/qcom/lsc_calibration.h b/src/libcamera/pipeline/qcom/lsc_calibration.h
+new file mode 100644
+index 0000000..8ee02d0
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lsc_calibration.h
+@@ -0,0 +1,154 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++#include <libcamera/geometry.h>
++#include <libcamera/transform.h>
++
++#include "qcom_camss.h"
++
++namespace libcamera::qcom {
++
++struct LscEepromSpec {
++	uint32_t offset;
++	double cct;
++};
++
++struct LscTable {
++	double cct = 0.0;
++	/* Normalized gains (>= 1.0) in R, Gr, Gb, B order on a 17x13 mesh. */
++	std::array<std::array<float, QCOM_CAMSS_LSC_POINTS>, 4> gains{};
++};
++
++struct LscCalibration {
++	std::vector<LscTable> tables;
++};
++
++constexpr std::size_t kLscEepromPayloadBytes = 4 * QCOM_CAMSS_LSC_POINTS;
++constexpr std::size_t kLscEepromBlockBytes = kLscEepromPayloadBytes + 2;
++
++inline std::optional<LscTable>
++parseEepromLscBlock(const std::array<uint8_t, kLscEepromBlockBytes> &block,
++		    double cct)
++{
++	uint32_t sum = 0;
++	for (std::size_t i = 0; i < kLscEepromPayloadBytes; ++i)
++		sum += block[i];
++	uint16_t checksum = static_cast<uint16_t>(block[kLscEepromPayloadBytes]) |
++			    (static_cast<uint16_t>(block[kLscEepromPayloadBytes + 1]) << 8);
++	if (!sum || (sum & 0xffffU) != checksum)
++		return std::nullopt;
++
++	LscTable table;
++	table.cct = cct;
++	for (unsigned int ch = 0; ch < 4; ++ch) {
++		for (unsigned int i = 0; i < QCOM_CAMSS_LSC_POINTS; ++i) {
++			uint8_t val = block[ch * QCOM_CAMSS_LSC_POINTS + i];
++			if (!val)
++				return std::nullopt;
++			table.gains[ch][i] = 255.0f / static_cast<float>(val);
++		}
++	}
++	return table;
++}
++
++inline qcom_camss_lsc
++buildHardwareLsc(const LscCalibration &calibration, double cct,
++		 const Size &activeAreaSize, const Rectangle &analogCrop,
++		 Transform transform)
++{
++	qcom_camss_lsc out = {};
++	if (calibration.tables.empty())
++		return out;
++
++	/* Interpolate across sorted illuminant tables by active CCT. */
++	const LscTable *lo = &calibration.tables.front();
++	const LscTable *hi = &calibration.tables.back();
++	double alpha = 0.0;
++	if (calibration.tables.size() == 1 || cct <= lo->cct) {
++		hi = lo;
++	} else if (cct >= hi->cct) {
++		lo = hi;
++	} else {
++		for (std::size_t i = 0; i + 1 < calibration.tables.size(); ++i) {
++			if (cct <= calibration.tables[i + 1].cct) {
++				lo = &calibration.tables[i];
++				hi = &calibration.tables[i + 1];
++				double span = hi->cct - lo->cct;
++				alpha = span > 0.0 ? (cct - lo->cct) / span : 0.0;
++				break;
++			}
++		}
++	}
++
++	std::array<std::array<float, QCOM_CAMSS_LSC_POINTS>, 4> interp{};
++	for (unsigned int ch = 0; ch < 4; ++ch) {
++		for (unsigned int i = 0; i < QCOM_CAMSS_LSC_POINTS; ++i) {
++			interp[ch][i] = static_cast<float>(
++				lo->gains[ch][i] * (1.0 - alpha) +
++				hi->gains[ch][i] * alpha);
++		}
++	}
++
++	const double fullW = activeAreaSize.width ? static_cast<double>(activeAreaSize.width) : 1.0;
++	const double fullH = activeAreaSize.height ? static_cast<double>(activeAreaSize.height) : 1.0;
++	const bool validCrop = activeAreaSize.width > 0 && activeAreaSize.height > 0 &&
++			       analogCrop.width > 0 && analogCrop.height > 0;
++	const double cropX = validCrop ? static_cast<double>(analogCrop.x) : 0.0;
++	const double cropY = validCrop ? static_cast<double>(analogCrop.y) : 0.0;
++	const double cropW = validCrop ? static_cast<double>(analogCrop.width) : fullW;
++	const double cropH = validCrop ? static_cast<double>(analogCrop.height) : fullH;
++	const bool hflip = !!(transform & Transform::HFlip);
++	const bool vflip = !!(transform & Transform::VFlip);
++
++	auto sample = [&](unsigned int ch, double gx, double gy) -> uint16_t {
++		gx = std::clamp(gx, 0.0, static_cast<double>(QCOM_CAMSS_LSC_H_NUM - 1));
++		gy = std::clamp(gy, 0.0, static_cast<double>(QCOM_CAMSS_LSC_V_NUM - 1));
++		unsigned int x0 = static_cast<unsigned int>(std::floor(gx));
++		unsigned int y0 = static_cast<unsigned int>(std::floor(gy));
++		unsigned int x1 = std::min<unsigned int>(x0 + 1, QCOM_CAMSS_LSC_H_NUM - 1);
++		unsigned int y1 = std::min<unsigned int>(y0 + 1, QCOM_CAMSS_LSC_V_NUM - 1);
++		double fx = gx - x0;
++		double fy = gy - y0;
++		const auto &g = interp[ch];
++		double v00 = g[y0 * QCOM_CAMSS_LSC_H_NUM + x0];
++		double v10 = g[y0 * QCOM_CAMSS_LSC_H_NUM + x1];
++		double v01 = g[y1 * QCOM_CAMSS_LSC_H_NUM + x0];
++		double v11 = g[y1 * QCOM_CAMSS_LSC_H_NUM + x1];
++		double top = v00 * (1.0 - fx) + v10 * fx;
++		double bot = v01 * (1.0 - fx) + v11 * fx;
++		double gain = top * (1.0 - fy) + bot * fy;
++		return static_cast<uint16_t>(std::clamp<long>(std::lround(gain * 1024.0), 1024, 8191));
++	};
++
++	out.enable = 1;
++	for (unsigned int y = 0; y < QCOM_CAMSS_LSC_V_NUM; ++y) {
++		double ny = static_cast<double>(y) / (QCOM_CAMSS_LSC_V_NUM - 1);
++		if (vflip)
++			ny = 1.0 - ny;
++		double gy = ((cropY + ny * cropH) / fullH) * (QCOM_CAMSS_LSC_V_NUM - 1);
++
++		for (unsigned int x = 0; x < QCOM_CAMSS_LSC_H_NUM; ++x) {
++			double nx = static_cast<double>(x) / (QCOM_CAMSS_LSC_H_NUM - 1);
++			if (hflip)
++				nx = 1.0 - nx;
++			double gx = ((cropX + nx * cropW) / fullW) * (QCOM_CAMSS_LSC_H_NUM - 1);
++			unsigned int idx = y * QCOM_CAMSS_LSC_H_NUM + x;
++
++			out.r_q10[idx] = sample(0, gx, gy);
++			out.gr_q10[idx] = sample(1, gx, gy);
++			out.gb_q10[idx] = sample(2, gx, gy);
++			out.b_q10[idx] = sample(3, gx, gy);
++		}
++	}
++
++	return out;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 618b984..2f3363f 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -63,6 +63,7 @@
+ #include "libcamera/internal/v4l2_videodevice.h"
+ 
+ #include "qcom_camss.h"
++#include "lsc_calibration.h"
+ #include "fc4_engine.h"
+ #include "flicker_detector.h"
+ #include "lg_ae_motion.h"
+@@ -406,6 +407,45 @@ enum class GainModel {
+ 	SonyInverse1024,
+ };
+ 
++constexpr LscEepromSpec kImx363LscSpecs[] = {
++	{ 0x06fc, 3000.0 },
++	{ 0x0386, 4000.0 },
++	{ 0x0010, 5100.0 },
++};
++constexpr LscEepromSpec kS5k3m5LscSpecs[] = {
++	{ 0x06fc, 3000.0 },
++	{ 0x0386, 4000.0 },
++	{ 0x0010, 5100.0 },
++};
++constexpr LscEepromSpec kImx351LscSpecs[] = {
++	{ 0x0a00, 3000.0 },
++	{ 0x038a, 4000.0 },
++	{ 0x000c, 5100.0 },
++};
++constexpr LscEepromSpec kImx520LscSpecs[] = {
++	{ 0x0010, 5100.0 },
++};
++
++ColorSpace normalizePixColorSpace(const std::optional<ColorSpace> &requested)
++{
++	if (!requested)
++		return ColorSpace::Sycc;
++
++	static const ColorSpace kRec709Full{
++		ColorSpace::Primaries::Rec709,
++		ColorSpace::TransferFunction::Rec709,
++		ColorSpace::YcbcrEncoding::Rec709,
++		ColorSpace::Range::Full,
++	};
++	if (*requested == ColorSpace::Sycc ||
++	    *requested == ColorSpace::Rec709 ||
++	    *requested == ColorSpace::Smpte170m ||
++	    *requested == kRec709Full)
++		return *requested;
++
++	return ColorSpace::Sycc;
++}
++
+ struct SensorProfile {
+ 	const char *model;
+ 	uint32_t mediaBusCode;
+@@ -425,6 +465,8 @@ struct SensorProfile {
+ 	LgAwbPipelineConfiguration (*lgAwbConfiguration)() = nullptr;
+ 	LgAeFlatConfiguration (*lgAwbFlatConfiguration)() = nullptr;
+ 	std::array<unsigned int, 2> (*lgAwbEepromOffsets)() = nullptr;
++	const LscEepromSpec *lscEepromSpecs = nullptr;
++	std::size_t lscEepromSpecCount = 0;
+ 	const AeLuxZone *aeLuxZones;
+ 	std::size_t aeLuxZoneCount;
+ 	const AeExposureKnee *aeExposureKnees;
+@@ -459,6 +501,8 @@ constexpr SensorProfile kS5k3m5Profile = {
+ 	.lgAwbConfiguration = s5k3m5LgAwbPipelineConfiguration,
+ 	.lgAwbFlatConfiguration = s5k3m5LgAeFlatConfiguration,
+ 	.lgAwbEepromOffsets = s5k3m5LgAwbEepromOffsets,
++	.lscEepromSpecs = kS5k3m5LscSpecs,
++	.lscEepromSpecCount = std::size(kS5k3m5LscSpecs),
+ 	.aeLuxZones = kAeLuxZones,
+ 	.aeLuxZoneCount = std::size(kAeLuxZones),
+ 	.aeExposureKnees = kAeExposureKnees,
+@@ -493,6 +537,8 @@ constexpr SensorProfile kImx363Profile = {
+ 	.lgAwbConfiguration = imx363LgAwbPipelineConfiguration,
+ 	.lgAwbFlatConfiguration = imx363LgAeFlatConfiguration,
+ 	.lgAwbEepromOffsets = imx363LgAwbEepromOffsets,
++	.lscEepromSpecs = kImx363LscSpecs,
++	.lscEepromSpecCount = std::size(kImx363LscSpecs),
+ 	.aeLuxZones = kImx363AeLuxZones,
+ 	.aeLuxZoneCount = std::size(kImx363AeLuxZones),
+ 	.aeExposureKnees = kImx363AeExposureKnees,
+@@ -527,6 +573,8 @@ constexpr SensorProfile kImx351Profile = {
+ 	.lgAwbConfiguration = imx351LgAwbPipelineConfiguration,
+ 	.lgAwbFlatConfiguration = imx351LgAeFlatConfiguration,
+ 	.lgAwbEepromOffsets = imx351LgAwbEepromOffsets,
++	.lscEepromSpecs = kImx351LscSpecs,
++	.lscEepromSpecCount = std::size(kImx351LscSpecs),
+ 	.aeLuxZones = kImx351AeLuxZones,
+ 	.aeLuxZoneCount = std::size(kImx351AeLuxZones),
+ 	.aeExposureKnees = kImx351AeExposureKnees,
+@@ -559,6 +607,8 @@ constexpr SensorProfile kImx520Profile = {
+ 	.ccmEntries = kImx520CcmEntries,
+ 	.ccmEntryCount = std::size(kImx520CcmEntries),
+ 	.awbConfiguration = imx520AwbConfiguration,
++	.lscEepromSpecs = kImx520LscSpecs,
++	.lscEepromSpecCount = std::size(kImx520LscSpecs),
+ 	.aeLuxZones = kImx520AeLuxZones,
+ 	.aeLuxZoneCount = std::size(kImx520AeLuxZones),
+ 	.aeExposureKnees = kImx520AeExposureKnees,
+@@ -938,6 +988,11 @@ public:
+ 	Rectangle scalerCropRectangle() const;
+ 	Rectangle minScalerCropRectangle() const;
+ 	void syncBfRoi();
++	void syncDemux();
++	void syncBpc();
++	void syncAbf(bool force = false);
++	void syncGtm(bool force = false);
++	void syncLsc(bool force = false);
+ 	float estimateLux() const;
+ 	int32_t activeFlickerPeriod() const;
+ 	void applyAwbTemperature(int32_t cct);
+@@ -991,6 +1046,7 @@ public:
+ 	Size configuredPixSize_;
+ 	Size configuredSensorSize_;
+ 	PixelFormat configuredRawFormat_;
++	ColorSpace configuredColorSpace_ = ColorSpace::Sycc;
+ 
+ 	/* Statistics buffers. */
+ 	std::vector<uint32_t> awb_;
+@@ -1149,9 +1205,27 @@ public:
+ 	int32_t awbInitialCct_ = 0;
+ 	int32_t awbFrame_ = 0;
+ 	Size statsInputSize_;
++	Size activeAreaSize_;
+ 	Rectangle analogCrop_;
++	LscCalibration lscCalibration_;
++	double grGbRatio_ = 1.0;
+ 	bool hasScalerCrop_ = false;
+ 	bool hasBfRoi_ = false;
++	bool hasLsc_ = false;
++	bool hasDemux_ = false;
++	bool hasBpc_ = false;
++	bool hasAbf_ = false;
++	bool hasGtm_ = false;
++	bool abfProgrammed_ = false;
++	bool abfProgrammedEnabled_ = false;
++	double abfProgrammedGain_ = 0.0;
++	bool gtmProgrammed_ = false;
++	bool gtmProgrammedEnabled_ = false;
++	bool lscProgrammed_ = false;
++	bool lscProgrammedEnabled_ = false;
++	double lscProgrammedCct_ = 0.0;
++	Rectangle lscProgrammedCrop_{};
++	Transform lscProgrammedTransform_ = Transform::Identity;
+ 	bool bfRoiProgrammed_ = false;
+ 	qcom_camss_bf_roi activeBfRoi_ = {};
+ 	qcom_camss_bf_roi programmedBfRoi_ = {};
+@@ -1356,8 +1430,9 @@ CameraConfiguration::Status QcomCameraConfiguration::validate()
+ 			cfg.bufferCount = kBufferCount;
+ 			status = Adjusted;
+ 		}
+-		if (cfg.colorSpace != ColorSpace::Sycc) {
+-			cfg.colorSpace = ColorSpace::Sycc;
++		const ColorSpace colorSpace = normalizePixColorSpace(cfg.colorSpace);
++		if (cfg.colorSpace != colorSpace) {
++			cfg.colorSpace = colorSpace;
+ 			status = Adjusted;
+ 		}
+ 
+@@ -1539,6 +1614,9 @@ int QcomCameraData::bindVfeSlot(int slotIndex, MediaEntity *pixEntity,
+ 	boundSlot_ = slotIndex;
+ 	bfRoiProgrammed_ = false;
+ 	programmedBfRoi_ = {};
++	abfProgrammed_ = false;
++	gtmProgrammed_ = false;
++	lscProgrammed_ = false;
+ 	return 0;
+ }
+ 
+@@ -1700,6 +1778,18 @@ int QcomCameraData::init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
+ 			LOG(QcomPipeline, Error) << "Invalid IMX520 AWB calibration checksum";
+ 			return -EINVAL;
+ 		}
++		double grGbSum = 0.0;
++		unsigned int grGbCount = 0;
++		for (unsigned int i = 0; i < 2; ++i) {
++			std::array<uint8_t, 8> sub;
++			std::copy_n(block.begin() + i * 8, sub.size(), sub.begin());
++			if (auto r = awbEepromRatios(sub); r && (*r)[2] > 0.5f && (*r)[2] < 1.5f) {
++				grGbSum += (*r)[2];
++				grGbCount++;
++			}
++		}
++		if (grGbCount)
++			grGbRatio_ = std::clamp(grGbSum / grGbCount, 0.85, 1.15);
+ 		auto config = profile_.awbConfiguration();
+ 		QtiAwbCalibration calibration;
+ 		if (!calibration.configure(config.calibration, *measured)) {
+@@ -1710,7 +1800,8 @@ int QcomCameraData::init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
+ 		auto incandescent = calibration.forCct(2850);
+ 		LOG(QcomPipeline, Info) << "Loaded IMX520 AWB calibration from " << nvmem
+ 			<< std::setprecision(9) << ": daylight " << daylight.rg << " " << daylight.bg
+-			<< ", incandescent " << incandescent.rg << " " << incandescent.bg;
++			<< ", incandescent " << incandescent.rg << " " << incandescent.bg
++			<< ", Gr/Gb " << grGbRatio_;
+ 		qtiAwb_ = std::make_unique<QtiAwbFront>(std::move(config), std::move(calibration));
+ 	}
+ 
+@@ -1729,6 +1820,16 @@ int QcomCameraData::init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
+ 			LOG(QcomPipeline, Error) << "Invalid LG AWB calibration checksum";
+ 			return -EINVAL;
+ 		}
++		double grGbSum = 0.0;
++		unsigned int grGbCount = 0;
++		for (const auto &blk : blocks) {
++			if (auto r = awbEepromRatios(blk); r && (*r)[2] > 0.5f && (*r)[2] < 1.5f) {
++				grGbSum += (*r)[2];
++				grGbCount++;
++			}
++		}
++		if (grGbCount)
++			grGbRatio_ = std::clamp(grGbSum / grGbCount, 0.85, 1.15);
+ 		awbCalibration_ = *calibration;
+ 		auto config = profile_.lgAwbConfiguration();
+ 		awbMinimumGrayCount_ = config.minimumGrayCount;
+@@ -1743,10 +1844,42 @@ int QcomCameraData::init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
+ 			<< " AWB calibration from " << nvmem << std::setprecision(9)
+ 			<< ": daylight " << calibration->measured[0].red << " " << calibration->measured[0].blue
+ 			<< ", incandescent " << calibration->measured[1].red << " " << calibration->measured[1].blue
++			<< ", Gr/Gb " << grGbRatio_
+ 			<< ", valid " << calibration->valid[0] << " " << calibration->valid[1]
+ 			<< ", minimum gray count " << awbMinimumGrayCount_;
+ 	}
+ 
++	if (profile_.lscEepromSpecs && profile_.lscEepromSpecCount && !nvmem.empty()) {
++		lscCalibration_.tables.clear();
++		for (std::size_t i = 0; i < profile_.lscEepromSpecCount; ++i) {
++			const LscEepromSpec &spec = profile_.lscEepromSpecs[i];
++			std::array<uint8_t, kLscEepromBlockBytes> block;
++			if (readFile(nvmem, spec.offset, &block) != 0) {
++				LOG(QcomPipeline, Warning)
++					<< "Failed to read LSC EEPROM table at offset "
++					<< utils::hex(spec.offset) << " from " << nvmem;
++				continue;
++			}
++			auto table = parseEepromLscBlock(block, spec.cct);
++			if (!table) {
++				LOG(QcomPipeline, Warning)
++					<< "Invalid LSC EEPROM checksum at offset "
++					<< utils::hex(spec.offset) << " in " << nvmem;
++				continue;
++			}
++			lscCalibration_.tables.push_back(std::move(*table));
++		}
++		std::sort(lscCalibration_.tables.begin(), lscCalibration_.tables.end(),
++			  [](const LscTable &a, const LscTable &b) { return a.cct < b.cct; });
++		if (!lscCalibration_.tables.empty()) {
++			LOG(QcomPipeline, Info)
++				<< "Loaded " << lscCalibration_.tables.size()
++				<< " EEPROM LSC table(s) for " << sensorModel_
++				<< " (corner R gain " << std::setprecision(3)
++				<< lscCalibration_.tables.back().gains[0][0] << "x)";
++		}
++	}
++
+ 	ret = bindVfeSlot(0, pixEntity, videoEntity, rdiEntity, rawVideoEntity);
+ 	if (ret < 0) {
+ 		LOG(QcomPipeline, Error) << "Failed to bind initial VFE slot: " << ret;
+@@ -1826,6 +1959,11 @@ int QcomCameraData::init(MediaEntity *sensorEntity, MediaEntity *pixEntity,
+ 
+ 	hasScalerCrop_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_IFE_CROP);
+ 	hasBfRoi_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_BF_ROI);
++	hasLsc_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_LSC);
++	hasDemux_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_DEMUX);
++	hasBpc_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_BPC);
++	hasAbf_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_ABF);
++	hasGtm_ = pix_->controls().count(V4L2_CID_QCOM_CAMSS_GTM);
+ 
+ 	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
+ 	if (delays.exposureDelay != 2 || delays.gainDelay != 2) {
+@@ -2027,6 +2165,7 @@ int QcomCameraData::refreshSensorInfo(bool updateControls)
+ 		return ret;
+ 
+ 	statsInputSize_ = info.outputSize;
++	activeAreaSize_ = info.activeAreaSize;
+ 	analogCrop_ = info.analogCrop;
+ 	if (updateControls)
+ 		properties_.set(properties::ScalerCropMaximum, analogCrop_);
+@@ -2241,7 +2380,7 @@ int QcomCameraData::setFormats(bool updateControls)
+ 		V4L2DeviceFormat videoFormat;
+ 		videoFormat.fourcc = video_->toV4L2PixelFormat(formats::NV12);
+ 		videoFormat.size = pixOutputFormat.size;
+-		videoFormat.colorSpace = ColorSpace::Sycc;
++		videoFormat.colorSpace = configuredColorSpace_;
+ 
+ 		ret = video_->setFormat(&videoFormat);
+ 		if (ret < 0)
+@@ -2426,6 +2565,7 @@ void QcomCameraData::setManualAwb(double gainR, double gainB, std::optional<int3
+ 	}
+ 	interpolateCcm(profile_, colourTemperature_, ccmQ7_);
+ 	setIfeWb(awbGainR_, 1.0, awbGainB_);
++	syncLsc(false);
+ }
+ 
+ Rectangle QcomCameraData::scalerCropRectangle() const
+@@ -2903,6 +3043,7 @@ void QcomCameraData::fetchStats()
+ 		}
+ 		if (aeEnabled())
+ 			aeSettled = updateAe(sequence, *aecLuma_, appliedIndex, gain);
++		syncAbf(false);
+ 	}
+ 	aeSettled_ = aeSettled;
+ 	if (awbEnabled_ && awbMode_ == controls::AwbAuto)
+@@ -3231,6 +3372,7 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 		colourTemperature_ = result.cct;
+ 		interpolateCcm(profile_, colourTemperature_, ccmQ7_);
+ 		setIfeWb(result.gains[0], result.gains[1], result.gains[2]);
++		syncLsc(false);
+ 		if (result.faceFrame.detectedFrames && result.faceStatistics.count > 0)
+ 			reportedFaceScore_ = static_cast<uint8_t>(
+ 				std::clamp(std::round(result.faceResult.confidence * 100.0f), 0.0f, 100.0f));
+@@ -3344,6 +3486,7 @@ void QcomCameraData::updateAwb(bool aeSettled)
+ 	if (result.filtered.cct > 0) {
+ 		colourTemperature_ = result.filtered.cct;
+ 		interpolateCcm(profile_, colourTemperature_, ccmQ7_);
++		syncLsc(false);
+ 	}
+ 	/* The rear AWB filter reports state 2 once both gain ratios converge. */
+ 	awbLocked_ = result.filtered.state == 2;
+@@ -3463,6 +3606,226 @@ void QcomCameraData::syncBfRoi()
+ 	updateAfWeights();
+ }
+ 
++void QcomCameraData::syncDemux()
++{
++	if (!hasDemux_ || !pix_ || !pix_->isOpen())
++		return;
++
++	const double sqrtRatio = std::sqrt(std::clamp(grGbRatio_, 0.85, 1.15));
++	qcom_camss_demux demux = {};
++	demux.gain_q10[0] = 1024;
++	demux.gain_q10[1] = static_cast<uint16_t>(std::clamp<long>(std::lround(1024.0 / sqrtRatio), 512, 2048));
++	demux.gain_q10[2] = static_cast<uint16_t>(std::clamp<long>(std::lround(1024.0 * sqrtRatio), 512, 2048));
++	demux.gain_q10[3] = 1024;
++
++	struct v4l2_ext_control control = {};
++	struct v4l2_ext_controls controls = {};
++	control.id = V4L2_CID_QCOM_CAMSS_DEMUX;
++	control.size = sizeof(demux);
++	control.ptr = &demux;
++	controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++	controls.count = 1;
++	controls.controls = &control;
++	int ret = pix_->ioctl(VIDIOC_S_EXT_CTRLS, &controls);
++	if (ret)
++		LOG(QcomPipeline, Warning) << "Failed to program Demux gains: " << ret;
++}
++
++void QcomCameraData::syncBpc()
++{
++	if (!hasBpc_ || !pix_ || !pix_->isOpen())
++		return;
++
++	qcom_camss_bpc bpc = {};
++	bpc.enable = QCOM_CAMSS_BPC_ENABLE_BPC | QCOM_CAMSS_BPC_ENABLE_BCC;
++	bpc.sat_value = 4095;
++	bpc.fmax = 80;
++	bpc.fmin = 48;
++	bpc.bcc_offset = 256;
++	bpc.offset_hot = 256;
++	bpc.offset_cold = 256;
++
++	struct v4l2_ext_control control = {};
++	struct v4l2_ext_controls controls = {};
++	control.id = V4L2_CID_QCOM_CAMSS_BPC;
++	control.size = sizeof(bpc);
++	control.ptr = &bpc;
++	controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++	controls.count = 1;
++	controls.controls = &control;
++	int ret = pix_->ioctl(VIDIOC_S_EXT_CTRLS, &controls);
++	if (ret)
++		LOG(QcomPipeline, Warning) << "Failed to program BPC/BCC: " << ret;
++}
++
++void QcomCameraData::syncAbf(bool force)
++{
++	if (!hasAbf_ || !pix_ || !pix_->isOpen())
++		return;
++
++	const bool wantEnable = testPatternMode_ == controls::draft::TestPatternModeOff;
++	const double gain = std::clamp(aeGain_, 1.0, 16.0);
++	if (!force && abfProgrammed_) {
++		if (!wantEnable && !abfProgrammedEnabled_)
++			return;
++		if (wantEnable && abfProgrammedEnabled_ &&
++		    std::abs(gain - abfProgrammedGain_) < 0.35)
++			return;
++	}
++
++	qcom_camss_abf abf = {};
++	if (wantEnable) {
++		const double gainScale = std::sqrt(gain);
++		abf.enable = QCOM_CAMSS_ABF_ENABLE_FILTER |
++			     QCOM_CAMSS_ABF_ENABLE_CROSS_PLANE;
++		abf.act_th_r = 2;
++		abf.act_th_g = 1;
++		abf.act_th_b = 1;
++		abf.blk_pix_r = 2;
++		abf.blk_pix_g = 1;
++		abf.blk_pix_b = 1;
++		abf.bpc_max_shft = 2;
++		abf.bpc_min_shft = 2;
++		abf.bpc_offset = 64;
++		abf.spatial_wt[0] = 64;
++		abf.spatial_wt[1] = 48;
++		abf.spatial_wt[2] = 32;
++		abf.spatial_wt[3] = 16;
++		for (unsigned int i = 0; i < 8; ++i)
++			abf.curve_offset[i] = static_cast<uint8_t>(std::clamp<long>(
++				std::lround((4.0 + i * 1.5) * gainScale), 0, 255));
++		abf.edge_softness[0] = 32;
++		abf.edge_softness[1] = 32;
++		abf.edge_softness[2] = 8;
++		abf.edge_softness[3] = 8;
++		abf.noise_preserve_lo = 64;
++		abf.noise_preserve_span = 512;
++		abf.noise_preserve_base[0] = 192;
++		abf.noise_preserve_base[1] = 160;
++		for (unsigned int i = 0; i < QCOM_CAMSS_ABF_LUT_ENTRIES; ++i) {
++			const double norm = static_cast<double>(i) /
++					    (QCOM_CAMSS_ABF_LUT_ENTRIES - 1);
++			const double baseStd = 6.0 + 34.0 * std::sqrt(norm);
++			abf.noise_std_lut[i] = static_cast<uint16_t>(
++				std::clamp<long>(std::lround(baseStd * gainScale), 1, 511));
++		}
++	}
++
++	struct v4l2_ext_control control = {};
++	struct v4l2_ext_controls controls = {};
++	control.id = V4L2_CID_QCOM_CAMSS_ABF;
++	control.size = sizeof(abf);
++	control.ptr = &abf;
++	controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++	controls.count = 1;
++	controls.controls = &control;
++	int ret = pix_->ioctl(VIDIOC_S_EXT_CTRLS, &controls);
++	if (ret) {
++		LOG(QcomPipeline, Warning) << "Failed to program ABF 3.4: " << ret;
++		return;
++	}
++
++	abfProgrammed_ = true;
++	abfProgrammedEnabled_ = wantEnable;
++	abfProgrammedGain_ = gain;
++}
++
++void QcomCameraData::syncGtm(bool force)
++{
++	if (!hasGtm_ || !pix_ || !pix_->isOpen())
++		return;
++
++	const bool wantEnable = testPatternMode_ == controls::draft::TestPatternModeOff;
++	if (!force && gtmProgrammed_ && gtmProgrammedEnabled_ == wantEnable)
++		return;
++
++	static constexpr uint16_t kGtmXKnots[QCOM_CAMSS_GTM_ENTRIES] = {
++		0, 2, 4, 7, 13, 21, 31, 45, 62, 83,
++		107, 137, 169, 201, 233, 265, 297, 329, 361, 428,
++		463, 499, 538, 578, 621, 665, 712, 760, 811, 863,
++		919, 976, 1037, 1098, 1164, 1230, 1300, 1371, 1447, 1524,
++		1605, 1687, 1774, 1861, 1954, 2047, 2146, 2245, 2456, 2679,
++		2915, 3429, 3999, 4630, 5323, 6083, 6911, 7812, 8787, 9840,
++		10975, 12193, 13499, 14894, 16383,
++	};
++
++	qcom_camss_gtm gtm = {};
++	if (wantEnable) {
++		gtm.enable = 1;
++		for (unsigned int i = 0; i < QCOM_CAMSS_GTM_ENTRIES; ++i) {
++			const double t = static_cast<double>(kGtmXKnots[i]) / 16383.0;
++			const double lift = 1.0 + 0.06 * (1.0 - t) * (1.0 - t);
++			gtm.y_ratio_q12[i] = static_cast<uint32_t>(
++				std::clamp<long>(std::lround(4096.0 * lift), 0, 262143));
++		}
++	}
++
++	struct v4l2_ext_control control = {};
++	struct v4l2_ext_controls controls = {};
++	control.id = V4L2_CID_QCOM_CAMSS_GTM;
++	control.size = sizeof(gtm);
++	control.ptr = &gtm;
++	controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++	controls.count = 1;
++	controls.controls = &control;
++	int ret = pix_->ioctl(VIDIOC_S_EXT_CTRLS, &controls);
++	if (ret) {
++		LOG(QcomPipeline, Warning) << "Failed to program GTM 1.0: " << ret;
++		return;
++	}
++
++	gtmProgrammed_ = true;
++	gtmProgrammedEnabled_ = wantEnable;
++}
++
++void QcomCameraData::syncLsc(bool force)
++{
++	if (!hasLsc_ || !pix_ || !pix_->isOpen())
++		return;
++
++	const bool wantEnable = !lscCalibration_.tables.empty() &&
++				testPatternMode_ == controls::draft::TestPatternModeOff;
++	if (!force && lscProgrammed_) {
++		if (!wantEnable && !lscProgrammedEnabled_)
++			return;
++		if (wantEnable && lscProgrammedEnabled_ &&
++		    lscProgrammedCrop_ == analogCrop_ &&
++		    lscProgrammedTransform_ == transform_ &&
++		    (lscCalibration_.tables.size() <= 1 ||
++		     std::abs(colourTemperature_ - lscProgrammedCct_) < 150.0))
++			return;
++	}
++
++	qcom_camss_lsc lsc = {};
++	if (wantEnable) {
++		const Size fullSize = activeAreaSize_.isNull()
++			? profile_.fullInputSize
++			: activeAreaSize_;
++		lsc = buildHardwareLsc(lscCalibration_, colourTemperature_,
++				       fullSize, analogCrop_, transform_);
++	}
++
++	struct v4l2_ext_control control = {};
++	struct v4l2_ext_controls controls = {};
++	control.id = V4L2_CID_QCOM_CAMSS_LSC;
++	control.size = sizeof(lsc);
++	control.ptr = &lsc;
++	controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++	controls.count = 1;
++	controls.controls = &control;
++	int ret = pix_->ioctl(VIDIOC_S_EXT_CTRLS, &controls);
++	if (ret) {
++		LOG(QcomPipeline, Warning) << "Failed to program LSC mesh: " << ret;
++		return;
++	}
++
++	lscProgrammed_ = true;
++	lscProgrammedEnabled_ = wantEnable;
++	lscProgrammedCct_ = colourTemperature_;
++	lscProgrammedCrop_ = analogCrop_;
++	lscProgrammedTransform_ = transform_;
++}
++
+ void QcomCameraData::updateAfWeights()
+ {
+ 	afWeights_.fill(0.0);
+@@ -3806,7 +4169,14 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		int ret = sensor_->setTestPatternMode(static_cast<controls::draft::TestPatternModeEnum>(*mode));
+ 		if (ret)
+ 			return ret < 0 ? ret : -EIO;
+-		testPatternMode_ = *mode;
++		if (testPatternMode_ != *mode) {
++			testPatternMode_ = *mode;
++			if (pixConfigured_) {
++				syncAbf(true);
++				syncGtm(true);
++				syncLsc(true);
++			}
++		}
+ 	}
+ 	bool afWindowUpdated = false;
+ 	if (auto metering = controls.get(controls::AfMetering)) {
+@@ -3845,8 +4215,11 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 						static_cast<double>(exposureMax_));
+ 	}
+ 	if (!autoGain_) {
+-		if (auto gain = controls.get(controls::AnalogueGain))
++		if (auto gain = controls.get(controls::AnalogueGain)) {
+ 			aeGain_ = std::clamp(static_cast<double>(*gain), gainMin_, gainMax_);
++			if (pixConfigured_)
++				syncAbf(false);
++		}
+ 	}
+ 	if (resumeAuto && aeLocked_) {
+ 		const int32_t expLines = std::lround(aeExposure_);
+@@ -4442,13 +4815,17 @@ int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
+ 	const Size previousPixSize = data->configuredPixSize_;
+ 	const Size previousSensorSize = data->configuredSensorSize_;
+ 	const PixelFormat previousRawFormat = data->configuredRawFormat_;
++	const ColorSpace previousColorSpace = data->configuredColorSpace_;
+ 
+ 	data->transform_ = qcomConfig->transform_;
+ 	data->pixConfigured_ = qcomConfig->pixIndex_.has_value();
+ 	data->rawConfigured_ = qcomConfig->rawIndex_.has_value();
+ 	data->configuredSensorSize_ = qcomConfig->sensorSize_;
+-	if (qcomConfig->pixIndex_)
++	if (qcomConfig->pixIndex_) {
+ 		data->configuredPixSize_ = config->at(*qcomConfig->pixIndex_).size;
++		data->configuredColorSpace_ =
++			normalizePixColorSpace(config->at(*qcomConfig->pixIndex_).colorSpace);
++	}
+ 	if (qcomConfig->rawIndex_)
+ 		data->configuredRawFormat_ = qcomConfig->rawFormat_;
+ 
+@@ -4460,6 +4837,7 @@ int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
+ 		data->configuredPixSize_ = previousPixSize;
+ 		data->configuredSensorSize_ = previousSensorSize;
+ 		data->configuredRawFormat_ = previousRawFormat;
++		data->configuredColorSpace_ = previousColorSpace;
+ 		return ret;
+ 	}
+ 
+@@ -4606,6 +4984,9 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->testPatternMode_ = controls::draft::TestPatternModeOff;
+ 	data->bfRoiProgrammed_ = false;
+ 	data->programmedBfRoi_ = {};
++	data->abfProgrammed_ = false;
++	data->gtmProgrammed_ = false;
++	data->lscProgrammed_ = false;
+ 	if (data->pixConfigured_)
+ 		data->syncBfRoi();
+ 	data->fc4StableCount_ = 0;
+@@ -4633,6 +5014,11 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 
+ 	if (data->pixConfigured_) {
+ 		data->resetAwb();
++		data->syncDemux();
++		data->syncBpc();
++		data->syncAbf(true);
++		data->syncGtm(true);
++		data->syncLsc(true);
+ 		ret = data->applyIfe(0);
+ 		if (ret)
+ 			return ret;
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+index b7e33e8..9f35d3d 100644
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -26,6 +26,77 @@ struct qcom_camss_bf_roi {
+ 	uint16_t height;
+ };
+ 
++#define V4L2_CID_QCOM_CAMSS_LSC (V4L2_CID_USER_BASE + 0x1253)
++#define V4L2_CID_QCOM_CAMSS_DEMUX (V4L2_CID_USER_BASE + 0x1254)
++#define V4L2_CID_QCOM_CAMSS_BPC (V4L2_CID_USER_BASE + 0x1255)
++#define V4L2_CID_QCOM_CAMSS_ABF (V4L2_CID_USER_BASE + 0x1256)
++#define V4L2_CID_QCOM_CAMSS_GTM (V4L2_CID_USER_BASE + 0x1257)
++
++#define QCOM_CAMSS_LSC_H_NUM 17
++#define QCOM_CAMSS_LSC_V_NUM 13
++#define QCOM_CAMSS_LSC_POINTS (QCOM_CAMSS_LSC_H_NUM * QCOM_CAMSS_LSC_V_NUM)
++
++struct qcom_camss_lsc {
++	uint32_t enable;
++	uint16_t r_q10[QCOM_CAMSS_LSC_POINTS];
++	uint16_t gr_q10[QCOM_CAMSS_LSC_POINTS];
++	uint16_t gb_q10[QCOM_CAMSS_LSC_POINTS];
++	uint16_t b_q10[QCOM_CAMSS_LSC_POINTS];
++};
++
++struct qcom_camss_demux {
++	uint16_t gain_q10[4];
++};
++
++#define QCOM_CAMSS_BPC_ENABLE_BPC (1U << 0)
++#define QCOM_CAMSS_BPC_ENABLE_BCC (1U << 1)
++#define QCOM_CAMSS_BPC_ENABLE_CROSSTALK (1U << 2)
++
++struct qcom_camss_bpc {
++	uint32_t enable;
++	uint16_t sat_value;
++	uint16_t fmax;
++	uint16_t fmin;
++	uint16_t bcc_offset;
++	uint16_t offset_hot;
++	uint16_t offset_cold;
++};
++
++#define QCOM_CAMSS_ABF_LUT_ENTRIES 65
++
++#define QCOM_CAMSS_ABF_ENABLE_FILTER (1U << 0)
++#define QCOM_CAMSS_ABF_ENABLE_SINGLE_BPC (1U << 1)
++#define QCOM_CAMSS_ABF_ENABLE_CROSS_PLANE (1U << 2)
++
++struct qcom_camss_abf {
++	uint32_t enable;
++	uint8_t act_th_r;
++	uint8_t act_th_g;
++	uint8_t act_th_b;
++	uint8_t blk_pix_r;
++	uint8_t blk_pix_g;
++	uint8_t blk_pix_b;
++	uint8_t bpc_max_shft;
++	uint8_t bpc_min_shft;
++	uint16_t bpc_offset;
++	uint16_t reserved;
++	uint8_t spatial_wt[4];
++	uint8_t curve_offset[8];
++	uint8_t edge_softness[4];
++	uint16_t noise_preserve_lo;
++	uint16_t noise_preserve_span;
++	uint16_t noise_preserve_base[2];
++	uint16_t noise_std_lut[QCOM_CAMSS_ABF_LUT_ENTRIES];
++	uint16_t reserved1;
++};
++
++#define QCOM_CAMSS_GTM_ENTRIES 65
++
++struct qcom_camss_gtm {
++	uint32_t enable;
++	uint32_t y_ratio_q12[QCOM_CAMSS_GTM_ENTRIES];
++};
++
+ #define QCOM_CAMSS_IFE_CONFIG_BLACK_LEVEL (1U << 0)
+ #define QCOM_CAMSS_IFE_CONFIG_WHITE_BALANCE (1U << 1)
+ #define QCOM_CAMSS_IFE_CONFIG_CCM (1U << 2)
+-- 
+2.55.0
+
