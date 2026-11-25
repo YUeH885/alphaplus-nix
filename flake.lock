@@ -1,0 +1,63 @@
+{
+  "nodes": {
+    "linux-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1795522064,
+        "narHash": "sha256-r0VIxXjg/oVyblXBfk5rl8E6oE1D9LgNAsk71dJKZGg=",
+        "owner": "YUeH885",
+        "repo": "linux",
+        "rev": "01098fc31bc4ae457a135a274d088d5794f217ca",
+        "type": "github"
+      },
+      "original": {
+        "owner": "YUeH885",
+        "ref": "alphaplus-7.3.y",
+        "repo": "linux",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1794537146,
+        "narHash": "sha256-Wpz/7x/YWnDIBu7yj6ixe8j6fIMsidd9Y+o1PqPF3iM=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "d5cc6833999746cffdfe0598f7bc801a57b887a9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "linux-src": "linux-src",
+        "nixpkgs": "nixpkgs",
+        "uboot-src": "uboot-src"
+      }
+    },
+    "uboot-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794989419,
+        "narHash": "sha256-0zvBzmMStNve4bOWFJoiS/t8RWU6NSChMrg53Mwrb2o=",
+        "owner": "YUeH885",
+        "repo": "u-boot",
+        "rev": "15b639899ccebee2b8b9ee828cc651687407b5a3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "YUeH885",
+        "ref": "alphaplus-v2026.10",
+        "repo": "u-boot",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
