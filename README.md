@@ -17,7 +17,7 @@ LG G8 ThinQ（`LM-G820N`，Qualcomm SM8150 / `alphaplus` 韩版）的 NixOS Flak
 | CDSP | 部分 | `remoteproc_cdsp` + `hexagonrpcd` 基础计算通路可用；缺 HVX/NN 运行时与安全计算域 | [cdsp.md](docs/components/cdsp.md) |
 | VPU | 部分 | Iris 1.xx 4K H.264/HEVC/VP9 解码与 H.264/HEVC 编码；缺 UBWC 零拷贝与动态带宽 | [vpu.md](docs/components/vpu.md) |
 | 辅助外设 | 部分 | PM8941 RTC、PN547 NFC（`neard` + 托盘读写 UI）、PM8150L 闪光灯与托盘手电筒；缺 Goodix 指纹与 HCE | [auxiliary-peripherals.md](docs/components/auxiliary-peripherals.md) |
-| 传感器 | 部分 | SLPI FastRPC + `hexagonrpc` + `libssc` + `iio-sensor-proxy`；缺 `atmf04` SAR | [sensors.md](docs/components/sensors.md) |
+| 传感器 | 可用 | SLPI FastRPC + `hexagonrpc` + `libssc` + `iio-sensor-proxy` | [sensors.md](docs/components/sensors.md) |
 
 ## 快速开始
 
