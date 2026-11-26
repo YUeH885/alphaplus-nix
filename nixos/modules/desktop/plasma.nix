@@ -3,6 +3,23 @@
 let
   helpers = pkgs.alphaplus-desktop-helpers;
   powerdevilrc = ../../files/desktop/user-config/powerdevilrc;
+  plasmaDialer = pkgs.symlinkJoin {
+    name = "plasma-dialer-alphaplus";
+    paths = [ pkgs.kdePackages.plasma-dialer ];
+    postBuild = ''
+      rm "$out/share/dbus-1/services/org.kde.modemdaemon.service" \
+         "$out/etc/xdg/autostart/org.kde.modem.daemon.desktop"
+      for iface in CallUtils DeviceUtils UssdUtils; do
+        name="org.kde.telephony.$iface"
+        cat > "$out/share/dbus-1/services/$name.service" <<EOF
+      [D-BUS Service]
+      Name=$name
+      Exec=${lib.getExe' pkgs.imsd-alphaplus "imsd-dialerd"}
+      SystemdService=imsd-dialerd.service
+      EOF
+      done
+    '';
+  };
   qrcaWithLibcamera = let
     pluginPath = lib.makeSearchPath "lib/gstreamer-1.0" (with pkgs; [
       libcamera-alphaplus
@@ -48,10 +65,25 @@ in
   };
   programs.kde-pim.enable = false;
   programs.kdeconnect.enable = true;
+  services.dbus.packages = [ plasmaDialer pkgs.spacebar-alphaplus pkgs.callaudiod ];
+  systemd.user.services.imsd-dialerd = {
+    description = "Plasma Dialer IMS bridge";
+    after = [ "dbus.service" ];
+    partOf = [ "graphical-session.target" ];
+    wantedBy = [ "plasma-workspace.target" ];
+    serviceConfig = {
+      Type = "dbus";
+      BusName = "org.kde.telephony.CallUtils";
+      ExecStart = lib.getExe' pkgs.imsd-alphaplus "imsd-dialerd";
+      Restart = "on-failure";
+      RestartSec = "1s";
+    };
+  };
   # Keep 70-alphaplus-uinput.rules (GROUP="input") instead of NixOS 99-local.rules (GROUP="uinput").
   hardware.uinput.enable = false;
   environment.plasma6.excludePackages = with pkgs.kdePackages; [
     plasma-workspace-wallpapers
+    plasma-nm
     qrca
   ];
 
@@ -65,6 +97,10 @@ in
     helpers
     alphaplus-flashlight
     alphaplus-bypass-charging
+    plasma-nm-alphaplus
+    plasmaDialer
+    spacebar-alphaplus
+    callaudiod
     chromium
     libcamera-alphaplus
     gst_all_1.gstreamer

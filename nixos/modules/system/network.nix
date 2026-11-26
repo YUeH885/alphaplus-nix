@@ -1,11 +1,37 @@
 { config, pkgs, lib, ... }:
 
+let
+  hotspotIpv6Script = pkgs.runCommand "alphaplus-hotspot-ipv6" { } ''
+    install -Dm755 ${../../files/network/hotspot-ipv6.py} "$out"
+    substituteInPlace "$out" \
+      --replace-fail "#!/usr/bin/env python3" "#!${lib.getExe pkgs.python3}" \
+      --replace-fail "@ip@" "${lib.getExe' pkgs.iproute2 "ip"}" \
+      --replace-fail "@nft@" "${lib.getExe' pkgs.nftables "nft"}" \
+      --replace-fail "@nmcli@" "${lib.getExe' pkgs.networkmanager-alphaplus "nmcli"}" \
+      --replace-fail "@radvd@" "${lib.getExe' pkgs.radvd "radvd"}" \
+      --replace-fail "@sysctl@" "${lib.getExe' pkgs.procps "sysctl"}"
+  '';
+in
 {
   networking.hostName = "alphaplus";
   networking.firewall.enable = false;
+  boot.kernel.sysctl = {
+    "net.ipv6.conf.all.accept_ra" = 2;
+    "net.ipv6.conf.default.accept_ra" = 2;
+  };
+  environment.etc."NetworkManager/dnsmasq-shared.d/hotspot.conf".text = ''
+    resolv-file=/run/NetworkManager/no-stub-resolv.conf
+  '';
   networking.networkmanager = {
     enable = true;
+    package = pkgs.networkmanager-alphaplus;
     dns = "systemd-resolved";
+    dispatcherScripts = [
+      {
+        source = hotspotIpv6Script;
+        type = "basic";
+      }
+    ];
     wifi = {
       backend = "wpa_supplicant";
       macAddress = "permanent";

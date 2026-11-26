@@ -80,6 +80,17 @@ in
 
   environment.systemPackages = [ alsaCardProfiles pkgs.alsa-utils ];
 
+  systemd.services.alphaplus-call-audio = {
+    description = "LG alphaplus modem call audio";
+    after = [ "ModemManager.service" ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      ExecStart = lib.getExe pkgs.alphaplus-call-audio;
+      Restart = "on-failure";
+      RestartSec = "1s";
+    };
+  };
+
   environment.etc."alsa/conf.d/51-alphaplus.conf".source =
     ../../files/alsa/51-alphaplus.conf;
 }
