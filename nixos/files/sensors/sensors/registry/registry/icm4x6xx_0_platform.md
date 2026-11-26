@@ -1,1 +1,0 @@
-{"icm4x6xx_0_platform.md":{"owner":"sns_icm4x6xx","config":{"type":"grp","ver":"0","data":""}}}

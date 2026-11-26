@@ -1,1 +1,0 @@
-{"apds9999_platform.proximity.fac_cal":{"owner":"sns_apds9999","near_threshold":{"type":"flt","ver":"1","data":"400.000000"},"far_threshold":{"type":"flt","ver":"1","data":"350.000000"},"offset_cancellation":{"type":"flt","ver":"1","data":"0.000000"},"version":{"type":"flt","ver":"1","data":"1.000000"}}}
