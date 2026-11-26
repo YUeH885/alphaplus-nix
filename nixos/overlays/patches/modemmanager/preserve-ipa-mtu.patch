@@ -1,0 +1,16 @@
+--- a/src/mm-port-qmi.c
++++ b/src/mm-port-qmi.c
+@@ -1004,10 +1004,12 @@
+     ctx->device = g_object_ref (device);
+     g_task_set_task_data (task, ctx, (GDestroyNotify) internal_reset_context_free);
+ 
+-    /* mhi_net has a custom default MTU set by the kernel driver */
++    /* mhi_net and ipa use custom default MTUs set by their kernel drivers */
+     if (g_strcmp0 (self->priv->net_driver, "mhi_net") == 0)
+         mtu = MHI_NET_MTU_DEFAULT;
++    else if (g_strcmp0 (self->priv->net_driver, "ipa") == 0)
++        mtu = 0;
+     else
+         mtu = MM_PORT_NET_MTU_DEFAULT;
+ 
+     /* first, bring down main interface */

@@ -1,0 +1,20 @@
+--- a/serviceproviders.xml
++++ b/serviceproviders.xml
+@@ -2958,6 +2958,17 @@
+ 			<sid value="11298"/>
+ 		</cdma>
+ 	</provider>
++	<provider>
++		<name>China Broadnet</name>
++		<gsm>
++			<network-id mcc="460" mnc="15"/>
++			<apn value="cbnet">
++				<plan type="postpaid"/>
++				<usage type="internet"/>
++				<name>CBNET</name>
++			</apn>
++		</gsm>
++	</provider>
+ </country>
+ 
+ <country code="cr">

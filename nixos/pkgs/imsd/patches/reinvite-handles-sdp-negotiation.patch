@@ -1,0 +1,404 @@
+diff --git a/interfaces/Imsd-Engine.cppm b/interfaces/Imsd-Engine.cppm
+index 607b7bc..305435c 100644
+--- a/interfaces/Imsd-Engine.cppm
++++ b/interfaces/Imsd-Engine.cppm
+@@ -318,6 +318,7 @@ export namespace imsd::engine {
+         std::optional<int> dtmfPt;
+         std::optional<int> dtmfRxPt;
+         bool Valid() const { return !remoteIp.empty() && remotePort > 0 && payloadType >= 0; }
++        bool operator==(const MediaLeg&) const = default;
+     };
+ 
+     struct Action {
+@@ -412,13 +413,7 @@ export namespace imsd::engine {
+             if (attemptSos_) sosTried_ = true;
+             else
+                 plainTried_ = true;
+-            imsd::sdp::Offer offer;
+-            offer.local = ctx_.local;
+-            offer.rtpPort = rtpPort_;
+-            offer.sessionId = rng_.UInt(1000000, 9999999);
+-            offer.precond = precond_;
+-            offer.codecs = codecs_;
+-            std::string sdp = imsd::sdp::BuildOffer(offer);
++            std::string sdp = imsd::sdp::BuildOffer(MakeOffer());
+             std::vector<Action> a;
+             inviteOut_ = imsd::msg::BuildInvite(ctx_, d_, sdp, precond_);
+             a.push_back(Send(inviteOut_));
+@@ -474,7 +469,7 @@ export namespace imsd::engine {
+         std::vector<Action> OnInvite() {
+             std::vector<Action> a;
+             if (direction_ != Direction::Incoming || state_ != CallState::Incoming) return a;
+-            MediaLeg leg = ParseAnswer();
++            MediaLeg leg = ParseAnswer(/*weOffered=*/false);
+             if (!leg.Valid() || leg.codec.empty()) {
+                 a.push_back(Respond(imsd::msg::BuildInviteResponse(ctx_, invite_, 488, "Not Acceptable Here", d_.itag)));
+                 std::string why = !leg.Valid() ? "no usable audio line"
+@@ -497,21 +492,12 @@ export namespace imsd::engine {
+         }
+ 
+         // UAS: the user answered. 200 OK with the SDP answer (the offer's own
+-        // payload types, RFC 3264), media up, active. The caller's ACK needs
+-        // no action when it arrives (OnRequest ignores ACK).
++        // payload types, RFC 3264), media up, active.
+         std::vector<Action> OnAccept() {
+             std::vector<Action> a;
+             if (direction_ != Direction::Incoming || state_ != CallState::Incoming) return a;
+-            MediaLeg leg = ParseAnswer();
+-            imsd::sdp::AnswerSpec spec;
+-            spec.local = ctx_.local;
+-            spec.rtpPort = rtpPort_;
+-            spec.sessionId = rng_.UInt(1000000, 9999999);
+-            spec.payloadType = leg.payloadType;
+-            spec.octetAlign = leg.octetAlign;
+-            spec.codec = leg.codec;
+-            spec.dtmfPt = leg.dtmfPt;
+-            localSdp_ = imsd::sdp::BuildAnswer(spec);
++            MediaLeg leg = ParseAnswer(/*weOffered=*/false);
++            localSdp_ = BuildSdpAnswer(leg);
+             // session timers: echo the caller's Session-Expires; with no
+             // refresher stated, make the caller (uac) the refresher — its
+             // re-INVITE/UPDATE refreshes get 200d by OnRequest.
+@@ -574,7 +560,7 @@ export namespace imsd::engine {
+                 // wanted — the user never hung up. Matters most when the sos
+                 // attempt is answered at the wire just as the timeout fires:
+                 // BYEing an answering PSAP is the worst possible outcome.
+-                MediaLeg leg = ParseAnswer();
++                MediaLeg leg = ParseAnswer(/*weOffered=*/true);
+                 a.push_back(StartMediaAct(leg));
+                 state_ = CallState::Active;
+                 a.push_back(StateAct("accepted"));
+@@ -598,10 +584,20 @@ export namespace imsd::engine {
+         std::vector<Action> OnRequest(std::string_view msg) {
+             std::vector<Action> a;
+             std::string_view method = Method(msg);
+-            if (method == "ACK")
+-                return a;   // ACK is never responded to (RFC 3261 17.1.1.2)
+             std::string_view body = imsd::sip::Body(msg);
+-            if (body.contains("m=audio")) answerSdp_ = std::string(body);
++            const bool hasAudioSdp = body.contains("m=audio");
++            if (method == "ACK") {
++                if (state_ == CallState::Active && hasAudioSdp && awaitingOfferAck_) {
++                    awaitingOfferAck_ = false;
++                    answerSdp_ = std::string(body);
++                    MediaLeg leg = ParseAnswer(/*weOffered=*/true);
++                    if (leg.Valid() && !leg.codec.empty() && (!activeMedia_ || *activeMedia_ != leg)) {
++                        if (activeMedia_) a.push_back(Action{Action::Type::StopMedia});
++                        a.push_back(StartMediaAct(leg));
++                    }
++                }
++                return a;   // ACK is never responded to (RFC 3261 17.1.1.2)
++            }
+             if (direction_ == Direction::Incoming && state_ == CallState::Incoming) {
+                 if (method == "CANCEL") {
+                     // the caller gave up: 200 the CANCEL transaction, 487 the
+@@ -620,21 +616,29 @@ export namespace imsd::engine {
+             }
+             if (method == "UPDATE" || method == "INVITE") {
+                 std::optional<std::string> ans;
+-                if (direction_ == Direction::Incoming) {
+-                    // session-refresh: re-state the answer we gave if the
+-                    // refresh carries an offer; a bodyless refresh gets a
+-                    // bodyless 200 (RFC 3311/4028)
+-                    if (body.contains("m=audio")) ans = localSdp_;
+-                } else {
+-                    imsd::sdp::Offer offer;
+-                    offer.local = ctx_.local;
+-                    offer.rtpPort = rtpPort_;
+-                    offer.sessionId = rng_.UInt(1000000, 9999999);
+-                    offer.precond = precond_;
+-                    offer.currRemote = "sendrecv";
+-                    offer.codecs = codecs_;
+-                    ans = imsd::sdp::BuildOffer(offer);
++                std::optional<MediaLeg> updatedMedia;
++                if (hasAudioSdp) {
++                    MediaLeg leg = ParseSdp(body, /*weOffered=*/false);
++                    if (!leg.Valid() || leg.codec.empty()) {
++                        a.push_back(Respond(imsd::msg::BuildResponse(
++                            ctx_, msg, 488, "Not Acceptable Here", d_.itag)));
++                        return a;
++                    }
++                    localSdp_ = BuildSdpAnswer(leg);
++                    ans = localSdp_;
++                    if (state_ == CallState::Active) {
++                        answerSdp_ = std::string(body);
++                        awaitingOfferAck_ = false;
++                        if (!activeMedia_ || *activeMedia_ != leg)
++                            updatedMedia = leg;
++                    }
++                } else if (method == "INVITE") {
++                    // RFC 3261 14.2: a re-INVITE without SDP requests our offer in 200 OK;
++                    // the peer's answer arrives in ACK (above).
++                    ans = imsd::sdp::BuildOffer(MakeOffer(/*currRemote=*/"sendrecv"));
++                    awaitingOfferAck_ = true;
+                 }
++                if (auto ct = imsd::sip::Header(msg, "Contact")) d_.remoteTarget = AngleUri(*ct);
+                 // RFC 4028 §9: a 2xx to a refresh MUST echo Session-Expires,
+                 // or the refresher treats the session as unrefreshed. KPN's
+                 // B2BUA audits ~55 s into every call with such an UPDATE and
+@@ -647,6 +651,10 @@ export namespace imsd::engine {
+                     extra.push_back("Require: timer");
+                 }
+                 a.push_back(Respond(imsd::msg::BuildResponse200(ctx_, msg, ans ? std::optional<std::string_view>(*ans) : std::nullopt, extra)));
++                if (updatedMedia) {
++                    if (activeMedia_) a.push_back(Action{Action::Type::StopMedia});
++                    a.push_back(StartMediaAct(*updatedMedia));
++                }
+             } else if (method == "BYE") {
+                 a.push_back(Respond(imsd::msg::BuildResponse200(ctx_, msg)));
+                 Append(a, Finish("remote-hangup", WithReason("remote BYE", msg)));
+@@ -809,6 +817,44 @@ export namespace imsd::engine {
+         std::set<std::string> pracked_;
+         std::string answerSdp_;
+         std::optional<int> dtmfPt_;    // the running leg's telephone-event pt, set at media start
++        std::optional<MediaLeg> activeMedia_;
++        std::uint64_t localSessionId_ = 0;
++        std::uint64_t localSessionVersion_ = 0;
++        bool awaitingOfferAck_ = false;
++
++        std::uint64_t NextSessionVersion() {
++            if (!localSessionId_) {
++                localSessionId_ = rng_.UInt(1000000, 9999999);
++                localSessionVersion_ = localSessionId_;
++                return localSessionVersion_;
++            }
++            return ++localSessionVersion_;
++        }
++
++        imsd::sdp::Offer MakeOffer(std::string_view currRemote = "none") {
++            imsd::sdp::Offer offer;
++            offer.local = ctx_.local;
++            offer.rtpPort = rtpPort_;
++            offer.sessionVersion = NextSessionVersion();
++            offer.sessionId = localSessionId_;
++            offer.precond = precond_;
++            offer.currRemote = std::string(currRemote);
++            offer.codecs = codecs_;
++            return offer;
++        }
++
++        std::string BuildSdpAnswer(const MediaLeg& leg) {
++            imsd::sdp::AnswerSpec spec;
++            spec.local = ctx_.local;
++            spec.rtpPort = rtpPort_;
++            spec.sessionVersion = NextSessionVersion();
++            spec.sessionId = localSessionId_;
++            spec.payloadType = leg.payloadType;
++            spec.octetAlign = leg.octetAlign;
++            spec.codec = leg.codec;
++            spec.dtmfPt = leg.dtmfPt;
++            return imsd::sdp::BuildAnswer(spec);
++        }
+ 
+         // Fresh dialog identity for the current attempt. A fallback INVITE
+         // after a final response is a new transaction AND a clean new dialog
+@@ -824,6 +870,10 @@ export namespace imsd::engine {
+             nextCseq_ = 2;
+             pracked_.clear();
+             answerSdp_.clear();
++            activeMedia_.reset();
++            localSessionId_ = 0;
++            localSessionVersion_ = 0;
++            awaitingOfferAck_ = false;
+             cancelled_ = false;
+             userCancelled_ = false;
+             answered_ = false;
+@@ -891,8 +941,8 @@ export namespace imsd::engine {
+             if (body.contains("m=audio")) answerSdp_ = std::string(body);
+         }
+ 
+-        MediaLeg ParseAnswer() const {
+-            imsd::sdp::Answer ans = imsd::sdp::ParseAnswer(answerSdp_, codecs_);
++        MediaLeg ParseSdp(std::string_view sdp, bool weOffered) const {
++            imsd::sdp::Answer ans = imsd::sdp::ParseAnswer(sdp, codecs_);
+             MediaLeg leg;
+             leg.remoteIp = ans.ip;
+             leg.remotePort = ans.port < 0 ? 0 : ans.port;
+@@ -900,15 +950,19 @@ export namespace imsd::engine {
+             leg.octetAlign = ans.octetAlign;
+             leg.codec = ans.codec;
+             leg.dtmfPt = ans.dtmfPt;
+-            // the second number the leg takes events at: our offer's on a call
+-            // we placed — the answer's instead when the answer gave the audio
++            // the second number the leg takes events at: our offer's when we sent
++            // the offer — the answer's instead when the answer gave the audio
+             // that very number, which is then the leg's audio number
+             const int offered = imsd::sdp::OfferedTelephoneEventPt(imsd::sdp::CodecRate(leg.codec));
+             leg.dtmfRxPt = !leg.dtmfPt ? std::nullopt
+-                : std::optional<int>(direction_ == Direction::Outgoing && offered != leg.payloadType ? offered : *leg.dtmfPt);
++                : std::optional<int>(weOffered && offered != leg.payloadType ? offered : *leg.dtmfPt);
+             return leg;
+         }
+ 
++        MediaLeg ParseAnswer(bool weOffered) const {
++            return ParseSdp(answerSdp_, weOffered);
++        }
++
+         // Terminate: state change, media teardown, deletion — in that order,
+         // so the UI leaves the call page before the (slow) media teardown.
+         // One journald line per teardown — who ended the call and why
+@@ -918,6 +972,8 @@ export namespace imsd::engine {
+         std::vector<Action> Finish(std::string_view reason, std::string_view detail = "") {
+             state_ = CallState::Terminated;
+             reason_ = std::string(reason);
++            activeMedia_.reset();
++            awaitingOfferAck_ = false;
+             std::vector<Action> a;
+             a.push_back(LogAct(detail.empty() ? std::format("call {} ended: {}", uni_, reason) : std::format("call {} ended: {} — {}", uni_, reason, detail)));
+             a.push_back(StateAct(reason));
+@@ -947,6 +1003,7 @@ export namespace imsd::engine {
+             return a;
+         }
+         Action StartMediaAct(const MediaLeg& leg) {
++            activeMedia_ = leg;
+             dtmfPt_ = leg.dtmfPt;
+             Action a{Action::Type::StartMedia};
+             a.media = leg;
+diff --git a/interfaces/Imsd-Sdp.cppm b/interfaces/Imsd-Sdp.cppm
+index 5ae7f36..a925b90 100644
+--- a/interfaces/Imsd-Sdp.cppm
++++ b/interfaces/Imsd-Sdp.cppm
+@@ -78,6 +78,7 @@ export namespace imsd::sdp {
+         std::string local;              // connection address (v4 or v6)
+         int rtpPort = 0;
+         std::uint64_t sessionId = 0;    // o= sess-id/version; caller randomizes
++        std::optional<std::uint64_t> sessionVersion;
+         bool precond = false;           // IR.92 QoS preconditions block
+         std::string currRemote = "none";  // a=curr:qos remote <this>
+         std::vector<std::string> codecs;  // offered codecs in order; empty = AMR-WB, AMR
+@@ -107,7 +108,7 @@ export namespace imsd::sdp {
+         std::string ipver = Is6(o.local) ? "IP6" : "IP4";
+         std::string s;
+         s += "v=0\r\n";
+-        s += std::format("o=- {} {} IN {} {}\r\n", o.sessionId, o.sessionId, ipver, o.local);
++        s += std::format("o=- {} {} IN {} {}\r\n", o.sessionId, o.sessionVersion.value_or(o.sessionId), ipver, o.local);
+         s += "s=-\r\n";
+         s += std::format("c=IN {} {}\r\n", ipver, o.local);
+         s += "t=0 0\r\n";
+@@ -317,6 +318,7 @@ export namespace imsd::sdp {
+         std::string local;              // connection address (v4 or v6)
+         int rtpPort = 0;
+         std::uint64_t sessionId = 0;    // o= sess-id/version; caller randomizes
++        std::optional<std::uint64_t> sessionVersion;
+         int payloadType = 97;           // the offer's pt for the chosen codec
+         bool octetAlign = true;         // mirror of the offer's mode (AMR codecs only)
+         std::string codec = "AMR-WB";   // "AMR-WB" | "AMR" | "PCMA" | "PCMU"
+@@ -335,7 +337,7 @@ export namespace imsd::sdp {
+         int as = s.codec == "AMR-WB" ? 41 : (s.codec == "AMR" ? 30 : 80);
+         std::string out;
+         out += "v=0\r\n";
+-        out += std::format("o=- {} {} IN {} {}\r\n", s.sessionId, s.sessionId, ipver, s.local);
++        out += std::format("o=- {} {} IN {} {}\r\n", s.sessionId, s.sessionVersion.value_or(s.sessionId), ipver, s.local);
+         out += "s=-\r\n";
+         out += std::format("c=IN {} {}\r\n", ipver, s.local);
+         out += "t=0 0\r\n";
+diff --git a/tests/Engine/main.cpp b/tests/Engine/main.cpp
+index 4d1ab5f..8a49b28 100644
+--- a/tests/Engine/main.cpp
++++ b/tests/Engine/main.cpp
+@@ -2245,6 +2245,105 @@ int main() {
+         }
+     }
+ 
++    // ---- incoming call: delayed-offer re-INVITE (empty INVITE -> 200 w/ offer -> ACK w/ answer)
++    //      and offer-carrying re-INVITE / UPDATE renegotiation
++    {
++        imsd::util::Rng rng(91);
++        CallMachine m(c, rng, "ims-call-reinvite", IncomingInvite{MtInvite()}, 50004);
++        m.OnInvite();
++        auto aa = m.OnAccept();
++        const Action* ok1 = Responded(aa, "SIP/2.0 200 OK");
++        auto oLine = [](std::string_view text) {
++            auto at = text.find("\r\no=");
++            if (at == std::string_view::npos) return std::string_view{};
++            at += 2;
++            return text.substr(at, text.find("\r\n", at) - at);
++        };
++        const std::string initialO(ok1 ? oLine(ok1->text) : "");
++        Check(!initialO.empty(), "accept 200 carries o= line");
++
++        std::string reinviteEmpty = std::format(
++            "INVITE sip:001010123456789@[2001:db8::db43]:45062 SIP/2.0\r\n"
++            "Via: SIP/2.0/UDP [2001:db8::105]:5100;branch=z9hG4bKre1\r\n"
++            "From: <sip:+31612345678@ims;user=phone>;tag=caller1\r\n"
++            "To: <sip:+31611111111@ims;user=phone>;tag=x\r\n"
++            "Contact: <sip:newgw@[2001:db8::99]:5060>\r\n"
++            "Supported: timer\r\nSession-Expires: 1800;refresher=uac\r\nMin-SE: 90\r\n"
++            "Call-ID: {}\r\nCSeq: 2 INVITE\r\nContent-Length: 0\r\n\r\n", m.CallId());
++        auto ar = m.OnRequest(reinviteEmpty);
++        const Action* ok2 = Responded(ar, "SIP/2.0 200 OK");
++        Check(ok2 != nullptr, "offerless re-INVITE gets 200 OK");
++        Check(ok2 && ok2->text.contains("m=audio 50004 RTP/AVP 97 99 98 100\r\n"), "offerless re-INVITE 200 includes SDP offer");
++        Check(ok2 && ok2->text.contains("Contact: <sip:001010123456789@"), "offerless re-INVITE 200 carries Contact");
++        Check(ok2 && ok2->text.contains("Session-Expires: 1800;refresher=uac\r\n") && ok2->text.contains("Require: timer\r\n"), "offerless re-INVITE 200 echoes timer headers");
++        Check(!Has(ar, Action::Type::StopMedia) && !Has(ar, Action::Type::StartMedia), "offerless re-INVITE waits for ACK answer before restarting media");
++
++        // Verify o= keeps session id and increments session version
++        const std::string offerO(ok2 ? oLine(ok2->text) : "");
++        Check(!offerO.empty() && offerO != initialO, "re-INVITE SDP increments o= version");
++
++        // ACK carries SDP answer retargeting media and renumbering DTMF
++        std::string ackSdp =
++            "v=0\r\no=- 88 88 IN IP6 2001:db8::444\r\ns=-\r\n"
++            "c=IN IP6 2001:db8::444\r\nt=0 0\r\n"
++            "m=audio 40002 RTP/AVP 99 101\r\n"
++            "a=rtpmap:99 AMR/8000/1\r\na=fmtp:99 octet-align=1\r\n"
++            "a=rtpmap:101 telephone-event/8000\r\n";
++        std::string ack2 = std::format(
++            "ACK sip:001010123456789@[2001:db8::db43]:45062 SIP/2.0\r\n"
++            "Via: SIP/2.0/UDP [2001:db8::105]:5100;branch=z9hG4bKa2\r\n"
++            "From: <sip:+31612345678@ims;user=phone>;tag=caller1\r\n"
++            "To: <sip:+31611111111@ims;user=phone>;tag=x\r\n"
++            "Call-ID: {}\r\nCSeq: 2 ACK\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
++            m.CallId(), ackSdp.size(), ackSdp);
++        auto aack = m.OnRequest(ack2);
++        Check(Responded(aack, "SIP/") == nullptr, "ACK with SDP answer produces no SIP response");
++        Check(Has(aack, Action::Type::StopMedia), "ACK with changed media stops old media leg");
++        const Action* newMed = Find(aack, Action::Type::StartMedia);
++        Check(newMed && newMed->media.remoteIp == "2001:db8::444" && newMed->media.remotePort == 40002 && newMed->media.codec == "AMR" && newMed->media.payloadType == 99 && newMed->media.octetAlign && newMed->media.dtmfPt == 101 && newMed->media.dtmfRxPt == 100, "ACK retargets media leg and keeps offered DTMF rx pt");
++
++        // Duplicate delayed-offer ACK (UDP retransmission) must not restart media or clobber dtmfRxPt
++        auto aackDup = m.OnRequest(ack2);
++        Check(aackDup.empty(), "duplicate delayed-offer ACK is a no-op");
++
++        // Subsequent offer-carrying re-INVITE with an unplayable offer is 488'd while keeping the call active and preserving remoteTarget
++        std::string badOffer =
++            "v=0\r\no=- 89 89 IN IP6 2001:db8::444\r\ns=-\r\nc=IN IP6 2001:db8::444\r\nt=0 0\r\n"
++            "m=audio 40004 RTP/AVP 18\r\na=rtpmap:18 G729/8000\r\n";
++        std::string reinviteBad = std::format(
++            "INVITE sip:001010123456789@[2001:db8::db43]:45062 SIP/2.0\r\n"
++            "Via: SIP/2.0/UDP [2001:db8::105]:5100;branch=z9hG4bKre3\r\n"
++            "From: <sip:+31612345678@ims;user=phone>;tag=caller1\r\n"
++            "To: <sip:+31611111111@ims;user=phone>;tag=x\r\n"
++            "Contact: <sip:badgw@[2001:db8::666]:5060>\r\n"
++            "Call-ID: {}\r\nCSeq: 3 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
++            m.CallId(), badOffer.size(), badOffer);
++        auto abad = m.OnRequest(reinviteBad);
++        Check(Responded(abad, "SIP/2.0 488 Not Acceptable Here") != nullptr && !m.Terminated() && !Has(abad, Action::Type::StopMedia), "unacceptable re-INVITE offer returns 488 without dropping the call");
++        auto ah = m.OnHangup();
++        const Action* bye = Sent(ah, "BYE ");
++        Check(bye && bye->text.starts_with("BYE sip:newgw@[2001:db8::99]:5060 SIP/2.0\r\n"), "rejected 488 re-INVITE preserves previous remoteTarget");
++    }
++
++    // ---- outgoing call: bodyless session-refresh UPDATE receives a bodyless 200 OK (RFC 3311 §5.2)
++    {
++        imsd::util::Rng rng(92);
++        CallMachine m(c, rng, "ims-call-out-upd", "1233", 50004, false);
++        m.Start();
++        m.OnInviteResponse(R200(m.CallId()));
++        std::string upd = std::format(
++            "UPDATE sip:001010123456789@[2001:db8::db43]:45061 SIP/2.0\r\n"
++            "Via: SIP/2.0/TCP [2001:db8::105]:5100;branch=z9hG4bKuout\r\n"
++            "From: <sip:1233@ims>;tag=remote7\r\n"
++            "To: <sip:+31612345678@ims>;tag=it\r\n"
++            "Session-Expires: 1800;refresher=uac\r\n"
++            "Call-ID: {}\r\nCSeq: 2 UPDATE\r\nContent-Length: 0\r\n\r\n", m.CallId());
++        auto au = m.OnRequest(upd);
++        const Action* u200 = Responded(au, "SIP/2.0 200 OK");
++        Check(u200 != nullptr && u200->text.contains("Content-Length: 0\r\n") && !u200->text.contains("m=audio"),
++              "outgoing call answers bodyless UPDATE with a bodyless 200 OK");
++    }
++
+     if (Failures == 0) std::println("Engine: all tests passed");
+     return Failures != 0;   // not the count: an exit status keeps 8 bits, and this suite has more checks than that
+ }

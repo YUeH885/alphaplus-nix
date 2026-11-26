@@ -71,6 +71,37 @@ let
     inherit (cross) replaceVarsWith;
     inherit (build) installShellFiles;
   };
+  mobile-broadband-provider-info-alphaplus = native.mobile-broadband-provider-info-alphaplus.override {
+    inherit (cross) stdenv;
+    inherit (build) libxslt libxml2 meson ninja;
+  };
+  modemmanager-alphaplus = (native.modemmanager-alphaplus.override {
+    inherit (cross) stdenv meson pkg-config udevCheckHook;
+    inherit (build) gettext libxslt ninja python3;
+    withIntrospection = false;
+  }).overrideAttrs (old: {
+    nativeBuildInputs = map (dep: if dep == native.glib then build.glib else dep)
+      old.nativeBuildInputs;
+  });
+  # Build KDE derivations natively on x86_64 tools while linking against native ARM64 Qt6/KF6 libs.
+  mkKdeDerivationCross = native.kdePackages.mkKdeDerivation.override {
+    inherit (cross) stdenv makeSetupHook;
+    inherit (build) cmake ninja jq python3 python3Packages;
+    qt6 = native.qt6 // {
+      wrapQtAppsHook = cross.qt6.wrapQtAppsHook.override {
+        inherit (native.qt6) qtbase;
+        makeBinaryWrapper = build.makeWrapper;
+      };
+      qtdeclarative = build.qt6.qtdeclarative;
+    };
+  };
+  # Rebuild callaudiod with build-host meson/ninja for plasma-dialer's dependency graph.
+  callaudiod = (native.callaudiod.override {
+    inherit (cross) stdenv meson pkg-config;
+    inherit (build) ninja;
+  }).overrideAttrs (old: {
+    nativeBuildInputs = old.nativeBuildInputs ++ [ build.glib.dev ];
+  });
 in
 # Reuse binary-cache paths for ARM64 packages while running system generators
 # and the board's source builds on the build platform.
@@ -151,6 +182,61 @@ packages // {
   alphaplus-gnssd = native.alphaplus-gnssd.override {
     inherit (cross) stdenv meson pkg-config;
     inherit (build) ninja;
+  };
+  alphaplus-vss-init = native.alphaplus-vss-init.override {
+    inherit (cross) stdenv;
+  };
+  alphaplus-call-audio = native.alphaplus-call-audio.override {
+    inherit (cross) stdenv pkg-config;
+    inherit modemmanager-alphaplus;
+  };
+  imsd-alphaplus = native.imsd-alphaplus.override {
+    inherit (cross) stdenv pkg-config makeWrapper;
+    inherit (build) fetchgit;
+  };
+  inherit modemmanager-alphaplus mobile-broadband-provider-info-alphaplus callaudiod;
+  kdePackages = native.kdePackages // {
+    # Override plasma-dialer so its build tools run natively on x86_64 with the cross callaudiod.
+    plasma-dialer = (native.kdePackages.plasma-dialer.override {
+      inherit callaudiod;
+      inherit (cross) pkg-config;
+      inherit (build.qt6) qtbase;
+      mkKdeDerivation = mkKdeDerivationCross;
+    }).overrideAttrs (old: {
+      buildInputs = map (dep: if dep == build.qt6.qtbase then native.qt6.qtbase else dep)
+        old.buildInputs;
+    });
+  };
+  spacebar-alphaplus = native.spacebar-alphaplus.override {
+    inherit (cross) pkg-config;
+    mkKdeDerivation = mkKdeDerivationCross;
+  };
+  plasma-nm-alphaplus = native.plasma-nm-alphaplus.override {
+    mkKdeDerivation = mkKdeDerivationCross;
+    inherit (cross) replaceVars pkg-config;
+    mobile-broadband-provider-info = mobile-broadband-provider-info-alphaplus;
+  };
+  networkmanager-alphaplus = (native.networkmanager-alphaplus.override {
+    inherit (cross) stdenv meson pkg-config replaceVars udevCheckHook;
+    inherit (build) bpftools clang elfutils gettext gnused ninja perl python3
+      mesonEmulatorHook;
+    docbook_xml_dtd_412 = null;
+    docbook_xml_dtd_42 = null;
+    docbook_xml_dtd_43 = null;
+    docbook_xsl = null;
+    gtk-doc = null;
+    libxslt = null;
+    vala = null;
+    gobject-introspection = null;
+    mobile-broadband-provider-info = mobile-broadband-provider-info-alphaplus;
+  }).overrideAttrs (old: {
+    mesonFlags = old.mesonFlags ++ [ "-Dintrospection=false" "-Dvapi=false" "-Ddocs=false" ];
+    nativeBuildInputs = builtins.filter (dep: dep != null) old.nativeBuildInputs ++ [ build.glib.dev ];
+    NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -rpath-link ${native.stdenv.cc.cc.lib}/lib";
+  });
+  tqftpserv = native.tqftpserv.override {
+    inherit (cross) stdenv meson pkg-config;
+    inherit (build) ninja fetchFromGitHub;
   };
   alphaplus-kernel = cross.alphaplus-kernel;
   alphaplus-uboot = cross.alphaplus-uboot;

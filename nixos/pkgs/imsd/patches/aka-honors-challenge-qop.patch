@@ -1,0 +1,174 @@
+diff --git a/implementations/main.cpp b/implementations/main.cpp
+index e487d9d..7268df2 100644
+--- a/implementations/main.cpp
++++ b/implementations/main.cpp
+@@ -2289,7 +2289,7 @@ private:
+         // An AUTS response requests a new challenge on the unprotected
+         // flow before we have any keys to establish the protected leg.
+         int registerCseq = 1;
+-        std::string authLine, resp;
++        std::string authLine, resp, cnonce;
+         std::optional<std::string> nonceB64;
+         std::optional<imsd::aka::AkaResult> aka;
+         for (;;) {
+@@ -2303,18 +2303,20 @@ private:
+                     throw RefusedError(what, *status, imsd::sip::RetryAfter(resp).value_or(0));
+                 throw std::runtime_error(what);
+             }
+-            nonceB64 = QuotedAfter(resp, "nonce=\"");
++            auto authChallenge = imsd::sip::Header(resp, "WWW-Authenticate");
++            if (!authChallenge) throw std::runtime_error("no authentication challenge in 401");
++            nonceB64 = QuotedAfter(*authChallenge, "nonce=\"");
+             if (!nonceB64) throw std::runtime_error("no nonce in 401");
+             auto raw = imsd::util::FromBase64(*nonceB64);
+             if (!raw || raw->size() < 32) throw std::runtime_error("bad nonce");
+             auto challenge = std::span<const std::uint8_t>(*raw);
+             aka = Authenticate(challenge.first(16), challenge.subspan(16, 16));
+             if (!aka) throw std::runtime_error("USIM AKA failed");
++            cnonce = imsd::sip::DigestChallengeHasQop(*authChallenge) ? rng_.Token(16) : "";
+             if (aka->auts.empty()) break;
+             if (registerCseq != 1) throw std::runtime_error("USIM AKA synchronization failed after AUTS");
+ 
+             Log("USIM AKA: requesting synchronization using AUTS");
+-            std::string cnonce = rng_.Token(16);
+             std::string digest = imsd::aka::DigestAkav1(*nonceB64, {}, cnonce, ctx_.id.regUri, ctx_.id.impi, ctx_.id.domain);
+             g_autofree gchar* auts = g_base64_encode(aka->auts.data(), aka->auts.size());
+             authLine = std::format("{}, auts=\"{}\"", imsd::msg::AuthAka(ctx_, *nonceB64, cnonce, digest), auts);
+@@ -2412,7 +2414,6 @@ private:
+         }
+         Log(std::format("protected leg over {}", TransportName(transport_)));
+ 
+-        std::string cnonce = rng_.Token(16);
+         std::string response = imsd::aka::DigestAkav1(*nonceB64, aka->res, cnonce, ctx_.id.regUri, ctx_.id.impi, ctx_.id.domain);
+         std::string auth = imsd::msg::AuthAka(ctx_, *nonceB64, cnonce, response);
+         std::string reg2 = imsd::msg::BuildRegisterProtected(ctx_, callidReg, ftag, rng_.Token(16), registerCseq, spiUc, spiUs, auth);
+diff --git a/interfaces/Imsd-Aka.cppm b/interfaces/Imsd-Aka.cppm
+index b02f68b..7c752a6 100644
+--- a/interfaces/Imsd-Aka.cppm
++++ b/interfaces/Imsd-Aka.cppm
+@@ -67,7 +67,8 @@ export namespace imsd::aka {
+ 
+     // AKAv1-MD5 digest-response (RFC 3310 §3.2): HA1 = MD5(IMPI:realm:RES)
+     // where RES is the *binary* AKA result, HA2 = MD5(method:uri), and the
+-    // response = MD5(HA1:nonce:nc:cnonce:qop:HA2). realm is the home domain.
++    // response = MD5(HA1:nonce:nc:cnonce:qop:HA2). A challenge without
++    // qop uses the RFC 2617 section 3.2.2.1 form without nc or cnonce.
+     std::string DigestAkav1(std::string_view nonce,
+                             std::span<const std::uint8_t> res,
+                             std::string_view cnonce, std::string_view uri,
+@@ -83,6 +84,8 @@ export namespace imsd::aka {
+         h1.Update(res);
+         std::string ha1 = imsd::util::ToHex(h1.Digest());
+         std::string ha2 = imsd::util::Md5::HexDigest(std::format("{}:{}", method, uri));
++        if (cnonce.empty())
++            return imsd::util::Md5::HexDigest(std::format("{}:{}:{}", ha1, nonce, ha2));
+         return imsd::util::Md5::HexDigest(std::format("{}:{}:{}:{}:{}:{}", ha1, nonce, nc, cnonce, qop, ha2));
+     }
+ 
+diff --git a/interfaces/Imsd-Messages.cppm b/interfaces/Imsd-Messages.cppm
+index 1aabc8f..1602121 100644
+--- a/interfaces/Imsd-Messages.cppm
++++ b/interfaces/Imsd-Messages.cppm
+@@ -130,11 +130,12 @@ export namespace imsd::msg {
+ 
+     // Authorization line with a computed AKAv1-MD5 response.
+     inline std::string AuthAka(const Context& c, std::string_view nonce, std::string_view cnonce, std::string_view response) {
++        std::string qop;
++        if (!cnonce.empty()) qop = std::format("qop=auth, nc=00000001, cnonce=\"{}\", ", cnonce);
+         return std::format(
+             "Authorization: Digest username=\"{}\", realm=\"{}\", uri=\"{}\", "
+-            "nonce=\"{}\", qop=auth, nc=00000001, cnonce=\"{}\", response=\"{}\", "
+-            "algorithm=AKAv1-MD5",
+-            c.id.impi, c.id.domain, c.id.regUri, nonce, cnonce, response);
++            "nonce=\"{}\", {}response=\"{}\", algorithm=AKAv1-MD5",
++            c.id.impi, c.id.domain, c.id.regUri, nonce, qop, response);
+     }
+ 
+     // REGISTER Contact media-feature tags. The MMTEL ICSI declares the
+diff --git a/interfaces/Imsd-Sip.cppm b/interfaces/Imsd-Sip.cppm
+index 0f5a07a..04cb2d9 100644
+--- a/interfaces/Imsd-Sip.cppm
++++ b/interfaces/Imsd-Sip.cppm
+@@ -170,6 +170,34 @@ namespace imsd::sip {
+ 
+ export namespace imsd::sip {
+ 
++    bool DigestChallengeHasQop(std::string_view challenge) {
++        challenge = Trim(challenge);
++        constexpr std::string_view Digest = "Digest";
++        auto schemeEnd = challenge.find_first_of(" \t");
++        if (schemeEnd != Digest.size() || !IEqualsPrefix(challenge, Digest)) return false;
++        for (std::size_t pos = schemeEnd; pos < challenge.size();) {
++            auto end = PieceEnd(challenge, pos, ',');
++            auto parameter = challenge.substr(pos, end - pos);
++            auto equals = parameter.find('=');
++            auto name = Trim(parameter.substr(0, equals));
++            if (equals != std::string_view::npos && name.size() == 3 && IEqualsPrefix(name, "qop")) {
++                auto val = Trim(parameter.substr(equals + 1));
++                if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
++                    val = val.substr(1, val.size() - 2);
++                for (std::size_t qpos = 0; qpos < val.size();) {
++                    auto qend = val.find(',', qpos);
++                    if (qend == std::string_view::npos) qend = val.size();
++                    auto tok = Trim(val.substr(qpos, qend - qpos));
++                    if (tok.size() == 4 && IEqualsPrefix(tok, "auth"))
++                        return true;
++                    qpos = qend + 1;
++                }
++            }
++            pos = end + 1;
++        }
++        return false;
++    }
++
+     // Value of the first `name:` header, trimmed; nullopt if absent.
+     std::optional<std::string_view> Header(std::string_view msg, std::string_view name) {
+         std::optional<std::string_view> out;
+diff --git a/tests/Aka/main.cpp b/tests/Aka/main.cpp
+index 5351c1a..7e40e38 100644
+--- a/tests/Aka/main.cpp
++++ b/tests/Aka/main.cpp
+@@ -119,6 +119,9 @@ int main() {
+         std::array<std::uint8_t, 8> res{0xa1,0xb2,0xc3,0xd4,0xe5,0xf6,0x07,0x18};
+         std::string d = DigestAkav1("abc123nonce==", res, "cnonce0123456789", "sip:ims.mnc001.mcc001.3gppnetwork.org", "001010123456789@ims.mnc001.mcc001.3gppnetwork.org", "ims.mnc001.mcc001.3gppnetwork.org");
+         Check(d == "09fd8f8f7ef716c029666a7c6df1db1e", "AKAv1-MD5 digest matches pinned vector");
++        auto noQop = DigestAkav1("abc123nonce==", res, "", "sip:ims.mnc001.mcc001.3gppnetwork.org",
++                                "001010123456789@ims.mnc001.mcc001.3gppnetwork.org", "ims.mnc001.mcc001.3gppnetwork.org");
++        Check(noQop == "83aa63438af26644f88b81e5d706ac20", "AKAv1-MD5 uses the short digest without qop");
+     }
+ 
+     // ---- identity assembly
+diff --git a/tests/Messages/main.cpp b/tests/Messages/main.cpp
+index 36103f4..c43bb30 100644
+--- a/tests/Messages/main.cpp
++++ b/tests/Messages/main.cpp
+@@ -201,6 +201,10 @@ int main() {
+         Eq(BuildRegisterProtected(c, "REGCALLID@2001:db8::db43", "FTAG5678",
+                                   "REGBRANCH123456", 2, 7449812u, 176466735u, auth),
+            Reg2, "protected REGISTER");
++        auto noQop = AuthAka(c, "NONCEXYZ", "", "RESP0000");
++        Check(noQop.contains("nonce=\"NONCEXYZ\", response=\"RESP0000\", algorithm=AKAv1-MD5")
++              && !noQop.contains("qop=") && !noQop.contains("nc=") && !noQop.contains("cnonce="),
++              "AKA without qop omits qop, nonce count and client nonce");
+     }
+ 
+     // ---- a reregistration (the keepalive refresh, a resume): the last
+diff --git a/tests/Sip/main.cpp b/tests/Sip/main.cpp
+index d4471a7..ae97a53 100644
+--- a/tests/Sip/main.cpp
++++ b/tests/Sip/main.cpp
+@@ -54,6 +54,14 @@ int main() {
+     Check(Header(Resp200, "Contact") == "<sip:user@[2001:db8::1]:45061>;expires=600000", "Header is case-insensitive (message)");
+     Check(!Header(Resp200, "Route").has_value(), "Header absent -> nullopt");
+     Check(Header(Resp200, "CSeq") == "2 REGISTER", "Header trims the value");
++    Check(DigestChallengeHasQop(R"(Digest realm="example", Qop = "auth,auth-int")"),
++          "Digest detects a qop parameter");
++    Check(!DigestChallengeHasQop(R"(Digest realm="example", qop="auth-int")"),
++          "Digest requires the auth qop token");
++    Check(!DigestChallengeHasQop(R"(Digest realm="example", qop="")"),
++          "Digest rejects an empty qop parameter");
++    Check(!DigestChallengeHasQop(R"(Digest realm="example, qop=auth", algorithm=AKAv1-MD5)"),
++          "Digest ignores qop text within a quoted value");
+     Check(Headers(Resp200, "Via").size() == 2, "Headers returns every Via");
+     Check(Headers(Resp200, "Via")[1] == "SIP/2.0/TCP [2001:db8::2]:5060;branch=z9hG4bK2", "Headers keeps order");
+     // name must sit at line start: "P-Associated-URI" must not match "URI"

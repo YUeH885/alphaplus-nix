@@ -17,8 +17,64 @@ final: prev: {
       ./patches/iio-sensor-proxy/0002-discover-all-sensors-on-a-hotplugged-device.patch
     ];
   });
+  modemmanager-alphaplus = prev.modemmanager.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [
+      ./patches/modemmanager/allow-qrtr-without-data-port.patch
+      ./patches/modemmanager/distinguish-sim-failure-from-absence.patch
+      ./patches/modemmanager/fix-netlink-transaction-uaf.patch
+      ./patches/modemmanager/preserve-ipa-mtu.patch
+    ];
+    mesonFlags = map (flag: if flag == "-Dqrtr=false" then "-Dqrtr=true" else flag)
+      old.mesonFlags;
+  });
+  mobile-broadband-provider-info-alphaplus = prev.mobile-broadband-provider-info.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [
+      ./patches/mobile-broadband-provider-info/add-china-broadnet.patch
+    ];
+  });
+  plasma-nm-alphaplus = (prev.kdePackages.plasma-nm.override {
+    mobile-broadband-provider-info = final.mobile-broadband-provider-info-alphaplus;
+  }).overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [
+      ./patches/plasma-nm/hotspot-band-5ghz.patch
+    ];
+  });
+  spacebar-alphaplus = prev.kdePackages.spacebar.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [
+      ./patches/spacebar/add-imsd-messaging-backend.patch
+    ];
+    postInstall = (old.postInstall or "") + ''
+      install -Dm644 /dev/stdin "$out/share/dbus-1/services/org.kde.spacebar.Daemon.service" <<EOF
+[D-BUS Service]
+Name=org.kde.spacebar.Daemon
+Exec=$out/libexec/spacebar-daemon
+EOF
+    '';
+  });
+  networkmanager-alphaplus = (prev.networkmanager.override {
+    mobile-broadband-provider-info = final.mobile-broadband-provider-info-alphaplus;
+  }).overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [
+      ./patches/networkmanager/dnsmasq-bind-dynamic.patch
+    ];
+  });
+  tqftpserv = prev.tqftpserv.overrideAttrs (old: {
+    version = "1.1.1-unstable-2026-10-27";
+    src = final.fetchFromGitHub {
+      owner = "linux-msm";
+      repo = "tqftpserv";
+      rev = "eb4b9a04ff92d2753ededf32cc3b6ed287f6e29b";
+      hash = "sha256-H33e1HRSedZZGZ8S00K8GCh3CNq7JZLQJuuaMHPacUc=";
+    };
+    buildInputs = (old.buildInputs or [ ]) ++ [ final.xz ];
+    # Upstream nixpkgs patches for 1.1.1 are already merged in rev eb4b9a04.
+    postPatch = "";
+  });
 
   alphaplus-gnssd = final.callPackage ../pkgs/alphaplus-gnssd { };
+  alphaplus-vss-init = final.callPackage ../pkgs/alphaplus-vss-init { };
+  alphaplus-call-audio = final.callPackage ../pkgs/alphaplus-call-audio { };
+  imsd-alphaplus = final.callPackage ../pkgs/imsd { };
   hexagonrpc = final.callPackage ../pkgs/hexagonrpc { };
   libssc = final.callPackage ../pkgs/libssc { };
   libcamera-alphaplus = final.callPackage ../pkgs/libcamera {

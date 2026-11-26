@@ -1,0 +1,211 @@
+diff --git a/implementations/main.cpp b/implementations/main.cpp
+index e079f19..8128379 100644
+--- a/implementations/main.cpp
++++ b/implementations/main.cpp
+@@ -2284,30 +2284,41 @@ private:
+         std::uint32_t spiUs = rng_.UInt(0x10000, 0xFFFFFFF);
+         ctx_.portUc = PortUc; ctx_.portUs = PortUs; ctx_.initPort = InitPort;
+ 
+-        // reg1 over UDP from the init port -> 401
+-        int fam = Is6(local_) ? AF_INET6 : AF_INET;
+-        int us = socket(fam, SOCK_DGRAM, 0);
+-        int one = 1; setsockopt(us, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+-        sockaddr_storage la; socklen_t ll = MakeAddr(local_, InitPort, la);
+-        if (bind(us, reinterpret_cast<sockaddr*>(&la), ll) != 0) {
+-            close(us); throw std::runtime_error("bind init port failed");
+-        }
+-        std::string reg1 = imsd::msg::BuildRegisterInitial(ctx_, callidReg, ftag, rng_.Token(16), spiUc, spiUs);
+-        sockaddr_storage pa; socklen_t pl = MakeAddr(pcscf_, pcscfPort_, pa);
+-        sendto(us, reg1.data(), reg1.size(), 0, reinterpret_cast<sockaddr*>(&pa), pl);
+-        std::string resp = AwaitInitialFinal(us, callidReg);
+-        if (auto st1 = imsd::sip::Status(resp); st1 != 401) {
+-            DumpRaw("imsd-register-fail.raw", resp);
+-            std::string what = std::format("expected 401, got {}", imsd::sip::RefusalSummary(resp));
+-            if (st1 && *st1 >= 300) throw RefusedError(what, *st1, imsd::sip::RetryAfter(resp).value_or(0));
+-            throw std::runtime_error(what);
+-        }
+-        auto nonceB64 = QuotedAfter(resp, "nonce=\"");
+-        if (!nonceB64) throw std::runtime_error("no nonce in 401");
+-        auto raw = imsd::util::FromBase64(*nonceB64);
+-        if (!raw || raw->size() < 32) throw std::runtime_error("bad nonce");
+-        std::vector<std::uint8_t> rand16(raw->begin(), raw->begin() + 16);
+-        std::vector<std::uint8_t> autn16(raw->begin() + 16, raw->begin() + 32);
++        // An AUTS response requests a new challenge on the unprotected
++        // flow before we have any keys to establish the protected leg.
++        int registerCseq = 1;
++        std::string authLine, resp;
++        std::optional<std::string> nonceB64;
++        std::optional<imsd::aka::AkaResult> aka;
++        for (;;) {
++            std::string request = imsd::msg::BuildRegisterInitial(
++                ctx_, callidReg, ftag, rng_.Token(16), spiUc, spiUs, registerCseq, authLine);
++            resp = SendInitialRegister(request, callidReg, registerCseq);
++            if (auto status = imsd::sip::Status(resp); status != 401) {
++                DumpRaw("imsd-register-fail.raw", resp);
++                std::string what = std::format("expected 401, got {}", imsd::sip::RefusalSummary(resp));
++                if (status && *status >= 300)
++                    throw RefusedError(what, *status, imsd::sip::RetryAfter(resp).value_or(0));
++                throw std::runtime_error(what);
++            }
++            nonceB64 = QuotedAfter(resp, "nonce=\"");
++            if (!nonceB64) throw std::runtime_error("no nonce in 401");
++            auto raw = imsd::util::FromBase64(*nonceB64);
++            if (!raw || raw->size() < 32) throw std::runtime_error("bad nonce");
++            auto challenge = std::span<const std::uint8_t>(*raw);
++            aka = Authenticate(challenge.first(16), challenge.subspan(16, 16));
++            if (!aka) throw std::runtime_error("USIM AKA failed");
++            if (aka->auts.empty()) break;
++            if (registerCseq != 1) throw std::runtime_error("USIM AKA synchronization failed after AUTS");
++
++            Log("USIM AKA: requesting synchronization using AUTS");
++            std::string cnonce = rng_.Token(16);
++            std::string digest = imsd::aka::DigestAkav1(*nonceB64, {}, cnonce, ctx_.id.regUri, ctx_.id.impi, ctx_.id.domain);
++            g_autofree gchar* auts = g_base64_encode(aka->auts.data(), aka->auts.size());
++            authLine = std::format("{}, auts=\"{}\"", imsd::msg::AuthAka(ctx_, *nonceB64, cnonce, digest), auts);
++            ++registerCseq;
++        }
++        ++registerCseq;
+         // Every Security-Server instance is one comma-list (RFC 3261
+         // §7.3.1); the joined value is what Security-Verify echoes — RFC
+         // 3329 §2.3.1 wants the whole list back, not the chosen entry.
+@@ -2344,9 +2355,6 @@ private:
+         int portPc = *carrier.portPc;
+         Log(std::format("SA: alg={} ealg={}{} spi-c={} spi-s={} port-c={} port-s={}", alg, ealg, mech.ealg.empty() ? " (absent)" : "", spiPc, spiPs, portPc, portPs));
+ 
+-        auto aka = Authenticate(rand16, autn16);
+-        if (!aka) throw std::runtime_error("USIM AKA failed");
+-
+         // install the IPsec SA pair
+         imsd::ipsec::SaParams sp;
+         sp.local = local_; sp.pcscf = pcscf_;
+@@ -2405,14 +2413,14 @@ private:
+         std::string cnonce = rng_.Token(16);
+         std::string response = imsd::aka::DigestAkav1(*nonceB64, aka->res, cnonce, ctx_.id.regUri, ctx_.id.impi, ctx_.id.domain);
+         std::string auth = imsd::msg::AuthAka(ctx_, *nonceB64, cnonce, response);
+-        std::string reg2 = imsd::msg::BuildRegisterProtected(ctx_, callidReg, ftag, rng_.Token(16), 2, spiUc, spiUs, auth);
++        std::string reg2 = imsd::msg::BuildRegisterProtected(ctx_, callidReg, ftag, rng_.Token(16), registerCseq, spiUc, spiUs, auth);
+         if (!sip_.Send(reg2)) throw std::runtime_error("send protected REGISTER failed");
+-        std::string ok = AwaitFinal(callidReg, 2, "protected REGISTER");
++        std::string ok = AwaitFinal(callidReg, registerCseq, "protected REGISTER");
+         if (auto st = imsd::sip::Status(ok); st != 200) {
+             DumpRaw("imsd-register-fail.raw", ok);
+             throw RefusedError(std::format("REGISTER refused: {}", imsd::sip::RefusalSummary(ok)), *st, imsd::sip::RetryAfter(ok).value_or(0));
+         }
+-        reg_.callid = callidReg; reg_.ftag = ftag; reg_.cseq = 2;
++        reg_.callid = callidReg; reg_.ftag = ftag; reg_.cseq = registerCseq;
+         reg_.contactUser = contactUser;
+         reg_.id = ctx_.id;
+         reg_.spiUc = spiUc; reg_.spiUs = spiUs;
+@@ -2485,7 +2493,24 @@ private:
+     // sockets (RFC 3261 18.3; DatagramMessage), but a request gets no
+     // answer here, whole or cut short: the socket is that REGISTER's own.
+     // Closes the socket; throws when nothing answers.
+-    std::string AwaitInitialFinal(int us, const std::string& callid) {
++    std::string SendInitialRegister(const std::string& request, const std::string& callid, int cseq) {
++        int us = socket(Is6(local_) ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
++        if (us < 0) throw std::runtime_error("open init port failed");
++        int one = 1;
++        setsockopt(us, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
++        sockaddr_storage local, remote;
++        socklen_t localLen = MakeAddr(local_, InitPort, local);
++        socklen_t remoteLen = MakeAddr(pcscf_, pcscfPort_, remote);
++        if (bind(us, reinterpret_cast<sockaddr*>(&local), localLen) != 0 ||
++            sendto(us, request.data(), request.size(), 0, reinterpret_cast<sockaddr*>(&remote), remoteLen) < 0) {
++            close(us);
++            throw std::runtime_error("send unprotected REGISTER failed");
++        }
++        return AwaitInitialFinal(us, callid, cseq);
++    }
++
++    std::string AwaitInitialFinal(int us, const std::string& callid, int cseq) {
++        const std::string sequence = std::format("{} REGISTER", cseq);
+         double deadline = Mono() + 8.0;
+         char buf[65535];
+         for (;;) {
+@@ -2507,7 +2532,7 @@ private:
+                 continue;
+             }
+             std::string m = std::move(*framed);
+-            if (!imsd::sip::ResponseOf(m, callid, "1 REGISTER")) {
++            if (!imsd::sip::ResponseOf(m, callid, sequence)) {
+                 std::string_view sv = m;
+                 Log(std::format("ignoring a datagram on the init port from port {} that is not the unprotected REGISTER's reply: {}", sp, sv.substr(0, sv.find("\r\n"))));
+                 continue;
+diff --git a/interfaces/Imsd-Aka.cppm b/interfaces/Imsd-Aka.cppm
+index e470a07..ba1491d 100644
+--- a/interfaces/Imsd-Aka.cppm
++++ b/interfaces/Imsd-Aka.cppm
+@@ -508,17 +508,24 @@ export namespace imsd::aka {
+         std::vector<std::uint8_t> res;
+         std::vector<std::uint8_t> ck;
+         std::vector<std::uint8_t> ik;
++        std::vector<std::uint8_t> auts;
+     };
+ 
+     // Parse the card's AUTHENTICATE response body. `resp` is the raw APDU
+     // response INCLUDING the trailing SW1 SW2 (two status bytes), which are
+     // stripped here. A successful 3G AKA body is:
+     //   DB  L_RES RES..  L_CK CK..  L_IK IK..
+-    // (tag 0xDB = "AKA success"; 0xDC would be sync-failure). nullopt on a
+-    // short buffer, a non-DB tag, or a length that runs past the end.
++    // A synchronization failure is DC 0E AUTS (14 bytes). AUTS can
++    // request a new vector, but does not carry keys for IPsec.
+     std::optional<AkaResult> ParseAkaResponse(std::span<const std::uint8_t> resp) {
+         if (resp.size() < 3) return std::nullopt;
+         std::span<const std::uint8_t> body = resp.subspan(0, resp.size() - 2);
++        if (body.size() == 16 && body[0] == 0xDC && body[1] == 14 &&
++            resp[resp.size() - 2] == 0x90 && resp.back() == 0) {
++            AkaResult r;
++            r.auts.assign(body.begin() + 2, body.end());
++            return r;
++        }
+         if (body.empty() || body[0] != 0xDB) return std::nullopt;
+         std::size_t i = 1;
+         auto take = [&](std::vector<std::uint8_t>& out) -> bool {
+diff --git a/interfaces/Imsd-Messages.cppm b/interfaces/Imsd-Messages.cppm
+index 5500ed1..1aabc8f 100644
+--- a/interfaces/Imsd-Messages.cppm
++++ b/interfaces/Imsd-Messages.cppm
+@@ -228,9 +228,9 @@ export namespace imsd::msg {
+ 
+     // ---- REGISTER -------------------------------------------------------
+ 
+-    // The first, unprotected REGISTER (UDP from the init port, CSeq 1, empty
+-    // digest, Supported: path). Triggers the 401 that carries the AKA nonce.
+-    std::string BuildRegisterInitial(const Context& c, std::string_view callid, std::string_view ftag, std::string_view branch, std::uint32_t spiUc, std::uint32_t spiUs) {
++    // An unprotected REGISTER obtains an AKA challenge or requests a new
++    // challenge after a sequence-number synchronization failure.
++    std::string BuildRegisterInitial(const Context& c, std::string_view callid, std::string_view ftag, std::string_view branch, std::uint32_t spiUc, std::uint32_t spiUs, int cseq = 1, std::string_view authLine = {}) {
+         std::vector<std::string> l = {
+             std::format("REGISTER {} SIP/2.0", c.id.regUri),
+             ViaLine(c, "UDP", c.initPort, branch),
+@@ -238,10 +238,10 @@ export namespace imsd::msg {
+             std::format("From: <{}>;tag={}", c.id.impu, ftag),
+             std::format("To: <{}>", c.id.impu),
+             std::format("Call-ID: {}", callid),
+-            "CSeq: 1 REGISTER",
++            std::format("CSeq: {} REGISTER", cseq),
+             std::format("Contact: <sip:{}@{}>{};expires=600000", ContactUser(c), imsd::util::HostPort(c.local, c.initPort), ContactFeatures(c)),
+             "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, NOTIFY, PRACK, UPDATE, MESSAGE, REFER",
+-            AuthEmpty(c),
++            authLine.empty() ? AuthEmpty(c) : std::string(authLine),
+             "Require: sec-agree",
+             "Proxy-Require: sec-agree",
+             SecurityClient(c, spiUc, spiUs),
+diff --git a/tests/Aka/main.cpp b/tests/Aka/main.cpp
+index 7cdad57..6d1a3e1 100644
+--- a/tests/Aka/main.cpp
++++ b/tests/Aka/main.cpp
+@@ -208,7 +208,11 @@ int main() {
+     {
+         // sync-failure tag (0xDC) or truncated body -> nullopt
+         std::vector<std::uint8_t> dc = {0xDC, 0x0E, 0x90, 0x00};
+-        Check(!ParseAkaResponse(dc).has_value(), "non-DB tag rejected");
++        Check(!ParseAkaResponse(dc).has_value(), "truncated AUTS rejected");
++        const auto sync = ParseAkaResponse(*imsd::util::FromHex("dc 0e 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 90 00"));
++        Check(sync && sync->auts.size() == 14 && sync->auts.front() == 1 &&
++              sync->auts.back() == 14 && sync->ck.empty() && sync->ik.empty(),
++              "sequence synchronization returns AUTS without session keys");
+         std::vector<std::uint8_t> tr = {0xDB, 0x08, 0x00, 0x90, 0x00};
+         Check(!ParseAkaResponse(tr).has_value(), "length past end rejected");
+     }

@@ -1,0 +1,169 @@
+diff --git a/implementations/pcscf.cpp b/implementations/pcscf.cpp
+index 0e180f2..51c1982 100644
+--- a/implementations/pcscf.cpp
++++ b/implementations/pcscf.cpp
+@@ -10,13 +10,15 @@ a second WDS client gets them once it is bound to the same mux data port
+ (the binding ModemManager gives its own clients), so this is a reader on
+ the side: Bind Mux Data Port, Set IP Family 6, Get Current Settings, over
+ one AF_QIPCRTR socket, which is its own QMI client as far as the modem is
+-concerned — no proxy, no interference with ModemManager's. It never sends
+-Start Network or Stop Network: it changes nothing about the call. The
++concerned — no proxy, no interference with ModemManager's. It never starts or stops
++a data call. The separate profile creation mode enables P-CSCF discovery
++when the modem has no IMS profile. The
+ bytes are Imsd:Qmi's; this file is the socket, the service lookup and the
+ sequence.
+ 
+ Usage: imsd-pcscf --mux <id> [--ep-type 4] [--ep-iface 1] [--node 0]
+                   [--profile <idx>] [--timeout <s>] [-v]
++  imsd-pcscf --create-ims-profile <apn> [--node 0] [--timeout <s>] [-v]
+   --mux      the rmnet mux id of the ims netdev (`ip -d link show <dev>`)
+   --ep-type, --ep-iface
+              the modem's data endpoint: embedded (4), interface 1 for an
+@@ -153,6 +155,7 @@ namespace {
+     };
+ 
+     void Usage() {
++        std::println(std::cerr, "usage: imsd-pcscf --create-ims-profile <apn> [--node 0] [--timeout <s>] [-v]");
+         std::println(std::cerr, "usage: imsd-pcscf --mux <id> [--ep-type 4] [--ep-iface 1] [--node 0] [--profile <idx>] [--timeout <s>] [-v]");
+     }
+ }
+@@ -160,6 +163,7 @@ namespace {
+ int main(int argc, char** argv) {
+     std::optional<int> mux;
+     std::optional<int> profile;
++    std::optional<std::string_view> createApn;
+     std::uint32_t epType = imsd::qmi::EndpointEmbedded;
+     std::uint32_t epIface = imsd::qmi::EndpointInterfaceIpa;
+     std::uint32_t node = 0;
+@@ -177,6 +181,10 @@ int main(int argc, char** argv) {
+         std::optional<long> v;
+         if (a == "--mux") { if (!(v = num(i, "--mux"))) return 1; mux = static_cast<int>(*v); }
+         else if (a == "--profile") { if (!(v = num(i, "--profile"))) return 1; profile = static_cast<int>(*v); }
++        else if (a == "--create-ims-profile") {
++            if (++i == argc || argv[i][0] == '\0') { Usage(); return 1; }
++            createApn = argv[i];
++        }
+         else if (a == "--ep-type") { if (!(v = num(i, "--ep-type"))) return 1; epType = static_cast<std::uint32_t>(*v); }
+         else if (a == "--ep-iface") { if (!(v = num(i, "--ep-iface"))) return 1; epIface = static_cast<std::uint32_t>(*v); }
+         else if (a == "--node") { if (!(v = num(i, "--node"))) return 1; node = static_cast<std::uint32_t>(*v); }
+@@ -188,7 +196,10 @@ int main(int argc, char** argv) {
+         else if (a == "-v") Verbose = true;
+         else { Usage(); return 1; }
+     }
+-    if (!mux || *mux < 0 || *mux > 255) { Usage(); return 1; }
++    if (createApn ? (mux || profile) : (!mux || *mux < 0 || *mux > 255)) {
++        Usage();
++        return 1;
++    }
+     if (profile && (*profile < 0 || *profile > 255)) { Err("--profile: 0..255"); return 1; }
+ 
+     long deadline = NowMs() + static_cast<long>(timeout * 1000);
+@@ -207,6 +218,17 @@ int main(int argc, char** argv) {
+         return r;
+     };
+     using namespace imsd::qmi;
++    if (createApn) {
++        auto r = step(CreateImsProfile(c.NextTxn(), *createApn), MsgCreateProfile, "Create IMS Profile");
++        if (!r) return 1;
++        const auto* id = r->Find(0x01);
++        if (!id || id->value.size() != 2 || id->value[0] != ProfileType3gpp) {
++            Err("Create IMS Profile: missing 3GPP profile identifier");
++            return 1;
++        }
++        std::println("{}", static_cast<unsigned>(id->value[1]));
++        return 0;
++    }
+     if (!step(BindMuxDataPort(c.NextTxn(), epType, epIface, static_cast<std::uint8_t>(*mux)), MsgBindMuxDataPort, "Bind Mux Data Port")) return 1;
+     if (!step(SetIpFamily(c.NextTxn(), IpFamilyV6), MsgSetIpFamily, "Set IP Family")) return 1;
+     if (Verbose) {
+diff --git a/interfaces/Imsd-Qmi.cppm b/interfaces/Imsd-Qmi.cppm
+index 63e1fe6..730a482 100644
+--- a/interfaces/Imsd-Qmi.cppm
++++ b/interfaces/Imsd-Qmi.cppm
+@@ -31,6 +31,7 @@ export namespace imsd::qmi {
+     constexpr std::uint8_t TypeIndication = 0x04;
+ 
+     constexpr std::uint16_t MsgGetPacketServiceStatus = 0x0022;
++    constexpr std::uint16_t MsgCreateProfile = 0x0027;
+     constexpr std::uint16_t MsgGetProfileSettings = 0x002B;
+     constexpr std::uint16_t MsgGetCurrentSettings = 0x002D;
+     constexpr std::uint16_t MsgSetIpFamily = 0x004D;
+@@ -132,6 +133,21 @@ export namespace imsd::qmi {
+     inline std::vector<std::uint8_t> GetCurrentSettings(std::uint16_t txn, std::uint32_t mask) {
+         return Request(txn, MsgGetCurrentSettings, Tlv32(0x10, mask));
+     }
++    inline std::vector<std::uint8_t> CreateImsProfile(std::uint16_t txn, std::string_view apn) {
++        constexpr std::uint8_t PdpTypeV6 = 2;
++        auto tlvs = Tlv8(0x01, ProfileType3gpp);
++        auto add = [&](const std::vector<std::uint8_t>& tlv) {
++            tlvs.insert(tlvs.end(), tlv.begin(), tlv.end());
++        };
++        const std::vector<std::uint8_t> apnBytes(apn.begin(), apn.end());
++        add(TlvBytes(0x10, apnBytes));
++        add(Tlv8(0x11, PdpTypeV6));
++        add(TlvBytes(0x14, apnBytes));
++        // The modem requests P-CSCF in PCO only when the IMS profile enables it.
++        add(Tlv8(0x1f, 1)); // P-CSCF address using PCO
++        add(Tlv8(0x22, 1)); // IM CN subsystem signalling
++        return Request(txn, MsgCreateProfile, tlvs);
++    }
+     // Get Profile Settings: TLV 0x01 {profile type u8 (0 = 3GPP), index u8}.
+     inline std::vector<std::uint8_t> GetProfileSettings(std::uint16_t txn, std::uint8_t index) {
+         std::array<std::uint8_t, 2> id{ProfileType3gpp, index};
+diff --git a/packaging/ims-pdn-up.sh b/packaging/ims-pdn-up.sh
+index 0342941..23d823c 100644
+--- a/packaging/ims-pdn-up.sh
++++ b/packaging/ims-pdn-up.sh
+@@ -20,8 +20,9 @@
+ #   IMS_APN          ims APN name (default ims)
+ #   IMS_IP_TYPE      bearer ip-type (default ipv6)
+ #   IMS_PROFILE_ID   3GPP profile index to connect through (default: looked up
+-#                    by APN in the modem's profile list; empty/none = connect by
+-#                    APN string). A profile-indexed call is exempt from the
++#                    by APN in the modem's profile list; a missing IPv6
++#                    profile is created with P-CSCF via PCO enabled.
++#                    Use none to connect by APN string). A profile-indexed call is exempt from the
+ #                    modem's attach-family forcing that refuses an APN-string
+ #                    IPv6 request when the attach PDN was granted IPv4-only
+ #                    (journal/ims 2026-09-16/17 bench: Odido, O2 UK, Swisscom).
+@@ -154,15 +155,21 @@ lookup_profile() {  # $1 = modem state, $2 = log suffix; sets PROFILE_ID, LOOKUP
+             log "ims profile: index $PROFILE_ID (apn $IMS_APN)"
+             return 0
+         fi
+-        # a list without the APN is final only once the modem is registered:
+-        # while it enables, the list can be partial (dev phone cold boot
+-        # 2026-09-24 18:18: entries but no ims at `enabling`, ims listed when
+-        # read minutes later), and on a walled carrier the APN-string fallback
+-        # that would follow is the request the modem refuses
++        # Only create a profile after registration, when the modem's
++        # profile list is complete.
+         case "$1" in
+             registered|connecting|connected)
+                 LOOKUP=done
+-                log "ims profile: none for apn $IMS_APN, connecting by APN string" ;;
++                if [ "$IP_TYPE" = ipv6 ]; then
++                    if PROFILE_ID=$("${IMSD_PCSCF:-/usr/libexec/imsd-pcscf}" --create-ims-profile "$IMS_APN"); then
++                        log "ims profile: created profile $PROFILE_ID for $IMS_APN with P-CSCF via PCO"
++                    else
++                        log "ims profile: could not create a PCO-enabled profile for $IMS_APN"
++                        exit 1
++                    fi
++                else
++                    log "ims profile: none for apn $IMS_APN, connecting by APN string"
++                fi ;;
+             *)  log "ims profile: not in the list yet$2" ;;
+         esac
+     else
+diff --git a/tests/Qmi/main.cpp b/tests/Qmi/main.cpp
+index 245a116..a167b62 100644
+--- a/tests/Qmi/main.cpp
++++ b/tests/Qmi/main.cpp
+@@ -42,6 +42,7 @@ int main() {
+     Check(SetIpFamily(2, IpFamilyV6) == Hex("00 02 00 4d 00 04 00 01 01 00 06"), "Set IP Family bytes");
+     Check(GetPacketServiceStatus(3) == Hex("00 03 00 22 00 00 00"), "Get Packet Service Status bytes");
+     Check(GetCurrentSettings(4, RequestedSettingsAll) == Hex("00 04 00 2d 00 07 00 10 04 00 ff ff 07 00"), "Get Current Settings bytes");
++    Check(CreateImsProfile(1, "ims") == Hex("00 01 00 27 00 1c 00 01 01 00 00 10 03 00 69 6d 73 11 01 00 02 14 03 00 69 6d 73 1f 01 00 01 22 01 00 01"), "Create IMS Profile requests P-CSCF via PCO");
+     Check(GetProfileSettings(5, 2) == Hex("00 05 00 2b 00 05 00 01 02 00 00 02"), "Get Profile Settings bytes");
+ 
+     // ---- the recorded answer

@@ -1,0 +1,663 @@
+diff --git a/daemon/CMakeLists.txt b/daemon/CMakeLists.txt
+index 6e4950b..91168ee 100644
+--- a/daemon/CMakeLists.txt
++++ b/daemon/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ set(spacebar_daemon_SRCS
+     main.cpp
+     channellogger.cpp
++    imsdmessagingclient.cpp
+     ecurl.cpp
+ )
+ 
+diff --git a/daemon/channellogger.cpp b/daemon/channellogger.cpp
+index 0667139..8609664 100644
+--- a/daemon/channellogger.cpp
++++ b/daemon/channellogger.cpp
+@@ -69,6 +69,22 @@ ChannelLogger::ChannelLogger(std::optional<QString> &modemPath, QObject *parent)
+         PhoneNumber::setCountryCode(countryCode);
+     });
+ 
++    connect(&ImsdMessagingClient::instance(), &ImsdMessagingClient::messageReceived, this, [this](const QString &id, const QVariantMap &properties) {
++        handleIncomingImsMessage(id, properties);
++    });
++    connect(&ImsdMessagingClient::instance(), &ImsdMessagingClient::messageStateChanged, this, [this](const QString &id, const QString &state, const QString &reason) {
++        handleImsMessageStateChanged(id, state, reason);
++    });
++    connect(&ImsdMessagingClient::instance(), &ImsdMessagingClient::ownNumberChanged, this, [this](const QString &) {
++        m_ownNumber = PhoneNumber(ownNumber());
++    });
++    connect(&ImsdMessagingClient::instance(), &ImsdMessagingClient::availabilityChanged, this, [this]() {
++        if (!ImsdMessagingClient::instance().isEnabled()) {
++            handleImsUnavailable();
++        }
++    });
++    ImsdMessagingClient::instance().init();
++
+     // Check for any unhandled messages from the modem
+     checkMessages();
+ }
+@@ -87,6 +103,10 @@ void ChannelLogger::checkMessages()
+ 
+ QString ChannelLogger::ownNumber()
+ {
++    const QString imsOwnNumber = ImsdMessagingClient::instance().ownNumber();
++    if (!imsOwnNumber.isEmpty()) {
++        return imsOwnNumber;
++    }
+     return ModemController::instance().ownNumber();
+ }
+ 
+@@ -179,6 +199,27 @@ QCoro::Task<void> ChannelLogger::handleIncomingMessage(ModemManager::Sms::Ptr ms
+     // Delete message from modem
+     ModemController::instance().deleteMessage(msg->uni());
+ 
++    co_await saveIncomingPayload(number, datetime, text, data);
++}
++
++QCoro::Task<void> ChannelLogger::handleIncomingImsMessage(QString id, QVariantMap properties)
++{
++    const QString number = properties.value(SL("from")).toString();
++    const QString text = properties.value(SL("text")).toString();
++    const QByteArray data = properties.value(SL("data")).toByteArray();
++
++    QDateTime datetime = QDateTime::fromString(properties.value(SL("timestamp")).toString(), Qt::ISODate);
++    if (!datetime.isValid()) {
++        const qint64 received = properties.value(SL("received")).toLongLong();
++        datetime = received > 0 ? QDateTime::fromSecsSinceEpoch(received) : QDateTime::currentDateTime();
++    }
++
++    co_await saveIncomingPayload(number, datetime, text, data);
++    co_await ImsdMessagingClient::instance().deleteMessage(id);
++}
++
++QCoro::Task<void> ChannelLogger::saveIncomingPayload(QString number, QDateTime datetime, QString text, QByteArray data)
++{
+     const PhoneNumberList phoneNumberList = PhoneNumberList(number);
+ 
+     // TODO check if blocked number
+@@ -379,42 +420,43 @@ QCoro::Task<void> ChannelLogger::saveMessage(const PhoneNumberList &phoneNumberL
+ 
+ void ChannelLogger::sendMessage(const QString &numbers, const QString &id, const QString &text, const QStringList &files, const qint64 &totalSize)
+ {
+-    PhoneNumberList phoneNumberList = PhoneNumberList(numbers);
++    sendMessageImpl(PhoneNumberList(numbers), id, text, files, totalSize);
++}
+ 
+-    [this, phoneNumberList, id, text, files, totalSize]() -> QCoro::Task<void> {
+-        QString result;
+-        // check if it is a MMS message
+-        if (phoneNumberList.size() > 1 || files.length() > 0) {
+-            if (SettingsManager::self()->groupConversation()) {
+-                sendMessageMMS(phoneNumberList, id, text, files, totalSize);
+-            } else {
+-                // send as individual messages
+-                for (const auto &phoneNumber : phoneNumberList) {
+-                    if (files.length() > 0) {
+-                        sendMessageMMS(PhoneNumberList(phoneNumber.toInternational()), Database::generateRandomId(), text, files, totalSize);
+-                    } else {
+-                        result = co_await sendMessageSMS(phoneNumber, Database::generateRandomId(), text);
+-                    }
++QCoro::Task<void> ChannelLogger::sendMessageImpl(PhoneNumberList phoneNumberList, QString id, QString text, QStringList files, qint64 totalSize)
++{
++    QString result;
++    // check if it is a MMS message
++    if (phoneNumberList.size() > 1 || files.length() > 0) {
++        if (SettingsManager::self()->groupConversation()) {
++            sendMessageMMS(phoneNumberList, id, text, files, totalSize);
++        } else {
++            // send as individual messages
++            for (const auto &phoneNumber : phoneNumberList) {
++                if (files.length() > 0) {
++                    sendMessageMMS(PhoneNumberList(phoneNumber.toInternational()), Database::generateRandomId(), text, files, totalSize);
++                } else {
++                    result = co_await sendMessageSMS(phoneNumber, Database::generateRandomId(), text);
+                 }
+-
+-                // update delivery status of original message
+-                Message message;
+-                message.id = id;
+-                message.phoneNumberList = phoneNumberList;
+-                message.datetime = QDateTime::currentDateTime();
+-                message.deliveryStatus = MessageState::Sent;
+-                updateMessage(message);
+             }
+-        } else {
+-            result = co_await sendMessageSMS(phoneNumberList.first(), id, text);
+-        }
+ 
+-        if (result.isEmpty()) {
+-            qDebug() << "Message sent successfully";
+-        } else {
+-            qDebug() << "Failed successfully" << result;
++            // update delivery status of original message
++            Message message;
++            message.id = id;
++            message.phoneNumberList = phoneNumberList;
++            message.datetime = QDateTime::currentDateTime();
++            message.deliveryStatus = MessageState::Sent;
++            updateMessage(message);
+         }
+-    }();
++    } else if (!phoneNumberList.isEmpty()) {
++        result = co_await sendMessageSMS(phoneNumberList.first(), id, text);
++    }
++
++    if (result.isEmpty()) {
++        qDebug() << "Message sent successfully";
++    } else {
++        qDebug() << "Failed successfully" << result;
++    }
+ }
+ 
+ void ChannelLogger::sendTapback(const QString &numbers, const QString &id, const QString &tapback, const bool &isRemoved)
+@@ -422,11 +464,63 @@ void ChannelLogger::sendTapback(const QString &numbers, const QString &id, const
+     sendTapbackHandler(numbers, id, tapback, isRemoved);
+ }
+ 
+-QCoro::Task<QString> ChannelLogger::sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text)
++QString ChannelLogger::formatSmsTarget(const PhoneNumber &phoneNumber)
+ {
+-    ModemManager::ModemMessaging::Message m;
+-    m.number = phoneNumber.toE164();
+-    m.text = text;
++    if (phoneNumber.isValidFullNumber()) {
++        return phoneNumber.toE164();
++    }
++
++    QString target = phoneNumber.toString().trimmed();
++    target.remove(u' ');
++    target.remove(u'-');
++    target.remove(u'.');
++    return target;
++}
++
++QCoro::Task<void> ChannelLogger::handleImsUnavailable()
++{
++    m_earlyImsStates.clear();
++    m_earlyImsStateOrder.clear();
++    const QList<Message> pending = m_pendingImsMessages.values();
++    m_pendingImsMessages.clear();
++    for (const auto &message : pending) {
++        co_await m_database.updateMessageDeliveryState(message.id, MessageState::Failed);
++        updateMessage(message);
++    }
++}
++
++QCoro::Task<void> ChannelLogger::handleImsMessageStateChanged(QString id, QString state, QString reason)
++{
++    const auto it = m_pendingImsMessages.find(id);
++    if (it == m_pendingImsMessages.end()) {
++        if (state == SL("sent") || state == SL("failed")) {
++            if (!m_earlyImsStates.contains(id)) {
++                m_earlyImsStateOrder.enqueue(id);
++                while (m_earlyImsStateOrder.size() > 128) {
++                    m_earlyImsStates.remove(m_earlyImsStateOrder.dequeue());
++                }
++            }
++            m_earlyImsStates.insert(id, {state, reason});
++        }
++        co_return;
++    }
++
++    Message message = it.value();
++    if (state == SL("sent")) {
++        m_pendingImsMessages.erase(it);
++        co_await m_database.updateMessageDeliveryState(message.id, MessageState::Sent);
++        updateMessage(message);
++    } else if (state == SL("failed")) {
++        qWarning() << "imsd SMS" << id << "failed:" << reason;
++        m_pendingImsMessages.erase(it);
++        co_await m_database.updateMessageDeliveryState(message.id, MessageState::Failed);
++        updateMessage(message);
++    }
++}
++
++QCoro::Task<QString> ChannelLogger::sendMessageSMS(PhoneNumber phoneNumber, QString id, QString text)
++{
++    const QString target = formatSmsTarget(phoneNumber);
+ 
+     Message message;
+     message.id = id;
+@@ -440,6 +534,28 @@ QCoro::Task<QString> ChannelLogger::sendMessageSMS(const PhoneNumber &phoneNumbe
+     // add message to database
+     co_await addMessage(message);
+ 
++    if (ImsdMessagingClient::instance().isEnabled()) {
++        const QDBusReply<QString> sendReply = co_await ImsdMessagingClient::instance().send(target, text, false);
++        if (!sendReply.isValid()) {
++            co_await m_database.updateMessageDeliveryState(message.id, MessageState::Failed);
++            updateMessage(message);
++            co_return sendReply.error().message();
++        }
++
++        const QString imsId = sendReply.value();
++        m_pendingImsMessages.insert(imsId, message);
++        if (m_earlyImsStates.contains(imsId)) {
++            const auto early = m_earlyImsStates.take(imsId);
++            m_earlyImsStateOrder.removeOne(imsId);
++            co_await handleImsMessageStateChanged(imsId, early.first, early.second);
++        }
++        co_return QString();
++    }
++
++    ModemManager::ModemMessaging::Message m;
++    m.number = phoneNumber.toE164();
++    m.text = text;
++
+     auto maybeReply = ModemController::instance().createMessage(m);
+ 
+     if (!maybeReply) {
+@@ -763,6 +879,15 @@ QCoro::Task<void> ChannelLogger::sendTapbackHandler(const QString &numbers, cons
+     Q_EMIT messageUpdated(numbers, message.id);
+ 
+     for (const auto &phoneNumber : PhoneNumberList(numbers)) {
++        if (ImsdMessagingClient::instance().isEnabled()) {
++            const QDBusReply<QString> sendReply = co_await ImsdMessagingClient::instance().send(formatSmsTarget(phoneNumber), message.text, false);
++            if (!sendReply.isValid()) {
++                qWarning() << "imsd SMS tapback failed:" << sendReply.error().message();
++                co_return;
++            }
++            continue;
++        }
++
+         ModemManager::ModemMessaging::Message m;
+         m.number = phoneNumber.toE164();
+         m.text = message.text;
+diff --git a/daemon/channellogger.h b/daemon/channellogger.h
+index d9b0203..7ec57b3 100644
+--- a/daemon/channellogger.h
++++ b/daemon/channellogger.h
+@@ -4,11 +4,16 @@
+ 
+ #pragma once
+ 
++#include <QHash>
+ #include <QObject>
++#include <QPair>
++#include <QQueue>
++#include <QVariantMap>
+ 
+ #include <optional>
+ 
+ #include "ecurl.h"
++#include "imsdmessagingclient.h"
+ #include "modemcontroller.h"
+ #include <database.h>
+ #include <mms.h>
+@@ -64,6 +69,11 @@ public:
+ private:
+     void checkMessages();
+     QCoro::Task<void> handleIncomingMessage(ModemManager::Sms::Ptr msg);
++    QCoro::Task<void> handleIncomingImsMessage(QString id, QVariantMap properties);
++    QCoro::Task<void> handleImsMessageStateChanged(QString id, QString state, QString reason);
++    QCoro::Task<void> handleImsUnavailable();
++    QCoro::Task<void> saveIncomingPayload(QString number, QDateTime datetime, QString text, QByteArray data);
++    static QString formatSmsTarget(const PhoneNumber &phoneNumber);
+     void createDownloadNotification(const MmsMessage &mmsMessage);
+     QCoro::Task<void> addMessage(const Message &message);
+     void updateMessage(const Message &message);
+@@ -78,7 +88,8 @@ private:
+                                   const QString &contentLocation = QString(),
+                                   const QDateTime &expires = QDateTime(),
+                                   const int size = 0);
+-    QCoro::Task<QString> sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text);
++    QCoro::Task<QString> sendMessageSMS(PhoneNumber phoneNumber, QString id, QString text);
++    QCoro::Task<void> sendMessageImpl(PhoneNumberList phoneNumberList, QString id, QString text, QStringList files, qint64 totalSize);
+     QCoro::Task<QString>
+     sendMessageMMS(const PhoneNumberList &phoneNumberList, const QString &id, const QString &text, const QStringList &files, const qint64 totalSize);
+     QCoro::Task<void> sendCancelResponse(const QString &transactionId);
+@@ -111,6 +122,9 @@ private:
+     bool m_dataConnected;
+ 
+     QStringList m_deferredIndicators;
++    QHash<QString, Message> m_pendingImsMessages;
++    QHash<QString, QPair<QString, QString>> m_earlyImsStates;
++    QQueue<QString> m_earlyImsStateOrder;
+ 
+ Q_SIGNALS:
+     Q_SCRIPTABLE void messageAdded(const QString &phoneNumber, const QString &id);
+diff --git a/daemon/imsdmessagingclient.cpp b/daemon/imsdmessagingclient.cpp
+new file mode 100644
+index 0000000..3909694
+--- /dev/null
++++ b/daemon/imsdmessagingclient.cpp
+@@ -0,0 +1,231 @@
++// SPDX-FileCopyrightText: 2026 Contributors to the lmg820n-linux project
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++#include "imsdmessagingclient.h"
++
++#include <QDBusArgument>
++#include <QDBusConnection>
++#include <QDBusMessage>
++#include <QDBusMetaType>
++#include <QDBusPendingReply>
++#include <QDBusServiceWatcher>
++#include <QDebug>
++
++#include <QCoroDBusPendingReply>
++
++#include <global.h>
++
++namespace
++{
++const QString IMSD_SERVICE = SL("net.catcrafts.IMS1");
++const QString IMSD_PATH = SL("/net/catcrafts/IMS1");
++const QString IMSD_IFACE = SL("net.catcrafts.IMS1");
++const QString IMSD_MESSAGING_IFACE = SL("net.catcrafts.IMS1.Messaging");
++constexpr qsizetype MAX_SEEN_IDS = 512;
++
++QString extractNumberFromPpi(const QString &ppi)
++{
++    QString value = ppi.trimmed();
++    if (value.startsWith(u'<') && value.endsWith(u'>')) {
++        value = value.mid(1, value.size() - 2).trimmed();
++    }
++    if (value.startsWith(SL("tel:"), Qt::CaseInsensitive)) {
++        value = value.mid(4);
++    } else if (value.startsWith(SL("sip:"), Qt::CaseInsensitive)) {
++        value = value.mid(4).section(u'@', 0, 0);
++    } else if (value.startsWith(SL("sips:"), Qt::CaseInsensitive)) {
++        value = value.mid(5).section(u'@', 0, 0);
++    } else {
++        return QString();
++    }
++    return value.section(u';', 0, 0);
++}
++}
++
++QDBusArgument &operator<<(QDBusArgument &argument, const ImsdStoredMessage &message)
++{
++    argument.beginStructure();
++    argument << message.id << message.properties;
++    argument.endStructure();
++    return argument;
++}
++
++const QDBusArgument &operator>>(const QDBusArgument &argument, ImsdStoredMessage &message)
++{
++    argument.beginStructure();
++    argument >> message.id >> message.properties;
++    argument.endStructure();
++    return argument;
++}
++
++ImsdMessagingClient &ImsdMessagingClient::instance()
++{
++    static ImsdMessagingClient instance;
++    return instance;
++}
++
++ImsdMessagingClient::ImsdMessagingClient(QObject *parent)
++    : QObject(parent)
++{
++}
++
++void ImsdMessagingClient::init()
++{
++    if (m_initialized) {
++        return;
++    }
++    m_initialized = true;
++
++    qRegisterMetaType<ImsdStoredMessage>();
++    qRegisterMetaType<QList<ImsdStoredMessage>>();
++    qDBusRegisterMetaType<ImsdStoredMessage>();
++    qDBusRegisterMetaType<QList<ImsdStoredMessage>>();
++
++    auto bus = QDBusConnection::systemBus();
++    bus.connect(IMSD_SERVICE, IMSD_PATH, IMSD_MESSAGING_IFACE, SL("Received"), this, SLOT(slotReceived(QString, QVariantMap)));
++    bus.connect(IMSD_SERVICE, IMSD_PATH, IMSD_MESSAGING_IFACE, SL("StateChanged"), this, SLOT(slotStateChanged(QString, QString, QString)));
++    bus.connect(IMSD_SERVICE, IMSD_PATH, IMSD_IFACE, SL("RegistrationChanged"), this, SLOT(slotRegistrationChanged(bool)));
++
++    m_watcher = new QDBusServiceWatcher(IMSD_SERVICE, bus, QDBusServiceWatcher::WatchForOwnerChange, this);
++    connect(m_watcher, &QDBusServiceWatcher::serviceOwnerChanged, this, [this](const QString &, const QString &, const QString &newOwner) {
++        if (newOwner.isEmpty()) {
++            ++m_syncGeneration;
++            if (m_enabled) {
++                m_enabled = false;
++                Q_EMIT availabilityChanged();
++            }
++            return;
++        }
++        syncFromDaemon();
++    });
++
++    syncFromDaemon();
++}
++
++bool ImsdMessagingClient::isEnabled() const
++{
++    return m_enabled;
++}
++
++QString ImsdMessagingClient::ownNumber() const
++{
++    return m_ownNumber;
++}
++
++QCoro::Task<void> ImsdMessagingClient::syncFromDaemon()
++{
++    const quint64 generation = ++m_syncGeneration;
++    auto bus = QDBusConnection::systemBus();
++
++    QDBusMessage statusCall = QDBusMessage::createMethodCall(IMSD_SERVICE, IMSD_PATH, IMSD_MESSAGING_IFACE, SL("GetStatus"));
++    const QDBusReply<QVariantMap> statusReply = co_await QDBusPendingReply<QVariantMap>(bus.asyncCall(statusCall));
++    if (generation != m_syncGeneration) {
++        co_return;
++    }
++
++    auto setEnabled = [this](bool enabled) {
++        if (m_enabled != enabled) {
++            m_enabled = enabled;
++            Q_EMIT availabilityChanged();
++        }
++    };
++
++    if (!statusReply.isValid()) {
++        setEnabled(false);
++        co_return;
++    }
++
++    const QVariantMap status = statusReply.value();
++    const bool daemonEnabled = status.value(SL("enabled")).toBool();
++    updateOwnNumberFromPpi(status.value(SL("ppi")).toString());
++    if (!daemonEnabled) {
++        setEnabled(false);
++        co_return;
++    }
++
++    QDBusMessage subscribeCall = QDBusMessage::createMethodCall(IMSD_SERVICE, IMSD_PATH, IMSD_MESSAGING_IFACE, SL("Subscribe"));
++    const QDBusReply<void> subscribeReply = co_await QDBusPendingReply<>(bus.asyncCall(subscribeCall));
++    if (generation != m_syncGeneration) {
++        co_return;
++    }
++    if (!subscribeReply.isValid()) {
++        qWarning() << "imsd Messaging.Subscribe failed:" << subscribeReply.error().message();
++        setEnabled(false);
++        co_return;
++    }
++
++    setEnabled(true);
++
++    QDBusMessage listCall = QDBusMessage::createMethodCall(IMSD_SERVICE, IMSD_PATH, IMSD_MESSAGING_IFACE, SL("List"));
++    const QDBusReply<QList<ImsdStoredMessage>> listReply = co_await QDBusPendingReply<QList<ImsdStoredMessage>>(bus.asyncCall(listCall));
++    if (generation != m_syncGeneration) {
++        co_return;
++    }
++    if (!listReply.isValid()) {
++        qWarning() << "imsd Messaging.List failed:" << listReply.error().message();
++        co_return;
++    }
++
++    const QList<ImsdStoredMessage> stored = listReply.value();
++    for (const auto &item : stored) {
++        emitUniqueIncoming(item.id, item.properties);
++    }
++}
++
++void ImsdMessagingClient::updateOwnNumberFromPpi(const QString &ppi)
++{
++    const QString extracted = extractNumberFromPpi(ppi);
++    if (!extracted.isEmpty() && extracted != m_ownNumber) {
++        m_ownNumber = extracted;
++        Q_EMIT ownNumberChanged(m_ownNumber);
++    }
++}
++
++void ImsdMessagingClient::emitUniqueIncoming(const QString &id, const QVariantMap &properties)
++{
++    if (id.isEmpty() || m_seenIncomingIds.contains(id)) {
++        return;
++    }
++    m_seenIncomingIds.insert(id);
++    m_seenIncomingOrder.enqueue(id);
++    while (m_seenIncomingOrder.size() > MAX_SEEN_IDS) {
++        m_seenIncomingIds.remove(m_seenIncomingOrder.dequeue());
++    }
++    Q_EMIT messageReceived(id, properties);
++}
++
++void ImsdMessagingClient::slotReceived(const QString &id, const QVariantMap &properties)
++{
++    emitUniqueIncoming(id, properties);
++}
++
++void ImsdMessagingClient::slotStateChanged(const QString &id, const QString &state, const QString &reason)
++{
++    Q_EMIT messageStateChanged(id, state, reason);
++}
++
++void ImsdMessagingClient::slotRegistrationChanged(bool registered)
++{
++    (void)registered;
++    syncFromDaemon();
++}
++
++QCoro::Task<QDBusReply<QString>> ImsdMessagingClient::send(QString number, QString text, bool statusReport)
++{
++    QDBusMessage call = QDBusMessage::createMethodCall(IMSD_SERVICE, IMSD_PATH, IMSD_MESSAGING_IFACE, SL("Send"));
++    const QVariantMap options{{SL("status-report"), statusReport}};
++    call << number << text << options;
++    const QDBusReply<QString> reply = co_await QDBusPendingReply<QString>(QDBusConnection::systemBus().asyncCall(call));
++    co_return reply;
++}
++
++QCoro::Task<void> ImsdMessagingClient::deleteMessage(QString id)
++{
++    QDBusMessage call = QDBusMessage::createMethodCall(IMSD_SERVICE, IMSD_PATH, IMSD_MESSAGING_IFACE, SL("Delete"));
++    call << id;
++    const QDBusReply<void> reply = co_await QDBusPendingReply<>(QDBusConnection::systemBus().asyncCall(call));
++    if (!reply.isValid()) {
++        qWarning() << "imsd Messaging.Delete failed for" << id << ":" << reply.error().message();
++    }
++}
+diff --git a/daemon/imsdmessagingclient.h b/daemon/imsdmessagingclient.h
+new file mode 100644
+index 0000000..ce4d05c
+--- /dev/null
++++ b/daemon/imsdmessagingclient.h
+@@ -0,0 +1,72 @@
++// SPDX-FileCopyrightText: 2026 Contributors to the lmg820n-linux project
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++#pragma once
++
++#include <QDBusReply>
++#include <QObject>
++#include <QQueue>
++#include <QSet>
++#include <QString>
++#include <QVariantMap>
++
++#include <qcorotask.h>
++
++class QDBusArgument;
++class QDBusServiceWatcher;
++
++struct ImsdStoredMessage {
++    QString id;
++    QVariantMap properties;
++};
++
++QDBusArgument &operator<<(QDBusArgument &argument, const ImsdStoredMessage &message);
++const QDBusArgument &operator>>(const QDBusArgument &argument, ImsdStoredMessage &message);
++
++Q_DECLARE_METATYPE(ImsdStoredMessage)
++
++/**
++ * D-Bus client for net.catcrafts.IMS1.Messaging (SMS over IP in imsd).
++ */
++class ImsdMessagingClient : public QObject
++{
++    Q_OBJECT
++
++public:
++    static ImsdMessagingClient &instance();
++
++    void init();
++
++    bool isEnabled() const;
++    QString ownNumber() const;
++
++    QCoro::Task<QDBusReply<QString>> send(QString number, QString text, bool statusReport = false);
++    QCoro::Task<void> deleteMessage(QString id);
++
++Q_SIGNALS:
++    void messageReceived(const QString &id, const QVariantMap &properties);
++    void messageStateChanged(const QString &id, const QString &state, const QString &reason);
++    void ownNumberChanged(const QString &ownNumber);
++    void availabilityChanged();
++
++private Q_SLOTS:
++    void slotReceived(const QString &id, const QVariantMap &properties);
++    void slotStateChanged(const QString &id, const QString &state, const QString &reason);
++    void slotRegistrationChanged(bool registered);
++
++private:
++    explicit ImsdMessagingClient(QObject *parent = nullptr);
++
++    QCoro::Task<void> syncFromDaemon();
++    void updateOwnNumberFromPpi(const QString &ppi);
++    void emitUniqueIncoming(const QString &id, const QVariantMap &properties);
++
++    bool m_initialized = false;
++    bool m_enabled = false;
++    quint64 m_syncGeneration = 0;
++    QString m_ownNumber;
++    QSet<QString> m_seenIncomingIds;
++    QQueue<QString> m_seenIncomingOrder;
++    QDBusServiceWatcher *m_watcher = nullptr;
++};
+diff --git a/lib/telephonySupport/phonenumber.cpp b/lib/telephonySupport/phonenumber.cpp
+index ce4571c..9760642 100644
+--- a/lib/telephonySupport/phonenumber.cpp
++++ b/lib/telephonySupport/phonenumber.cpp
+@@ -98,6 +98,12 @@ bool PhoneNumber::isValid() const
+     }
+ }
+ 
++bool PhoneNumber::isValidFullNumber() const
++{
++    return d->representation == PhoneNumberPrivate::Parsed
++        && phonenumbers::PhoneNumberUtil::GetInstance()->IsValidNumber(d->number);
++}
++
+ void PhoneNumber::setCountryCode(const QString &code)
+ {
+     countryCode = code.toStdString();
+diff --git a/lib/telephonySupport/phonenumber.h b/lib/telephonySupport/phonenumber.h
+index 9834d80..aa2e9bb 100644
+--- a/lib/telephonySupport/phonenumber.h
++++ b/lib/telephonySupport/phonenumber.h
+@@ -37,6 +37,7 @@ public:
+     QString toNational() const;
+     QString toE164() const;
+     bool isValid() const;
++    bool isValidFullNumber() const;
+     static void setCountryCode(const QString &countryCode);
+ 
+     QString toString() const;

@@ -1,0 +1,98 @@
+diff --git a/implementations/main.cpp b/implementations/main.cpp
+index 8128379..e487d9d 100644
+--- a/implementations/main.cpp
++++ b/implementations/main.cpp
+@@ -1910,13 +1910,15 @@ private:
+         return "/usr/libexec/imsd-media";
+     }
+ 
+-    // Refresh P-Access-Network-Info from the live serving cell (mmcli 3GPP
+-    // location). Serving cell changes as the phone moves, so this runs
+-    // before every REGISTER/INVITE-carrying step; on failure the previous
+-    // value (possibly empty = header omitted) stays.
++    // The serving cell and duplex mode may change between requests.
++    // Retain the previous PANI on transient command failure; clear it only when
++    // both queries succeed and report no LTE serving cell.
+     void RefreshPani() {
+         auto loc = RunCapture({"mmcli", "-m", "any", "--location-get"});
+-        if (auto p = imsd::aka::ParsePani(loc.out)) ctx_.panInfo = *p;
++        if (loc.rc != 0) return;
++        auto rf = RunCapture({"qmicli", "-d", "qrtr://0", "--nas-get-rf-band-info"});
++        if (rf.rc != 0) return;
++        ctx_.panInfo = imsd::aka::ParsePani(loc.out, rf.out).value_or("");
+     }
+ 
+     // ---- bring-up: warm resume if an SA + state file exist, else fresh ----
+diff --git a/interfaces/Imsd-Aka.cppm b/interfaces/Imsd-Aka.cppm
+index ba1491d..b02f68b 100644
+--- a/interfaces/Imsd-Aka.cppm
++++ b/interfaces/Imsd-Aka.cppm
+@@ -279,17 +279,18 @@ export namespace imsd::aka {
+         return s;
+     }
+ 
+-    // P-Access-Network-Info value from `mmcli -m any --location-get`:
+-    // "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=<mcc><mnc><tac:4hex><eci:7hex>"
+-    // (TS 24.229 7.2A.4: E-UTRAN cell id = MCC + MNC as broadcast + 16-bit
+-    // TAC + 28-bit ECI; mmcli prints both hex fields zero-padded wider, so
+-    // take the low digits). The stock modem sends exactly this shape in
+-    // every REGISTER/INVITE — the TAS reads it to see which access the UE
+-    // is reachable on. FDD is a constant: every KPN LTE band in use is FDD
+-    // and MM does not expose the duplex mode. nullopt when the fields are
+-    // missing or zero (no serving cell) — callers then omit the header
+-    // rather than fabricate one.
+-    std::optional<std::string> ParsePani(std::string_view text) {
++    // TS 24.229 7.2A.4 uses the serving E-UTRA duplex mode and the
++    // broadcast PLMN, 16-bit TAC and 28-bit ECI for P-Access-Network-Info.
++    // mmcli supplies the cell identifiers and QMI supplies the LTE band.
++    std::optional<std::string> ParsePani(std::string_view text, std::string_view rfInfo) {
++        auto bandNumber = detail::Digits(rfInfo, "Active Band Class: 'eutran-");
++        if (!bandNumber) return std::nullopt;
++        int band{};
++        auto parsed = std::from_chars(bandNumber->data(), bandNumber->data() + bandNumber->size(), band);
++        if (parsed.ec != std::errc{} || band < 1) return std::nullopt;
++        // TS 36.101 Table 5.5-1 assigns LTE bands 33 through 54 to TDD.
++        std::string_view duplex = band >= 33 && band <= 54 ? "TDD" : "FDD";
++
+         auto mcc = detail::Digits(text, "operator mcc:");
+         auto mnc = detail::Digits(text, "operator mnc:");
+         auto hexAfter = [&](std::string_view label) -> std::optional<std::string> {
+@@ -312,7 +313,7 @@ export namespace imsd::aka {
+         if (ci->size() > 7) *ci = ci->substr(ci->size() - 7);
+         while (ci->size() < 7) ci->insert(ci->begin(), '0');
+         if (tac->find_first_not_of('0') == std::string::npos && ci->find_first_not_of('0') == std::string::npos) return std::nullopt;
+-        return std::format("3GPP-E-UTRAN-FDD;utran-cell-id-3gpp={}{}{}{}", *mcc, *mnc, *tac, *ci);
++        return std::format("3GPP-E-UTRAN-{};utran-cell-id-3gpp={}{}{}{}", duplex, *mcc, *mnc, *tac, *ci);
+     }
+ 
+     // ---- AUTHENTICATE(AKA) APDU (ISO 7816-4 over the qmicli UIM channel) ----
+diff --git a/tests/Aka/main.cpp b/tests/Aka/main.cpp
+index 6d1a3e1..5351c1a 100644
+--- a/tests/Aka/main.cpp
++++ b/tests/Aka/main.cpp
+@@ -228,16 +228,20 @@ int main() {
+             "       | location area code: 0000\n"
+             "       | tracking area code: 001234\n"
+             "       |            cell id: 00ABCDE0\n";
+-        auto p = ParsePani(Loc);
+-        Check(p.has_value(), "PANI parses");
+-        Check(p == "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010112340ABCDE0", "PANI concatenation mcc+mnc+TAC+ECI");
+-        Check(!ParsePani("no location here").has_value(), "PANI absent fields rejected");
++        constexpr std::string_view Fdd = "   Active Band Class: 'eutran-28'\n";
++        constexpr std::string_view Tdd = "   Active Band Class: 'eutran-39'\n";
++        Check(ParsePani(Loc, Fdd) == "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010112340ABCDE0",
++              "PANI uses the FDD band and serving cell");
++        Check(ParsePani(Loc, Tdd) == "3GPP-E-UTRAN-TDD;utran-cell-id-3gpp=0010112340ABCDE0",
++              "PANI uses the TDD band and serving cell");
++        Check(!ParsePani(Loc, "   Active Band Class: 'wcdma-2100'\n"), "PANI requires an LTE band");
++        Check(!ParsePani("no location here", Tdd), "PANI absent fields rejected");
+         constexpr std::string_view Zeros =
+             "  3GPP |       operator mcc: 001\n"
+             "       |       operator mnc: 01\n"
+             "       | tracking area code: 000000\n"
+             "       |            cell id: 00000000\n";
+-        Check(!ParsePani(Zeros).has_value(), "PANI all-zero cell rejected");
++        Check(!ParsePani(Zeros, Fdd), "PANI all-zero cell rejected");
+     }
+ 
+     // ---- the ISIM application of the slot in use

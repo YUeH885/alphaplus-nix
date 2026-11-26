@@ -1,0 +1,20 @@
+--- a/src/core/dnsmasq/nm-dnsmasq-manager.c
++++ b/src/core/dnsmasq/nm-dnsmasq-manager.c
+@@ -141,7 +141,7 @@ create_dm_cmd_line(const char           *iface,
+ 
+     nm_strv_ptrarray_add_string_dup(cmd, "--no-hosts");
+     nm_strv_ptrarray_add_string_dup(cmd, "--keep-in-foreground");
+-    nm_strv_ptrarray_add_string_dup(cmd, "--bind-interfaces");
++    nm_strv_ptrarray_add_string_dup(cmd, "--bind-dynamic");
+     nm_strv_ptrarray_add_string_dup(cmd, "--except-interface=lo");
+     nm_strv_ptrarray_add_string_dup(cmd, "--clear-on-reload");
+ 
+@@ -153,7 +153,7 @@ create_dm_cmd_line(const char           *iface,
+ 
+     nm_inet4_ntop(listen_address->address, listen_address_s);
+ 
+-    nm_strv_ptrarray_add_string_concat(cmd, "--listen-address=", listen_address_s);
++    nm_strv_ptrarray_add_string_concat(cmd, "--interface=", iface);
+ 
+     shared_dhcp_lease_time = (shared_dhcp_lease_time != 0) ? shared_dhcp_lease_time : 3600;
+     if (shared_dhcp_range && *shared_dhcp_range) {

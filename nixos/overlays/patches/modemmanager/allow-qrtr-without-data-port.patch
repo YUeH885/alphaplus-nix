@@ -1,0 +1,78 @@
+--- a/src/mm-base-modem.c
++++ b/src/mm-base-modem.c
+@@ -1471,6 +1471,7 @@
+     MMPortSerialAt *data_at_primary = NULL;
+     MMPort *xmmrpc = NULL;
+     GList *l;
++    gboolean control_only = FALSE;
+     /* These lists don't keep full references, so they should be
+      * g_list_free()-ed on error exits */
+     g_autoptr(GList) data_at = NULL;
+@@ -1638,8 +1639,11 @@
+         secondary = backup_primary ? backup_primary : backup_secondary;
+ 
+ #if defined WITH_QMI
+-    /* On QMI-based modems, we need to have at least a net port */
+-    if (qmi && !data_net) {
++    /* An integrated QRTR modem can expose SIM management before its
++     * packet data interface is available. */
++    control_only = qmi && !qmi->next && !data_net &&
++                   mm_port_get_subsys (MM_PORT (qmi->data)) == MM_PORT_SUBSYS_QRTR;
++    if (qmi && !data_net && !control_only) {
+         g_set_error_literal (error,
+                              MM_CORE_ERROR,
+                              MM_CORE_ERROR_FAILED,
+@@ -1742,7 +1746,7 @@
+ 
+     /* Fail if we haven't added any single data port; this is probably a plugin
+      * misconfiguration */
+-    if (!self->priv->data) {
++    if (!self->priv->data && !control_only) {
+         g_set_error_literal (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                              "Failed to find a data port in the modem");
+         return FALSE;
+@@ -1750,12 +1754,14 @@
+ 
+ #if defined WITH_QMI
+     if (qmi) {
+-        /* The first item in the data list must be a net port, because
+-         * QMI modems only expect net ports */
+-        g_assert (MM_IS_PORT_NET (self->priv->data->data));
+-        /* let the MMPortQmi know which net driver is being used, taken
+-         * from the first item in the net port list */
+-        g_list_foreach (qmi, (GFunc)mm_port_qmi_set_net_details, (gpointer) MM_PORT (self->priv->data->data));
++        if (self->priv->data) {
++            /* The first item in the data list must be a net port, because
++             * QMI modems only expect net ports */
++            g_assert (MM_IS_PORT_NET (self->priv->data->data));
++            /* let the MMPortQmi know which net driver is being used, taken
++             * from the first item in the net port list */
++            g_list_foreach (qmi, (GFunc)mm_port_qmi_set_net_details, (gpointer) MM_PORT (self->priv->data->data));
++        }
+ 
+         g_list_foreach (qmi, (GFunc)g_object_ref, NULL);
+         self->priv->qmi = g_steal_pointer (&qmi);
+--- a/src/mm-broadband-modem-qmi.c
++++ b/src/mm-broadband-modem-qmi.c
+@@ -13860,14 +13860,19 @@
+ static void
+ initialization_open_port (GTask *task)
+ {
++    MMBaseModem *self;
+     InitializationStartedContext *ctx;
++    gboolean has_data_ports;
+ 
++    self = g_task_get_source_object (task);
+     ctx = g_task_get_task_data (task);
++    has_data_ports = mm_base_modem_peek_data_ports (self) != NULL;
+ 
+     mm_port_qmi_open (ctx->qmi,
+-                      TRUE,
++                      has_data_ports,
+                       NULL,
+-                      (GAsyncReadyCallback)qmi_port_open_ready,
++                      has_data_ports ? (GAsyncReadyCallback)qmi_port_open_ready :
++                                       (GAsyncReadyCallback)qmi_port_open_ready_no_data_format,
+                       task);
+ }
+ 

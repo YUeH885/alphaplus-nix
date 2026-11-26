@@ -1,0 +1,263 @@
+diff --git a/kcms/kcm_connections/qml/ConfigurationDialog.qml b/kcms/kcm_connections/qml/ConfigurationDialog.qml
+index 8aef687..4ff44ff 100644
+--- a/kcms/kcm_connections/qml/ConfigurationDialog.qml
++++ b/kcms/kcm_connections/qml/ConfigurationDialog.qml
+@@ -73,6 +73,7 @@ QQC2.ApplicationWindow {
+             Kirigami.PasswordField {
+                 id: hotspotPassword
+                 Layout.fillWidth: true
++                KeyNavigation.down: hotspotBand
+                 Kirigami.FormData.label: i18nc("@label Hotspot password", "Password:")
+                 showPassword: true
+                 validator: RegularExpressionValidator {
+@@ -82,6 +83,14 @@ QQC2.ApplicationWindow {
+                         : /^$|^(?:.{5}|[0-9a-fA-F]{10}|.{13}|[0-9a-fA-F]{26}){1}$/
+                 }
+             }
++
++            QQC2.ComboBox {
++                id: hotspotBand
++                Layout.fillWidth: true
++                KeyNavigation.up: hotspotPassword
++                Kirigami.FormData.label: i18nc("@label Hotspot band", "Band:")
++                model: [i18n("5 GHz"), i18n("2.4 GHz")]
++            }
+         }
+ 
+         footer: ColumnLayout {
+@@ -118,13 +127,13 @@ QQC2.ApplicationWindow {
+         onRejected: root.reject()
+         onReset: root.loadConfiguration()
+ 
+-        KeyNavigation.up: hotspotPassword
++        KeyNavigation.up: hotspotBand
+ 
+         Component.onCompleted: {
+             const okButton = standardButton(QQC2.DialogButtonBox.Ok);
+             if (okButton) {
+                 okButton.enabled = Qt.binding(() => root.acceptableConfiguration());
+-                hotspotPassword.KeyNavigation.down = okButton;
++                hotspotBand.KeyNavigation.down = okButton;
+             }
+         }
+     }
+@@ -163,6 +172,7 @@ QQC2.ApplicationWindow {
+         systemConnectionsByDefault.checked = PlasmaNM.Configuration.systemConnectionsByDefault;
+         hotspotName.text = PlasmaNM.Configuration.hotspotName;
+         hotspotPassword.text = PlasmaNM.Configuration.hotspotPassword;
++        hotspotBand.currentIndex = PlasmaNM.Configuration.hotspotBand === "bg" ? 1 : 0;
+     }
+ 
+     function saveConfiguration() {
+@@ -171,6 +181,7 @@ QQC2.ApplicationWindow {
+         PlasmaNM.Configuration.systemConnectionsByDefault = systemConnectionsByDefault.checked;
+         PlasmaNM.Configuration.hotspotName = hotspotName.text;
+         PlasmaNM.Configuration.hotspotPassword = hotspotPassword.text;
++        PlasmaNM.Configuration.hotspotBand = hotspotBand.currentIndex === 1 ? "bg" : "a";
+     }
+ 
+     onVisibleChanged: {
+diff --git a/kcms/kcm_hotspot/ui/main.qml b/kcms/kcm_hotspot/ui/main.qml
+index d355b99..e70dc09 100644
+--- a/kcms/kcm_hotspot/ui/main.qml
++++ b/kcms/kcm_hotspot/ui/main.qml
+@@ -14,6 +14,10 @@ import org.kde.kirigamiaddons.formcard as FormCard
+ SimpleKCM {
+     id: root
+ 
++    function hotspotBandLabel(band) {
++        return band === "bg" ? i18n("2.4 GHz") : i18n("5 GHz");
++    }
++
+     leftPadding: 0
+     rightPadding: 0
+     topPadding: 0
+@@ -36,15 +40,18 @@ SimpleKCM {
+             onOpened: {
+                 hotspotSsidField.text = PlasmaNM.Configuration.hotspotName;
+                 hotspotPasswordField.text = PlasmaNM.Configuration.hotspotPassword;
++                hotspotBandField.currentIndex = PlasmaNM.Configuration.hotspotBand === "bg" ? 1 : 0;
+             }
+ 
+             onAccepted: {
+                 PlasmaNM.Configuration.hotspotName = hotspotSsidField.text;
+                 PlasmaNM.Configuration.hotspotPassword = hotspotPasswordField.text;
++                PlasmaNM.Configuration.hotspotBand = hotspotBandField.currentIndex === 1 ? "bg" : "a";
+ 
+                 // these properties need to be manually updated since they're not NOTIFYable
+                 hotspotSSIDText.description = PlasmaNM.Configuration.hotspotName;
+                 hotspotPasswordText.description = PlasmaNM.Configuration.hotspotPassword;
++                hotspotBandText.description = root.hotspotBandLabel(PlasmaNM.Configuration.hotspotBand);
+             }
+ 
+             ColumnLayout {
+@@ -64,6 +71,15 @@ SimpleKCM {
+                     Layout.fillWidth: true
+                     id: hotspotPasswordField
+                 }
++                Controls.Label {
++                    text: i18n("Hotspot Band:")
++                    textFormat: Text.PlainText
++                }
++                Controls.ComboBox {
++                    Layout.fillWidth: true
++                    id: hotspotBandField
++                    model: [i18n("5 GHz"), i18n("2.4 GHz")]
++                }
+             }
+         }
+     ]
+@@ -114,6 +130,15 @@ SimpleKCM {
+ 
+             FormCard.FormDelegateSeparator {}
+ 
++            FormCard.FormTextDelegate {
++                id: hotspotBandText
++                enabled: !hotspotToggle.checked
++                text: i18n("Hotspot Band")
++                description: root.hotspotBandLabel(PlasmaNM.Configuration.hotspotBand)
++            }
++
++            FormCard.FormDelegateSeparator {}
++
+             FormCard.FormButtonDelegate {
+                 enabled: !hotspotToggle.checked
+                 text: i18n("Configure")
+diff --git a/libs/configurationproxy.cpp b/libs/configurationproxy.cpp
+index c1ca036..424528f 100644
+--- a/libs/configurationproxy.cpp
++++ b/libs/configurationproxy.cpp
+@@ -83,6 +83,18 @@ void ConfigurationProxy::setHotspotPassword(const QString &password)
+     }
+ }
+ 
++QString ConfigurationProxy::hotspotBand() const
++{
++    return mConfiguration->hotspotBand();
++}
++
++void ConfigurationProxy::setHotspotBand(const QString &band)
++{
++    if (mConfiguration) {
++        mConfiguration->setHotspotBand(band);
++    }
++}
++
+ QString ConfigurationProxy::hotspotConnectionPath() const
+ {
+     return mConfiguration->hotspotConnectionPath();
+diff --git a/libs/configurationproxy.h b/libs/configurationproxy.h
+index ff8a795..b015064 100644
+--- a/libs/configurationproxy.h
++++ b/libs/configurationproxy.h
+@@ -27,6 +27,7 @@ class PLASMANM_INTERNAL_EXPORT ConfigurationProxy : public QObject
+     Q_PROPERTY(bool systemConnectionsByDefault READ systemConnectionsByDefault WRITE setSystemConnectionsByDefault)
+     Q_PROPERTY(QString hotspotName READ hotspotName WRITE setHotspotName)
+     Q_PROPERTY(QString hotspotPassword READ hotspotPassword WRITE setHotspotPassword)
++    Q_PROPERTY(QString hotspotBand READ hotspotBand WRITE setHotspotBand)
+     Q_PROPERTY(QString hotspotConnectionPath READ hotspotConnectionPath WRITE setHotspotConnectionPath)
+ 
+     // Readonly constant property, as this value should only be set by the platform
+@@ -48,6 +49,9 @@ public:
+     QString hotspotPassword() const;
+     void setHotspotPassword(const QString &password);
+ 
++    QString hotspotBand() const;
++    void setHotspotBand(const QString &band);
++
+     QString hotspotConnectionPath() const;
+     void setHotspotConnectionPath(const QString &path);
+ 
+diff --git a/libs/editor/configuration.cpp b/libs/editor/configuration.cpp
+index 79c794d..a641b8e 100644
+--- a/libs/editor/configuration.cpp
++++ b/libs/editor/configuration.cpp
+@@ -164,6 +164,33 @@ void Configuration::setHotspotPassword(const QString &password)
+     }
+ }
+ 
++QString Configuration::hotspotBand() const
++{
++    KSharedConfigPtr config = KSharedConfig::openConfig(QStringLiteral("plasma-nm"));
++    KConfigGroup grp(config, QStringLiteral("General"));
++
++    if (grp.isValid()) {
++        const QString band = grp.readEntry(QStringLiteral("HotspotBand"), QStringLiteral("a"));
++        if (band == QLatin1String("bg")) {
++            return band;
++        }
++    }
++
++    return QStringLiteral("a");
++}
++
++void Configuration::setHotspotBand(const QString &band)
++{
++    KSharedConfigPtr config = KSharedConfig::openConfig(QStringLiteral("plasma-nm"));
++    KConfigGroup grp(config, QStringLiteral("General"));
++
++    if (grp.isValid()) {
++        const QString normalized = band == QLatin1String("bg") ? QStringLiteral("bg") : QStringLiteral("a");
++        grp.writeEntry(QStringLiteral("HotspotBand"), normalized, KConfigBase::Notify);
++        grp.sync();
++    }
++}
++
+ QString Configuration::hotspotConnectionPath() const
+ {
+     KSharedConfigPtr config = KSharedConfig::openConfig(QStringLiteral("plasma-nm"));
+diff --git a/libs/editor/configuration.h b/libs/editor/configuration.h
+index f9ea9ce..d974ce8 100644
+--- a/libs/editor/configuration.h
++++ b/libs/editor/configuration.h
+@@ -33,6 +33,9 @@ public:
+     QString hotspotPassword() const;
+     void setHotspotPassword(const QString &password);
+ 
++    QString hotspotBand() const;
++    void setHotspotBand(const QString &band);
++
+     QString hotspotConnectionPath() const;
+     void setHotspotConnectionPath(const QString &path);
+ 
+diff --git a/libs/handler.cpp b/libs/handler.cpp
+index 05f16ce..f569385 100644
+--- a/libs/handler.cpp
++++ b/libs/handler.cpp
+@@ -821,6 +821,18 @@ QCoro::Task<> Handler::createHotspotInternal()
+     wifiSetting->setInitialized(true);
+     wifiSetting->setMode(useApMode ? NetworkManager::WirelessSetting::Ap : NetworkManager::WirelessSetting::Adhoc);
+ 
++    const bool use5GhzBand = useApMode
++        && Configuration::self().hotspotBand() != QLatin1String("bg")
++        && wifiDev->wirelessCapabilities().testFlag(NetworkManager::WirelessDevice::Freq5Ghz);
++    if (useApMode) {
++        if (use5GhzBand) {
++            wifiSetting->setBand(NetworkManager::WirelessSetting::A);
++            wifiSetting->setChannel(36);
++        } else {
++            wifiSetting->setBand(NetworkManager::WirelessSetting::Bg);
++        }
++    }
++
+     if (!Configuration::self().hotspotPassword().isEmpty()) {
+         NetworkManager::WirelessSecuritySetting::Ptr wifiSecurity =
+             connectionSettings->setting(NetworkManager::Setting::WirelessSecurity).dynamicCast<NetworkManager::WirelessSecuritySetting>();
+@@ -852,9 +864,16 @@ QCoro::Task<> Handler::createHotspotInternal()
+ 
+     const QVariantMap options = {{QLatin1String("persist"), QLatin1String("volatile")}};
+ 
++    NMVariantMapMap connectionMap = connectionSettings->toMap();
++    if (use5GhzBand) {
++        // NetworkManager requires an explicit channel alongside channel-width;
++        // setting 80 MHz enables 802.11ac (Wi-Fi 5) VHT80 instead of defaulting to 20 MHz.
++        connectionMap[QStringLiteral("802-11-wireless")].insert(QStringLiteral("channel-width"), QVariant::fromValue<qint32>(80));
++    }
++
+     QPointer<Handler> thisGuard(this);
+     QDBusPendingReply<QDBusObjectPath, QDBusObjectPath, QVariantMap> reply =
+-        co_await NetworkManager::addAndActivateConnection2(connectionSettings->toMap(), wifiDev->uni(), QString(), options);
++        co_await NetworkManager::addAndActivateConnection2(connectionMap, wifiDev->uni(), QString(), options);
+     if (!thisGuard) {
+         co_return;
+     }

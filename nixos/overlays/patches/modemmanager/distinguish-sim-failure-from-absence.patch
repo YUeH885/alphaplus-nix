@@ -1,0 +1,11 @@
+--- a/src/mm-broadband-modem.c
++++ b/src/mm-broadband-modem.c
+@@ -13378,7 +13378,7 @@
+                  g_error_matches (error,
+                                   MM_MOBILE_EQUIPMENT_ERROR,
+                                   MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG))
+-            failed_reason = MM_MODEM_STATE_FAILED_REASON_SIM_MISSING;
++            failed_reason = MM_MODEM_STATE_FAILED_REASON_SIM_ERROR;
+         else if (g_error_matches (error,
+                                   MM_CORE_ERROR,
+                                   MM_CORE_ERROR_WRONG_SIM_STATE))
