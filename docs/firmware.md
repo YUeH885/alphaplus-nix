@@ -10,6 +10,7 @@
 | SLPI | `slpi.mdt`、`slpi.bNN`、`slpir.jsn`、`slpius.jsn` | 原厂 modem |
 | Iris VPU | `qcom/sm8150/lmg820n/venus.mdt`、`venus.bNN` | 原厂 modem |
 | MPSS | `modem.mdt`、`modem.bNN`、`modemr.jsn`、`modemuw.jsn`、`modem_pr/` | 原厂 modem |
+| IPA GSI | `qcom/sm8150/lmg820n/ipa_fws.mdt`、`ipa_fws.bNN` | 原厂 modem，由 AP 通过 PAS 加载 |
 | WLFW | `wlanmdsp.mbn` | 原厂 modem，由 `tqftpserv` 提供 |
 | ath10k | `ath10k/WCN3990/hw1.0/{board.bin,firmware-5.bin}` | 原厂板级参数 + 上游 `linux-firmware` |
 | Bluetooth | `qca/lmg820n-crbtfw21.tlv`、`qca/lmg820n-crnv21.bin` | 原厂 vendor |

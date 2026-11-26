@@ -17,9 +17,13 @@
 - **动态声道跟随旋转**：`alphaplus-audio-orientation` 监听 Wayland `DSI-1` 旋转方向，通过 WirePlumber 2×2 filter-graph 在 DSP 前交换左右声道或混为单声道（竖屏）。
 - **高采样率直通与扬声器锁频**：[audio.nix](../../nixos/modules/hardware/audio.nix) 与内核共同对有线耳机（`TERT_MI2S_RX`）放行 `44.1 / 48 / 88.2 / 96 / 176.4 / 192 kHz`（`S32_LE`）；[51-alphaplus-audio.conf](../../nixos/files/wireplumber/wireplumber.conf.d/51-alphaplus-audio.conf) 将扬声器节点锁定在 `48 kHz` 以匹配固定 `SEC_MI2S_RX` / TFADSP 后端。
 
+## 蜂窝通话音频
+
+- `imsd-media` 通过 PipeWire 处理 VoLTE 的 RTP 音频。Plasma Dialer 通过 `callaudiod` 选择通话时的音频设备。
+- `alphaplus-call-audio` 根据 ModemManager 的通话状态启停 QDSP6 `VoiceMMode1`。下行使用 `SEC_MI2S_RX`，上行使用 WCD9340 的 `SLIMBUS_0_TX`。
+
 ## 未实现
 
 - **TFA9872 SaaM 扬声器拾音（DMIC0）**：缺少 `saam_ctl`、WCD9340 DMIC0/ADC MUX8 时钟路由及 `Speaker microphone` ACP 端口。
-- **蜂窝通话语音 DSP（Q6Voice）**：缺少 MVM/CVS/CVP 语音前后级驱动及 ModemManager/oFono 通话路由集成。
 - **FM 收音接收**：主线缺少控制协议驱动与 AFE 后端路由。
 - **AMIC4 麦克风**：实测仅为底噪（疑似韩版未贴片或偏置特殊），未开放为可用输入。
