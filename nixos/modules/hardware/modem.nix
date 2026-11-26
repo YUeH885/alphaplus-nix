@@ -136,6 +136,7 @@ in
       ExecStart = "${pkgs.rmtfs}/bin/rmtfs -r -P -s";
       Restart = "always";
       RestartSec = "1s";
+      TimeoutStopSec = 10;
     };
   };
 
@@ -151,6 +152,7 @@ in
       ExecStart = "${pkgs.tqftpserv}/bin/tqftpserv";
       Restart = "always";
       RestartSec = "1s";
+      TimeoutStopSec = 10;
     };
   };
 

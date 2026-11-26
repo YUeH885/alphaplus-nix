@@ -21,6 +21,7 @@ EXTERNAL_ACTIONS = frozenset({
 INPUT_EVENT = struct.Struct("llHHi")
 EV_KEY, EV_REL, EV_ABS, EV_SW = 1, 2, 3, 5
 ABS_MT_TRACKING_ID = 0x39
+USB_SLEEP_POLICY = "@usb_sleep_policy@"
 
 
 @dataclass(frozen=True)
@@ -140,34 +141,45 @@ class InputMonitor:
         return active
 
 
+def apply_usb_sleep_policy(action):
+    result = subprocess.run([USB_SLEEP_POLICY, action], check=False)
+    if result.returncode != 0:
+        print(f"USB sleep policy {action} exited with {result.returncode}", file=sys.stderr, flush=True)
+
+
 def main():
     summary_action = Path("/sys/class/power_supply/parallel/device").resolve(strict=True).parent.name
-    with InputMonitor() as inputs:
-        before = read_irqs()
-        while True:
-            subprocess.run(["/usr/lib/systemd/systemd-sleep", "suspend"], check=True)
-            wakeup_irq = read_wakeup_irq()
-            after = read_irqs()
-            if inputs.active() or not maintenance_wakeup(before, after, wakeup_irq, summary_action):
-                print(f"Suspend completed on wakeup IRQ {wakeup_irq}", flush=True)
-                return 0
+    apply_usb_sleep_policy("prepare")
+    try:
+        with InputMonitor() as inputs:
+            before = read_irqs()
+            while True:
+                subprocess.run(["/usr/lib/systemd/systemd-sleep", "suspend"], check=True)
+                wakeup_irq = read_wakeup_irq()
+                after = read_irqs()
+                if inputs.active() or not maintenance_wakeup(before, after, wakeup_irq, summary_action):
+                    print(f"Suspend completed on wakeup IRQ {wakeup_irq}", flush=True)
+                    return 0
 
-            # Wait for resumed drivers' wakeup sources before arming the next sleep.
-            count = Path("/sys/power/wakeup_count").read_text()
-            current = read_irqs()
-            if inputs.active() or not maintenance_wakeup(before, current, wakeup_irq, summary_action):
-                return 0
-            try:
-                Path("/sys/power/wakeup_count").write_text(count)
-            except OSError as error:
-                if error.errno != errno.EINVAL:
-                    raise
-                print("A new wakeup event arrived before suspend", flush=True)
-                return 0
+                apply_usb_sleep_policy("prepare")
+                # Wait for resumed drivers' wakeup sources before arming the next sleep.
+                count = Path("/sys/power/wakeup_count").read_text()
+                current = read_irqs()
+                if inputs.active() or not maintenance_wakeup(before, current, wakeup_irq, summary_action):
+                    return 0
+                try:
+                    Path("/sys/power/wakeup_count").write_text(count)
+                except OSError as error:
+                    if error.errno != errno.EINVAL:
+                        raise
+                    print("A new wakeup event arrived before suspend", flush=True)
+                    return 0
 
-            actions = ",".join(sorted(after[wakeup_irq].actions))
-            print(f"Charger maintenance on IRQ {wakeup_irq} ({actions}); suspending again", flush=True)
-            before = current
+                actions = ",".join(sorted(after[wakeup_irq].actions))
+                print(f"Charger maintenance on IRQ {wakeup_irq} ({actions}); suspending again", flush=True)
+                before = current
+    finally:
+        apply_usb_sleep_policy("restore")
 
 
 if __name__ == "__main__":

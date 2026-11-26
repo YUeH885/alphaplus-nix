@@ -11,5 +11,11 @@
     };
   };
 
-  systemd.services.neard.wantedBy = [ "multi-user.target" ];
+  systemd.services.neard = {
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      Restart = "on-failure";
+      RestartSec = "1s";
+    };
+  };
 }

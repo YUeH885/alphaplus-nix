@@ -4,14 +4,19 @@
   environment.systemPackages = [ pkgs.alphaplus-gnssd ];
   services.geoclue2 = {
     enable = true;
-    package = pkgs.geoclue2.overrideAttrs (old: {
-      patches = (old.patches or [ ]) ++ [
-        ./patches/geoclue/0001-authorize-native-applications.patch
-      ];
-    });
+    package = pkgs.geoclue2-alphaplus;
   };
   environment.etc."geoclue/conf.d/80-alphaplus-gnss.conf".source =
     ../../files/geoclue/80-alphaplus-gnss.conf;
+
+  security.polkit.extraConfig = ''
+    polkit.addRule(function(action, subject) {
+      if (action.id == "org.freedesktop.ModemManager1.Location" &&
+          subject.user == "_gnss") {
+        return polkit.Result.YES;
+      }
+    });
+  '';
 
   users.users._gnss = {
     isSystemUser = true;

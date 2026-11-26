@@ -56,6 +56,104 @@ let
     python3 ${../../files/desktop/configure-plasma-shell.py} root
     mv root/org.kde.plasma.desktop "$out/"
   '';
+  # WrapQtAppsHook expands transitive dependencies into ~80 XDG_DATA_DIRS entries, which stalls
+  # Plasma startup on ENOENT lookups; rebuild a thin shell wrapper that keeps Qt/QML search paths
+  # from upstream makeCWrapper while leaving XDG_DATA_DIRS to the compact systemd environment.
+  mkTrimmedExec = pkg: binRelPath:
+    pkgs.runCommand "alphaplus-${baseNameOf binRelPath}-trimmed" {
+      nativeBuildInputs = [ pkgs.buildPackages.python3 ];
+    } ''
+      python3 - "${pkg}/${binRelPath}" "${pkgs.runtimeShell}" "$out" << 'EOF'
+      import os, shlex, sys
+
+      src, shell, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+      real = os.path.realpath(src)
+      data = open(real, "rb").read().decode("latin1")
+      idx = data.find("makeCWrapper")
+      if idx == -1:
+          raise SystemExit(f"Expected makeCWrapper in {real}")
+      block = data[idx:].split("\x00")[0]
+
+      tokens = shlex.split(block.replace("\\\n", " "), comments=True)
+      if len(tokens) < 2 or tokens[0] != "makeCWrapper":
+          raise SystemExit(f"Invalid makeCWrapper header in {real}")
+      target = tokens[1]
+
+      lines = [f"#!{shell}"]
+      prefixes = {}
+      suffixes = {}
+      sets = {}
+      defaults = {}
+      i = 2
+      while i < len(tokens):
+          flag = tokens[i]
+          if flag == "--inherit-argv0":
+              i += 1
+          elif flag in ("--prefix", "--suffix"):
+              if i + 3 >= len(tokens):
+                  raise SystemExit(f"Incomplete {flag} arguments in {real}")
+              var, sep, val = tokens[i + 1], tokens[i + 2], tokens[i + 3]
+              i += 4
+              if var == "XDG_DATA_DIRS":
+                  continue
+              target_map = prefixes if flag == "--prefix" else suffixes
+              items = target_map.setdefault(var, [])
+              for entry in val.split(sep or ":"):
+                  if entry and entry not in items:
+                      items.append(entry)
+          elif flag in ("--set", "--set-default"):
+              if i + 2 >= len(tokens):
+                  raise SystemExit(f"Incomplete {flag} arguments in {real}")
+              var, val = tokens[i + 1], tokens[i + 2]
+              i += 3
+              if var == "XDG_DATA_DIRS":
+                  continue
+              if flag == "--set":
+                  sets[var] = val
+              else:
+                  defaults[var] = val
+          else:
+              raise SystemExit(f"Unsupported wrapper flag {flag} in {real}")
+
+      for var, items in prefixes.items():
+          if var == "QT_PLUGIN_PATH" and "/run/current-system/sw/lib/qt-6/plugins" not in items:
+              items.append("/run/current-system/sw/lib/qt-6/plugins")
+          elif var == "NIXPKGS_QT6_QML_IMPORT_PATH" and "/run/current-system/sw/lib/qt-6/qml" not in items:
+              items.append("/run/current-system/sw/lib/qt-6/qml")
+          joined = ":".join(items)
+          lines.append("export " + var + "=" + shlex.quote(joined) + '"''${' + var + ':+:$' + var + '}"')
+      for var, items in suffixes.items():
+          joined = ":".join(items)
+          lines.append("export " + var + '="''${' + var + ':+$' + var + ':}"' + shlex.quote(joined))
+      for var, val in sets.items():
+          lines.append("export " + var + "=" + shlex.quote(val))
+      for var, val in defaults.items():
+          lines.append('if [ -z "''${' + var + ':-}" ]; then export ' + var + "=" + shlex.quote(val) + "; fi")
+      if "NIXPKGS_QT6_QML_IMPORT_PATH" in prefixes:
+          lines.append('export QML2_IMPORT_PATH="$NIXPKGS_QT6_QML_IMPORT_PATH''${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"')
+      lines.append(f"exec {shlex.quote(target)} \"$@\"")
+
+      with open(dst, "w") as f:
+          f.write("\n".join(lines) + "\n")
+      os.chmod(dst, 0o755)
+      EOF
+    '';
+  mkTrimmedPlasmaService = { pkg, bin, args ? "", after ? [ ], serviceConfig ? { } }: {
+    overrideStrategy = "asDropin";
+    enableDefaultPath = false;
+    after = [ "dbus.service" ] ++ after;
+    environment.XDG_DATA_DIRS = lib.concatStringsSep ":" [
+      "%h/.local/share"
+      "%h/.nix-profile/share"
+      "%h/.local/state/nix/profile/share"
+      "/etc/profiles/per-user/%u/share"
+      "/nix/var/nix/profiles/default/share"
+      "/run/current-system/sw/share"
+    ];
+    serviceConfig = {
+      ExecStart = [ "" "${mkTrimmedExec pkg bin}${lib.optionalString (args != "") " ${args}"}" ];
+    } // serviceConfig;
+  };
 in
 {
   imports = [ ./sddm.nix ];
@@ -97,6 +195,7 @@ in
     helpers
     alphaplus-flashlight
     alphaplus-bypass-charging
+    alphaplus-nfc
     plasma-nm-alphaplus
     plasmaDialer
     spacebar-alphaplus
@@ -108,6 +207,7 @@ in
     qrcaWithLibcamera
     ffmpeg-vpu
     kdePackages.plasma-browser-integration
+    kdePackages.plasma5support
     kdePackages.konsole
     kdePackages.dolphin
   ];
@@ -137,14 +237,72 @@ in
     Hidden=true
   '';
 
-  systemd.user.services.xdg-user-dirs = {
-    overrideStrategy = "asDropin";
-    wantedBy = [ "graphical-session-pre.target" ];
-    environment = {
-      LC_ALL = "C.UTF-8";
-      LANG = "C.UTF-8";
+  systemd.user.services = {
+    xdg-user-dirs = {
+      overrideStrategy = "asDropin";
+      wantedBy = [ "graphical-session-pre.target" ];
+      environment = {
+        LC_ALL = "C.UTF-8";
+        LANG = "C.UTF-8";
+      };
     };
+
+    plasma-kwin_wayland = {
+      overrideStrategy = "asDropin";
+      enableDefaultPath = false;
+      after = [ "dbus.service" ];
+    };
+
+    plasma-ksplash = mkTrimmedPlasmaService {
+      pkg = pkgs.kdePackages.plasma-workspace;
+      bin = "bin/ksplashqml";
+    };
+
+    plasma-ksmserver = mkTrimmedPlasmaService {
+      pkg = pkgs.kdePackages.plasma-workspace;
+      bin = "bin/ksmserver";
+    };
+
+    plasma-kded6 = mkTrimmedPlasmaService {
+      pkg = pkgs.kdePackages.kded;
+      bin = "bin/kded6";
+    };
+
+    plasma-plasmashell = mkTrimmedPlasmaService {
+      pkg = pkgs.kdePackages.plasma-workspace;
+      bin = "bin/plasmashell";
+      args = "--no-respawn";
+      serviceConfig.TimeoutStopSec = "5s";
+    };
+
+    plasma-powerdevil = mkTrimmedPlasmaService {
+      pkg = pkgs.kdePackages.powerdevil;
+      bin = "libexec/org_kde_powerdevil";
+    };
+
+    plasma-polkit-agent = mkTrimmedPlasmaService {
+      pkg = pkgs.kdePackages.polkit-kde-agent-1;
+      bin = "libexec/polkit-kde-authentication-agent-1";
+    };
+
+    plasma-kactivitymanagerd = mkTrimmedPlasmaService {
+      pkg = pkgs.kdePackages.kactivitymanagerd;
+      bin = "libexec/kactivitymanagerd";
+    };
+
+    plasma-xdg-desktop-portal-kde = mkTrimmedPlasmaService {
+      pkg = pkgs.kdePackages.xdg-desktop-portal-kde;
+      bin = "libexec/xdg-desktop-portal-kde";
+    };
+
+    # Mask DrKonqi cleanup/sentry units that define After=default.target / After=timers.target,
+    # creating shutdown ordering cycles that tear down dbus-broker before plasmashell stops.
+    drkonqi-coredump-cleanup.enable = false;
   };
+
+  systemd.user.paths.drkonqi-sentry-postman.enable = false;
+
+  systemd.user.timers.drkonqi-coredump-cleanup.enable = false;
 
   systemd.user.services.alphaplus-audio-orientation = {
     description = "Adapt LM-G820N stereo audio channels to screen rotation";

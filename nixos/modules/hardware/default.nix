@@ -25,6 +25,7 @@ in
     ./gnss.nix
     ./nfc.nix
     ./camera.nix
+    ./usb.nix
   ];
 
   environment.systemPackages = [ pkgs.feedbackd feedbackdTheme pkgs.libqmi pkgs.iw ];

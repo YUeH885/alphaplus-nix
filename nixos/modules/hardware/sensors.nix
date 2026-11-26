@@ -13,24 +13,39 @@ let
     rm -f $out/share/qcom/sm8150/LG/alphaplus/manifest.json \
           $out/share/qcom/sm8150/LG/alphaplus/dsp/cdsp/manifest.json
 
-    # Separate initial sensor registry seed from read-only package and link to writable state
-    if [ -d $out/share/qcom/sm8150/LG/alphaplus/sensors/registry ]; then
-      mkdir -p $out/share/alphaplus/sensors-seed
-      mv $out/share/qcom/sm8150/LG/alphaplus/sensors/registry $out/share/alphaplus/sensors-seed/
-      ln -s /var/lib/alphaplus/sensors/registry $out/share/qcom/sm8150/LG/alphaplus/sensors/registry
-    fi
+    ln -s /var/lib/alphaplus/sensors/registry $out/share/qcom/sm8150/LG/alphaplus/sensors/registry
   '';
 
   sensorInitScript = pkgs.writeShellScript "alphaplus-init-sensor-state" ''
-    mkdir -p /var/lib/alphaplus/sensors/registry
-    # Ensure existing seeded directories/files from read-only Nix store paths are writable by fastrpc.
-    chmod -R u+rwX,g=rX,o-rwx /var/lib/alphaplus/sensors
-    if [ -d ${dspAssets}/share/alphaplus/sensors-seed/registry ]; then
-      cp -r --update=none --no-preserve=mode ${dspAssets}/share/alphaplus/sensors-seed/registry/* \
-        /var/lib/alphaplus/sensors/registry/
-      chmod -R u+rwX,g=rX,o-rwx /var/lib/alphaplus/sensors/registry
+    set -eu
+    state_dir="/var/lib/alphaplus/sensors"
+    reg_dir="$state_dir/registry"
+    marker="$state_dir/.sns-populated"
+    ${pkgs.coreutils}/bin/mkdir -p "$reg_dir/registry"
+
+    if [ ! -f "$marker" ]; then
+      sns_dev="/dev/disk/by-partlabel/sns"
+      if [ -e "$sns_dev" ]; then
+        mnt=$(${pkgs.coreutils}/bin/mktemp -d)
+        cleanup() {
+          ${pkgs.util-linux}/bin/umount "$mnt" 2>/dev/null || true
+          ${pkgs.coreutils}/bin/rmdir "$mnt" 2>/dev/null || true
+        }
+        trap cleanup EXIT
+        if ${pkgs.util-linux}/bin/mount -o ro,noatime "$sns_dev" "$mnt"; then
+          if [ -d "$mnt/sensors/registry" ]; then
+            ${pkgs.coreutils}/bin/cp -a "$mnt/sensors/registry/." "$reg_dir/"
+          fi
+          : > "$marker"
+        else
+          echo "warning: failed to mount $sns_dev; using SLPI default sensor registry" >&2
+        fi
+      fi
     fi
-    chmod 0750 /var/lib/alphaplus/sensors /var/lib/alphaplus/sensors/registry
+
+    ${pkgs.coreutils}/bin/chown -R fastrpc:fastrpc "$state_dir"
+    ${pkgs.coreutils}/bin/chmod -R u+rwX,g=rX,o-rwx "$state_dir"
+    ${pkgs.coreutils}/bin/chmod 0750 "$state_dir" "$reg_dir"
   '';
 in
 {
@@ -63,17 +78,21 @@ in
 
   systemd.services.hexagonrpcd = {
     description = "Hexagon DSP sensors daemon (LM-G820N)";
+    wants = [ "dev-disk-by\\x2dpartlabel-sns.device" ];
     after = [
       "local-fs.target"
       "alphaplus-remoteproc-boot.service"
       "dev-fastrpc\\x2dsdsp.device"
+      "dev-disk-by\\x2dpartlabel-sns.device"
     ];
     bindsTo = [ "dev-fastrpc\\x2dsdsp.device" ];
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
+      Type = "notify";
+      NotifyAccess = "main";
       User = "fastrpc";
       Group = "fastrpc";
-      ExecStartPre = "${sensorInitScript}";
+      ExecStartPre = "+${sensorInitScript}";
       ExecStart = "${pkgs.hexagonrpc}/bin/hexagonrpcd -f /dev/fastrpc-sdsp -d sdsp -s -R ${dspAssets}/share/qcom/sm8150/LG/alphaplus";
       StateDirectory = "alphaplus/sensors";
       StateDirectoryMode = "0750";
@@ -89,5 +108,6 @@ in
       "alphaplus-remoteproc-boot.service"
       "hexagonrpcd.service"
     ];
+    wantedBy = [ "hexagonrpcd.service" ];
   };
 }

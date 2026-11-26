@@ -35,7 +35,8 @@ let
     install -Dm755 ${../../files/desktop/sddm/suspend-maintenance.py} "$out"
     substituteInPlace "$out" \
       --replace-fail "#!/usr/bin/python3" "#!${lib.getExe pkgs.python3}" \
-      --replace-fail "/usr/lib/systemd/systemd-sleep" "${config.systemd.package}/lib/systemd/systemd-sleep"
+      --replace-fail "/usr/lib/systemd/systemd-sleep" "${config.systemd.package}/lib/systemd/systemd-sleep" \
+      --replace-fail "@usb_sleep_policy@" "${lib.getExe pkgs.alphaplus-usb-sleep-policy}"
   '';
 in
 {
