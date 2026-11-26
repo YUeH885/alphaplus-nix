@@ -5,6 +5,7 @@
 , pkg-config
 , curl
 , glib
+, json-glib
 , libqmi
 , libqrtr-glib
 , systemd
@@ -12,12 +13,12 @@
 
 stdenv.mkDerivation {
   pname = "alphaplus-gnssd";
-  version = "0.1.11";
+  version = "0.1.12";
 
   src = ./gnss;
 
   postPatch = ''
-    substituteInPlace src/gnss-xtra.c \
+    substituteInPlace src/gnss-xtra.c src/gnss-assist.c \
       --replace-fail '"/usr/bin/curl"' '"${lib.getExe curl}"'
   '';
 
@@ -33,6 +34,7 @@ stdenv.mkDerivation {
 
   buildInputs = [
     glib
+    json-glib
     libqmi
     libqrtr-glib
     systemd

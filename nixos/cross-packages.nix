@@ -137,8 +137,23 @@ packages // {
     inherit (cross) stdenv meson pkg-config udevCheckHook;
     inherit (build) cmake glib libxml2 ninja;
   };
+  neard = (native.neard.override {
+    inherit (cross) stdenv autoreconfHook pkg-config;
+    inherit (build) autoconf-archive;
+    gobject-introspection = null;
+    wrapGAppsHook3 = null;
+    python3Packages = native.python3Packages // {
+      wrapPython = cross.python3Packages.wrapPython.override {
+        python = native.python3Packages.python // {
+          pythonOnBuildForHost = build.python3Packages.python;
+        };
+      };
+    };
+  }).overrideAttrs (_: {
+    doCheck = false;
+  });
   hexagonrpc = cross.hexagonrpc;
-  geoclue2 = (native.geoclue2.override {
+  geoclue2-alphaplus = (native.geoclue2-alphaplus.override {
     inherit (cross) stdenv meson pkg-config;
     inherit (build) intltool ninja python3;
     wrapGAppsHook3 = cross.wrapGAppsNoGuiHook.override { inherit (native) dconf; };
@@ -243,11 +258,18 @@ packages // {
   alphaplus-desktop-helpers = native.alphaplus-desktop-helpers.override {
     inherit (cross) stdenv makeWrapper;
   };
+  alphaplus-usb-sleep-policy = native.alphaplus-usb-sleep-policy.override {
+    inherit (cross) stdenv buildPackages;
+  };
   alphaplus-flashlight = import ./pkgs/flashlight {
     inherit (native) lib qt6;
     inherit (cross) stdenv buildPackages pkg-config;
   };
   alphaplus-bypass-charging = import ./pkgs/bypass-charging {
+    inherit (native) lib qt6;
+    inherit (cross) stdenv buildPackages pkg-config;
+  };
+  alphaplus-nfc = import ./pkgs/nfc {
     inherit (native) lib qt6;
     inherit (cross) stdenv buildPackages pkg-config;
   };

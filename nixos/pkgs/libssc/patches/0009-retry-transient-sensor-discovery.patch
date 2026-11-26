@@ -1,0 +1,126 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] sensor: retry transient empty SUID responses during DSP startup
+
+SLPI registers the 'registry' virtual sensor before hardware sensor drivers
+finish reading calibration files and registering their own SUIDs. Retry an
+empty SUID lookup briefly on the sensor's GMainContext before concluding that
+a sensor type is unavailable.
+
+diff --git a/src/libssc-sensor.c b/src/libssc-sensor.c
+index 893a882..691d6b1 100644
+--- a/src/libssc-sensor.c
++++ b/src/libssc-sensor.c
+@@ -26,6 +26,8 @@
+ 
+ #define MAX_RETRIES 100
+ #define SENSOR_SERVICE_TIMEOUT_S 30
++#define DISCOVER_RETRY_INTERVAL_MS 250
++#define MAX_DISCOVER_RETRIES 12
+ 
+ enum {
+ 	PROP_NAME = 1,
+@@ -65,6 +67,8 @@ typedef struct _SSCSensorPrivate {
+ 	gboolean service_available;
+ 	guint service_retries;
+ 	GSource *discovery_timeout;
++	guint discover_retries;
++	GSource *discover_retry;
+ } SSCSensorPrivate;
+ 
+ static void async_initable_iface_init (GAsyncInitableIface *iface);
+@@ -82,6 +86,15 @@ clear_discovery_timeout (SSCSensorPrivate *priv)
+ 	g_clear_pointer (&priv->discovery_timeout, g_source_unref);
+ }
+ 
++static void
++clear_discover_retry (SSCSensorPrivate *priv)
++{
++	if (!priv->discover_retry)
++		return;
++	g_source_destroy (priv->discover_retry);
++	g_clear_pointer (&priv->discover_retry, g_source_unref);
++}
++
+ static void
+ wait_for_sensor_service (SSCSensor *self, GTask *task);
+ 
+@@ -91,6 +104,24 @@ discover (SSCSensor *self, GTask *task);
+ static gboolean
+ sensor_service_discovery_timeout (gpointer user_data);
+ 
++static gboolean
++retry_discover_cb (gpointer user_data)
++{
++	GTask *task = G_TASK (user_data);
++	SSCSensor *self = SSC_SENSOR (g_task_get_source_object (task));
++	SSCSensorPrivate *priv = ssc_sensor_get_instance_private (self);
++	GSource *current = g_main_current_source ();
++
++	if (priv->discover_retry != current ||
++	    g_source_is_destroyed (current) ||
++	    g_task_get_completed (task))
++		return G_SOURCE_REMOVE;
++
++	g_clear_pointer (&priv->discover_retry, g_source_unref);
++	discover (self, task);
++	return G_SOURCE_REMOVE;
++}
++
+ static void
+ attribute (SSCSensor *self, GTask *task);
+ 
+@@ -317,6 +348,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			g_debug ("'registry' sensor available, discovering sensor now");
+ 
+ 			clear_discovery_timeout (priv);
++			priv->discover_retries = 0;
+ 
+ 			discover(ctx->sensor, ctx->task);
+ 			return;
+@@ -354,6 +386,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 
+ 		/* Only default sensor for data type is reported */
+ 		if (suid_msg != NULL && suid_msg->n_uid > 0) {
++			clear_discover_retry (priv);
+ 			priv->uid_high = suid_msg->uid[0]->high;
+ 			priv->uid_low = suid_msg->uid[0]->low;
+ 
+@@ -366,6 +399,22 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			return;
+ 		/* No sensor available for specified data type, complete task */
+ 		} else {
++			if (priv->discover_retries < MAX_DISCOVER_RETRIES &&
++			    ctx->task &&
++			    !g_cancellable_is_cancelled (g_task_get_cancellable (ctx->task))) {
++				priv->discover_retries++;
++				g_debug ("'%s' sensor not yet available, retrying discovery (%u/%u)",
++					 priv->data_type, priv->discover_retries, MAX_DISCOVER_RETRIES);
++				clear_discover_retry (priv);
++				priv->discover_retry = g_timeout_source_new (DISCOVER_RETRY_INTERVAL_MS);
++				g_source_set_callback (priv->discover_retry, retry_discover_cb,
++						       g_object_ref (ctx->task), g_object_unref);
++				g_source_attach (priv->discover_retry, ssc_sensor_get_context (ctx->sensor));
++				ssc_suid_response__free_unpacked (suid_msg, NULL);
++				return;
++			}
++			clear_discover_retry (priv);
++
+ 			g_debug ("No '%s' sensor available", priv->data_type);
+ 			ssc_suid_response__free_unpacked (suid_msg, NULL);
+ 
+@@ -621,6 +670,7 @@ sensor_service_discovery_timeout (gpointer user_data)
+ 	GError *error = NULL;
+ 
+ 	g_clear_pointer (&priv->discovery_timeout, g_source_unref);
++	clear_discover_retry (priv);
+ 
+ 	g_clear_signal_handler (&priv->report_id, priv->client);
+ 
+@@ -831,6 +881,7 @@ sensor_dispose (GObject *object)
+ 	SSCSensorPrivate *priv = ssc_sensor_get_instance_private (self);
+ 
+ 	clear_discovery_timeout (priv);
++	clear_discover_retry (priv);
+ 
+ 	if (priv->name)
+ 		g_free (priv->name);

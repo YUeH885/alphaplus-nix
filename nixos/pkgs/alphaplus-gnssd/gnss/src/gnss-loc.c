@@ -1,4 +1,5 @@
 #include "gnss-loc.h"
+#include "gnss-assist.h"
 #include "gnss-request.h"
 #include "gnss-xtra.h"
 #include <sys/timex.h>
@@ -71,6 +72,9 @@ typedef struct {
     gboolean time_pending;
     gboolean time_accepted;
     gboolean time_requested;
+    gboolean position_pending;
+    gboolean position_accepted;
+    gboolean position_requested;
     gboolean orbits_requested;
     gboolean start_pending;
     gboolean stop_pending;
@@ -83,6 +87,7 @@ struct _GnssLoc {
     QrtrBus *bus;
     GPtrArray *watched_nodes;
     GCancellable *discovery_cancellable;
+    GnssAssist *assist;
     LocConnection *connection;
     gboolean enabled;
     gboolean ready;
@@ -116,13 +121,22 @@ static void
 update_assistance (LocConnection *connection)
 {
     if (!connection_current (connection) || !connection->engine_on || !connection->tracking ||
-        connection->stop_pending || connection->time_pending || gnss_xtra_is_busy (connection->xtra))
+        connection->stop_pending || connection->time_pending || connection->position_pending ||
+        gnss_xtra_is_busy (connection->xtra))
         return;
     /* This firmware rejects UTC injection while XTRA parts are in flight. */
     if (connection->time_requested) {
         connection->time_requested = FALSE;
         inject_time (connection);
         if (connection->time_pending)
+            return;
+    }
+    if (connection->position_requested && connection->owner->assist) {
+        connection->position_requested = FALSE;
+        connection->position_pending = TRUE;
+        if (!gnss_assist_request_position (connection->owner->assist, connection->cancellable))
+            connection->position_pending = FALSE;
+        if (connection->position_pending)
             return;
     }
     if (connection->orbits_requested) {
@@ -143,6 +157,7 @@ loc_unref (GnssLoc *loc)
 {
     if (--loc->refs)
         return;
+    g_clear_pointer (&loc->assist, gnss_assist_free);
     g_clear_object (&loc->bus);
     g_clear_object (&loc->discovery_cancellable);
     g_clear_error (&loc->close_error);
@@ -259,6 +274,10 @@ detach_connection (LocConnection *connection)
     loc->ready = FALSE;
     g_cancellable_cancel (connection->cancellable);
     gnss_xtra_cancel (connection->xtra);
+    if (loc->assist) {
+        gnss_assist_cancel (loc->assist);
+        gnss_assist_flush_cache (loc->assist);
+    }
     if (connection->client)
         g_signal_handlers_disconnect_by_data (connection->client, connection);
     if (connection->device)
@@ -309,6 +328,7 @@ RESPONSE_CALLBACK (set_operation_mode, QmiMessageLocSetOperationModeOutput)
 RESPONSE_CALLBACK (get_nmea_types, QmiMessageLocGetNmeaTypesOutput)
 RESPONSE_CALLBACK (set_nmea_types, QmiMessageLocSetNmeaTypesOutput)
 RESPONSE_CALLBACK (inject_utc_time, QmiMessageLocInjectUtcTimeOutput)
+RESPONSE_CALLBACK (inject_position, QmiMessageLocInjectPositionOutput)
 RESPONSE_CALLBACK (get_predicted_orbits_data_source, QmiMessageLocGetPredictedOrbitsDataSourceOutput)
 
 static gboolean
@@ -341,6 +361,7 @@ static gboolean parse_##name (gpointer output, gpointer data, GError **error) { 
 STATUS_PARSER (set_operation_mode)
 STATUS_PARSER (set_nmea_types)
 STATUS_PARSER (inject_utc_time)
+STATUS_PARSER (inject_position)
 
 static gboolean
 retry_init (gpointer data)
@@ -507,6 +528,7 @@ initialize_connection (LocConnection *connection)
         QmiLocEventRegistrationFlag mask = QMI_LOC_EVENT_REGISTRATION_FLAG_POSITION_REPORT |
             QMI_LOC_EVENT_REGISTRATION_FLAG_GNSS_SATELLITE_INFO | QMI_LOC_EVENT_REGISTRATION_FLAG_NMEA |
             QMI_LOC_EVENT_REGISTRATION_FLAG_ENGINE_STATE | QMI_LOC_EVENT_REGISTRATION_FLAG_INJECT_TIME_REQUEST |
+            QMI_LOC_EVENT_REGISTRATION_FLAG_INJECT_POSITION_REQUEST |
             QMI_LOC_EVENT_REGISTRATION_FLAG_INJECT_PREDICTED_ORBITS_REQUEST;
         qmi_message_loc_register_events_input_set_event_registration_mask (input, mask, NULL);
         qmi_client_loc_register_events (connection->client, input, 10, connection->cancellable,
@@ -545,8 +567,12 @@ on_position (QmiClientLoc *client, QmiIndicationLocPositionReportOutput *output,
     if (status == QMI_LOC_SESSION_STATUS_SUCCESS &&
         qmi_indication_loc_position_report_output_get_latitude (output, &latitude, NULL) &&
         qmi_indication_loc_position_report_output_get_longitude (output, &longitude, NULL) &&
-        qmi_indication_loc_position_report_output_get_horizontal_uncertainty_circular (output, &uncertainty, NULL))
+        qmi_indication_loc_position_report_output_get_horizontal_uncertainty_circular (output, &uncertainty, NULL)) {
         g_debug ("[LOC] Position: lat=%.8f lon=%.8f horizontal_uncertainty=%.1fm", latitude, longitude, uncertainty);
+        if (connection->owner->assist)
+            gnss_assist_record_fix (connection->owner->assist, latitude, longitude,
+                                    uncertainty, (guint64)(g_get_real_time () / 1000));
+    }
 }
 
 static void
@@ -580,6 +606,9 @@ on_engine (QmiClientLoc *client, QmiIndicationLocEngineStateOutput *output, gpoi
         g_message ("[LOC] Engine state: %s", qmi_loc_engine_state_get_string (state));
         if (connection->engine_on && !connection->time_accepted && !connection->time_pending)
             connection->time_requested = TRUE;
+        if (connection->engine_on && !connection->position_accepted && !connection->position_pending &&
+            connection->owner->assist)
+            connection->position_requested = TRUE;
         update_assistance (connection);
     }
 }
@@ -591,6 +620,18 @@ on_time_request (QmiClientLoc *client, QmiIndicationLocInjectTimeRequestOutput *
     LocConnection *connection = data;
     if (connection_current (connection) && connection->tracking && !connection->time_pending) {
         connection->time_requested = TRUE;
+        update_assistance (connection);
+    }
+}
+
+static void
+on_position_request (QmiClientLoc *client, QmiIndicationLocInjectPositionRequestOutput *output, gpointer data)
+{
+    (void)client; (void)output;
+    LocConnection *connection = data;
+    if (connection_current (connection) && connection->tracking &&
+        !connection->position_pending && connection->owner->assist) {
+        connection->position_requested = TRUE;
         update_assistance (connection);
     }
 }
@@ -626,6 +667,7 @@ allocated (GObject *source, GAsyncResult *result, gpointer data)
             g_signal_connect (connection->client, "gnss-sv-info", G_CALLBACK (on_satellites), connection);
             g_signal_connect (connection->client, "engine-state", G_CALLBACK (on_engine), connection);
             g_signal_connect (connection->client, "inject-time-request", G_CALLBACK (on_time_request), connection);
+            g_signal_connect (connection->client, "inject-position-request", G_CALLBACK (on_position_request), connection);
             g_signal_connect (connection->client, "inject-predicted-orbits-request", G_CALLBACK (on_orbits_request), connection);
             initialize_connection (connection);
         }
@@ -828,6 +870,55 @@ inject_time (LocConnection *connection)
 }
 
 static void
+position_done (GObject *source, GAsyncResult *result, gpointer data)
+{
+    (void)source;
+    LocConnection *connection = data;
+    g_autoptr(GError) error = NULL;
+    gboolean success = g_task_propagate_boolean (G_TASK (result), &error);
+    connection->position_pending = FALSE;
+    if (success)
+        connection->position_accepted = TRUE;
+    if (connection_current (connection)) {
+        if (success)
+            g_message ("[LOC] Coarse position assistance accepted");
+        else
+            g_warning ("[LOC] Coarse position assistance failed: %s", error->message);
+        update_assistance (connection);
+    }
+    connection_unref (connection);
+}
+
+static void
+assist_position_ready (GnssAssist *assist, const GnssAssistPosition *position, gpointer data)
+{
+    (void)assist;
+    GnssLoc *loc = data;
+    LocConnection *connection = loc->connection;
+    if (!connection || !connection_current (connection) || !connection->position_pending)
+        return;
+
+    if (!position) {
+        connection->position_pending = FALSE;
+        update_assistance (connection);
+        return;
+    }
+
+    g_autoptr(QmiMessageLocInjectPositionInput) input = qmi_message_loc_inject_position_input_new ();
+    qmi_message_loc_inject_position_input_set_latitude (input, position->latitude, NULL);
+    qmi_message_loc_inject_position_input_set_longitude (input, position->longitude, NULL);
+    qmi_message_loc_inject_position_input_set_horizontal_uncertainty_circular (input, position->uncertainty_m, NULL);
+    qmi_message_loc_inject_position_input_set_horizontal_confidence (input, 68, NULL);
+    qmi_message_loc_inject_position_input_set_horizontal_reliability (input, QMI_LOC_RELIABILITY_LOW, NULL);
+    qmi_message_loc_inject_position_input_set_position_source (input, position->source, NULL);
+    qmi_message_loc_inject_position_input_set_utc_timestamp (input, position->timestamp_ms, NULL);
+    GTask *request = gnss_request_new (connection->client, "inject-position", 10000, connection->cancellable,
+                                       parse_inject_position, NULL, position_done, connection_ref (connection));
+    qmi_client_loc_inject_position (connection->client, input, 10, connection->cancellable,
+                                    inject_position_response, request);
+}
+
+static void
 session_started (GObject *source, GAsyncResult *result, gpointer data)
 {
     QmiClientLoc *client = QMI_CLIENT_LOC (source);
@@ -845,6 +936,8 @@ session_started (GObject *source, GAsyncResult *result, gpointer data)
         if (connection_current (connection) && success && !connection->stop_pending) {
             if (!connection->time_accepted && !connection->time_pending)
                 connection->time_requested = TRUE;
+            if (!connection->position_accepted && !connection->position_pending && connection->owner->assist)
+                connection->position_requested = TRUE;
             connection->orbits_requested = TRUE;
             update_assistance (connection);
         }
@@ -880,6 +973,8 @@ gnss_loc_new (void)
     loc->enabled = TRUE;
     loc->watched_nodes = g_ptr_array_new_with_free_func (g_object_unref);
     loc->discovery_cancellable = g_cancellable_new ();
+    loc->assist = gnss_assist_new (NULL);
+    gnss_assist_set_callback (loc->assist, assist_position_ready, loc);
     qrtr_bus_new (1000, loc->discovery_cancellable, bus_created, loc_ref (loc));
     return loc;
 }
@@ -921,6 +1016,12 @@ gnss_loc_stop_session (GnssLoc *loc)
     connection->stop_pending = TRUE;
     /* A later Start must observe readiness for its own engine activation. */
     connection->engine_on = FALSE;
+    if (loc->assist) {
+        if (gnss_assist_is_busy (loc->assist))
+            connection->position_pending = FALSE;
+        gnss_assist_cancel (loc->assist);
+        gnss_assist_flush_cache (loc->assist);
+    }
     g_autoptr(QmiMessageLocStopInput) input = qmi_message_loc_stop_input_new ();
     qmi_message_loc_stop_input_set_session_id (input, DEFAULT_GNSS_SESSION_ID, NULL);
     g_message ("[LOC] Stop session %u", DEFAULT_GNSS_SESSION_ID);
@@ -958,6 +1059,8 @@ gnss_loc_free (GnssLoc *loc)
     loc->session_cb = NULL;
     loc->error_cb = NULL;
     g_cancellable_cancel (loc->discovery_cancellable);
+    if (loc->assist)
+        gnss_assist_cancel (loc->assist);
     if (loc->connection)
         detach_connection (loc->connection);
     if (loc->bus)

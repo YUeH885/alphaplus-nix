@@ -573,10 +573,7 @@ def main():
     if orientation.error:
         orientation.close()
         raise orientation.error
-    if orientation.transform is None:
-        orientation.close()
-        raise RuntimeError("DSI-1 output is unavailable")
-    initial_transform = orientation.transform
+    initial_transform = orientation.transform or "Normal"
 
     touchpad = Touchpad(
         device, ecodes, UInput, AbsInfo, device_x_max, device_y_max, initial_transform

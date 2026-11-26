@@ -25,6 +25,7 @@ stdenv.mkDerivation {
     ./patches/0005-support-unsigned-shell-domains.patch
     ./patches/0006-supervise-client-sessions.patch
     ./patches/0007-preserve-64-bit-heap-addresses.patch
+    ./patches/0008-notify-systemd-when-listener-is-ready.patch
   ];
 
   nativeBuildInputs = [

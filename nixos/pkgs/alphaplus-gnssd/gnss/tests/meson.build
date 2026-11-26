@@ -55,12 +55,22 @@ test_daemon = executable(
 )
 test('test-daemon', test_daemon)
 
+test_assist = executable(
+  'test-assist',
+  'test-assist.c',
+  '../src/gnss-assist.c',
+  include_directories: inc_src,
+  dependencies: [glib_dep, gio_dep, json_glib_dep, qmi_glib_dep, m_dep],
+)
+test('test-assist', test_assist)
+
 test_loc = executable(
   'test-loc',
   'test-loc.c',
+  '../src/gnss-assist.c',
   '../src/gnss-request.c',
   '../src/gnss-xtra.c',
   include_directories: inc_src,
-  dependencies: [glib_dep, gio_dep, qmi_glib_dep, qrtr_glib_dep],
+  dependencies: [glib_dep, gio_dep, json_glib_dep, qmi_glib_dep, qrtr_glib_dep, m_dep],
 )
 test('test-loc', test_loc)

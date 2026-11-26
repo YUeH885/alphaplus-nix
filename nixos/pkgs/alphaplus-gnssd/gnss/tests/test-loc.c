@@ -219,11 +219,18 @@ static gint clock_state;
 static gint clock_flags;
 static guint utc_sends;
 static GTask *utc_request;
+static guint pos_sends;
+static GTask *pos_request;
+static gdouble pos_last_lat;
+static gdouble pos_last_lon;
+static QmiLocPositionSource pos_last_source;
 static guint xtra_sends;
 static GTask *xtra_request;
 
 extern QmiIndicationLocInjectUtcTimeOutput *
 qmi_indication_loc_inject_utc_time_indication_parse (QmiMessage *, GError **);
+extern QmiIndicationLocInjectPositionOutput *
+qmi_indication_loc_inject_position_indication_parse (QmiMessage *, GError **);
 extern QmiIndicationLocEngineStateOutput *
 qmi_indication_loc_engine_state_indication_parse (QmiMessage *, GError **);
 
@@ -256,6 +263,24 @@ qmi_client_loc_inject_utc_time (QmiClientLoc *client, QmiMessageLocInjectUtcTime
 }
 
 void
+qmi_client_loc_inject_position (QmiClientLoc *client, QmiMessageLocInjectPositionInput *input,
+                                guint timeout, GCancellable *cancellable,
+                                GAsyncReadyCallback callback, gpointer data)
+{
+    (void)client; (void)timeout; (void)cancellable; (void)callback;
+    gdouble lat = 0, lon = 0;
+    QmiLocPositionSource source = 0;
+    g_assert_true (qmi_message_loc_inject_position_input_get_latitude (input, &lat, NULL));
+    g_assert_true (qmi_message_loc_inject_position_input_get_longitude (input, &lon, NULL));
+    g_assert_true (qmi_message_loc_inject_position_input_get_position_source (input, &source, NULL));
+    pos_last_lat = lat;
+    pos_last_lon = lon;
+    pos_last_source = source;
+    pos_sends++;
+    pos_request = data;
+}
+
+void
 qmi_client_loc_inject_xtra_data (QmiClientLoc *client, QmiMessageLocInjectXtraDataInput *input,
                                 guint timeout, GCancellable *cancellable,
                                 GAsyncReadyCallback callback, gpointer data)
@@ -280,6 +305,23 @@ complete_utc (QmiClientLoc *client)
     gnss_request_response (utc_request, NULL);
     g_signal_emit_by_name (client, "inject-utc-time", indication);
     g_clear_object (&utc_request);
+    drain ();
+}
+
+static void
+complete_position (QmiClientLoc *client)
+{
+    g_autoptr(QmiMessage) accepted = qmi_message_new (QMI_SERVICE_LOC, 1, 1, 0x39);
+    accepted->data[6] = 0x04;
+    guint32 status = GUINT32_TO_LE (QMI_LOC_INDICATION_STATUS_SUCCESS);
+    g_assert_true (qmi_message_add_raw_tlv (accepted, 1, (guint8 *)&status, sizeof status, NULL));
+    g_autoptr(GError) error = NULL;
+    g_autoptr(QmiIndicationLocInjectPositionOutput) indication =
+        qmi_indication_loc_inject_position_indication_parse (accepted, &error);
+    g_assert_no_error (error);
+    gnss_request_response (pos_request, NULL);
+    g_signal_emit_by_name (client, "inject-position", indication);
+    g_clear_object (&pos_request);
     drain ();
 }
 
@@ -536,6 +578,72 @@ test_nmea_configuration (gconstpointer data)
     drain ();
 }
 
+static void
+test_position_assistance_and_serialization (void)
+{
+    g_autofree gchar *directory = g_dir_make_tmp ("gnss-pos-assist-XXXXXX", NULL);
+    g_autofree gchar *xtra_cache = g_build_filename (directory, "xtra3grcej.bin", NULL);
+    g_autofree gchar *pos_cache = g_build_filename (directory, "last-position.conf", NULL);
+    gchar payload[2048] = {0};
+    g_assert_true (g_file_set_contents (xtra_cache, payload, sizeof payload, NULL));
+
+    GnssLoc *loc = new_loc ();
+    loc->assist = gnss_assist_new (directory);
+    gnss_assist_set_callback (loc->assist, assist_position_ready, loc);
+    gnss_assist_record_fix (loc->assist, 31.2304, 121.4737, 15.0f,
+                            (guint64)(g_get_real_time () / 1000));
+
+    LocConnection *connection = connected_loc (loc);
+    gnss_xtra_free (connection->xtra);
+    connection->xtra = gnss_xtra_new (directory);
+    gnss_xtra_set_callback (connection->xtra, orbits_done, connection);
+    g_autoptr(GArray) servers = g_array_new (FALSE, FALSE, sizeof (gchar *));
+    gchar *url = "https://example.invalid/xtra.bin";
+    g_array_append_val (servers, url);
+    gnss_xtra_configure (connection->xtra, servers, sizeof payload, 1024);
+
+    connection->engine_on = TRUE;
+    connection->tracking = TRUE;
+    connection->time_requested = TRUE;
+    connection->position_requested = TRUE;
+    connection->orbits_requested = TRUE;
+    clock_state = TIME_OK;
+    clock_flags = 0;
+    utc_sends = pos_sends = xtra_sends = 0;
+
+    update_assistance (connection);
+    g_assert_cmpuint (utc_sends, ==, 1);
+    g_assert_cmpuint (pos_sends, ==, 0);
+    g_assert_cmpuint (xtra_sends, ==, 0);
+
+    complete_utc (connection->client);
+    g_assert_cmpuint (pos_sends, ==, 1);
+    g_assert_cmpuint (xtra_sends, ==, 0);
+    g_assert_cmpfloat_with_epsilon (pos_last_lat, 31.2304, 1e-6);
+    g_assert_cmpfloat_with_epsilon (pos_last_lon, 121.4737, 1e-6);
+    g_assert_cmpint (pos_last_source, ==, QMI_LOC_POSITION_SOURCE_GNSS);
+
+    complete_position (connection->client);
+    g_assert_true (connection->position_accepted);
+    g_assert_cmpuint (xtra_sends, ==, 1);
+
+    gnss_xtra_cancel (connection->xtra);
+    gnss_request_response (xtra_request, NULL);
+    g_clear_object (&xtra_request);
+    drain ();
+
+    on_position_request (connection->client, NULL, connection);
+    drain ();
+    g_assert_cmpuint (pos_sends, ==, 2);
+    complete_position (connection->client);
+
+    gnss_loc_free (loc);
+    drain ();
+    g_assert_cmpint (g_unlink (xtra_cache), ==, 0);
+    g_assert_cmpint (g_unlink (pos_cache), ==, 0);
+    g_assert_cmpint (g_rmdir (directory), ==, 0);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -546,6 +654,7 @@ main (int argc, char **argv)
     g_test_add_func ("/loc/replaced-connection", test_replaced_connection);
     g_test_add_func ("/loc/clock-trust", test_clock_trust);
     g_test_add_func ("/loc/assistance-serialization", test_assistance_serialization);
+    g_test_add_func ("/loc/position-assistance-and-serialization", test_position_assistance_and_serialization);
     g_test_add_func ("/loc/sources-without-optional-sizes", test_sources_without_optional_sizes);
     g_test_add_data_func ("/loc/nmea-extended-mask", GUINT_TO_POINTER (0), test_nmea_configuration);
     g_test_add_data_func ("/loc/nmea-mask-already-configured", GUINT_TO_POINTER (1), test_nmea_configuration);

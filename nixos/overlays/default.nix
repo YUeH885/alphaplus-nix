@@ -17,6 +17,17 @@ final: prev: {
       ./patches/iio-sensor-proxy/0002-discover-all-sensors-on-a-hotplugged-device.patch
     ];
   });
+  geoclue2-alphaplus = prev.geoclue2.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [
+      ./patches/geoclue/0001-authorize-native-applications.patch
+      ./patches/geoclue/0002-disable-ip-fallback-when-ip-disabled.patch
+    ];
+  });
+  neard = prev.neard.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [
+      ./patches/neard/fix-tag-dbus-properties.patch
+    ];
+  });
   modemmanager-alphaplus = prev.modemmanager.overrideAttrs (old: {
     patches = (old.patches or [ ]) ++ [
       ./patches/modemmanager/allow-qrtr-without-data-port.patch
@@ -91,5 +102,7 @@ EOF
   alphaplus-desktop-helpers = final.callPackage ../pkgs/desktop-helpers { };
   alphaplus-flashlight = final.callPackage ../pkgs/flashlight { };
   alphaplus-bypass-charging = final.callPackage ../pkgs/bypass-charging { };
+  alphaplus-nfc = final.callPackage ../pkgs/nfc { };
+  alphaplus-usb-sleep-policy = final.callPackage ../pkgs/usb-sleep-policy { };
   fcitx5-osk-alphaplus = final.callPackage ../pkgs/fcitx5-osk { };
 }

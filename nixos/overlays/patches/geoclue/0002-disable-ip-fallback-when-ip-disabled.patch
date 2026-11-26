@@ -1,0 +1,35 @@
+Description: Disable GeoIP queries and server IP fallback when IP source is disabled
+ When [ip] enable=false is configured, avoid sending empty GeoIP queries and
+ pass fallbacks.ipf=false in 3GPP/WiFi queries so BeaconDB/MLS does not fall
+ back to IP geolocation.
+Author: yuzu <yuzu23234@gmail.com>
+Forwarded: no
+
+--- a/src/gclue-mozilla.c
++++ b/src/gclue-mozilla.c
+@@ -277,6 +277,25 @@
+                 }
+                 json_builder_end_array (builder);
+         }
++
++        if (!gclue_config_get_enable_ip_source (gclue_config_get_singleton ())) {
++                if (!has_tower && !has_bss) {
++                        g_object_unref (builder);
++                        g_set_error_literal (error,
++                                             G_IO_ERROR,
++                                             G_IO_ERROR_NOT_INITIALIZED,
++                                             "IP geolocation disabled and no 3GPP/WiFi data available");
++                        return NULL;
++                }
++                json_builder_set_member_name (builder, "fallbacks");
++                json_builder_begin_object (builder);
++                json_builder_set_member_name (builder, "lacf");
++                json_builder_add_boolean_value (builder, TRUE);
++                json_builder_set_member_name (builder, "ipf");
++                json_builder_add_boolean_value (builder, FALSE);
++                json_builder_end_object (builder);
++        }
++
+         json_builder_end_object (builder);
+ 
+         generator = json_generator_new ();

@@ -1,0 +1,16 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Category": "Utilities",
+        "Description": "Toggle NFC and inspect or write NDEF tags",
+        "EnabledByDefault": true,
+        "Icon": "alphaplus-nfc-disabled-symbolic",
+        "Id": "org.alphaplus.nfc",
+        "License": "GPL-2.0+",
+        "Name": "NFC",
+        "Version": "1.0.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": true,
+    "X-Plasma-NotificationAreaCategory": "Hardware"
+}

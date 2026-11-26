@@ -1,0 +1,83 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] rpcd: notify systemd once FastRPC listener is ready
+
+Send READY=1 over NOTIFY_SOCKET after init_fastrpc_listener completes so
+dependent sensor services wait until the reverse tunnel is registered.
+
+--- a/hexagonrpcd/rpcd.c	2026-11-26 21:02:49.627290051 +0800
++++ b/hexagonrpcd/rpcd.c	2026-11-26 21:02:49.627357458 +0800
+@@ -27,11 +27,15 @@
+ #include <unistd.h>
+ #include <signal.h>
+ #include <stdbool.h>
++#include <stddef.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <sys/prctl.h>
++#include <sys/socket.h>
++#include <sys/un.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
+@@ -286,6 +290,41 @@
+ 	return 0;
+ }
+ 
++static void notify_systemd_ready(void)
++{
++	const char *socket_path = getenv("NOTIFY_SOCKET");
++	struct sockaddr_un addr = { .sun_family = AF_UNIX };
++	size_t path_len;
++	socklen_t addr_len;
++	int sock;
++
++	if (!socket_path || !socket_path[0])
++		return;
++
++	path_len = strlen(socket_path);
++	if (path_len >= sizeof(addr.sun_path)) {
++		fprintf(stderr, "NOTIFY_SOCKET path too long: %s\n", socket_path);
++		return;
++	}
++
++	memcpy(addr.sun_path, socket_path, path_len);
++	if (addr.sun_path[0] == '@')
++		addr.sun_path[0] = '\0';
++	addr_len = offsetof(struct sockaddr_un, sun_path) + path_len;
++
++	sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
++	if (sock < 0) {
++		perror("Could not open NOTIFY_SOCKET");
++		return;
++	}
++
++	if (sendto(sock, "READY=1\n", sizeof("READY=1\n") - 1, MSG_NOSIGNAL,
++		   (const struct sockaddr *)&addr, addr_len) < 0)
++		perror("Could not notify systemd readiness");
++
++	close(sock);
++}
++
+ static int start_reverse_tunnel(int fd, const char *device_dir, const char *dsp,
+ 				int ready_fd)
+ {
+@@ -329,6 +368,8 @@
+ 			ret = 1;
+ 			goto out;
+ 		}
++	} else {
++		notify_systemd_ready();
+ 	}
+ 
+ 	ret = run_fastrpc_listener(fd, n_ifaces, ifaces);
+@@ -381,6 +422,7 @@
+ 		result = 1;
+ 		goto stop_listener;
+ 	}
++	notify_systemd_ready();
+ 	if (start_clients(n_progs, progs, pids)) {
+ 		result = 1;
+ 		goto stop_listener;

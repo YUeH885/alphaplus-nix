@@ -34,6 +34,7 @@ stdenv.mkDerivation {
     ./patches/0006-apply-online-vector-calibration.patch
     ./patches/0007-find-multiarch-vala-gir.patch
     ./patches/0008-support-cpp-sensor-clients.patch
+    ./patches/0009-retry-transient-sensor-discovery.patch
   ];
 
   nativeBuildInputs = [

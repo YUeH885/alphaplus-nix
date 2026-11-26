@@ -1,0 +1,364 @@
+diff --git a/src/ndef.c b/src/ndef.c
+index 31237cf..f92f250 100644
+--- a/src/ndef.c
++++ b/src/ndef.c
+@@ -191,14 +191,8 @@ const char *__near_ndef_get_uri_prefix(uint8_t id)
+ 	return uri_prefixes[id];
+ }
+ 
+-static gboolean property_get_type(const GDBusPropertyTable *property,
+-					DBusMessageIter *iter, void *user_data)
++static const char *record_type_string(struct near_ndef_record *record)
+ {
+-	struct near_ndef_record *record = user_data;
+-	const char *type;
+-
+-	DBG("");
+-
+ 	switch (record->header->rec_type) {
+ 	case RECORD_TYPE_WKT_SIZE:
+ 	case RECORD_TYPE_WKT_TYPE:
+@@ -209,65 +203,64 @@ static gboolean property_get_type(const GDBusPropertyTable *property,
+ 	case RECORD_TYPE_UNKNOWN:
+ 	case RECORD_TYPE_ERROR:
+ 	default:
+-		type = NULL;
+-		break;
++		return NULL;
+ 
+ 	case RECORD_TYPE_WKT_TEXT:
+-		type = "Text";
+-		break;
++		return "Text";
+ 
+ 	case RECORD_TYPE_WKT_URI:
+-		type = "URI";
+-		break;
++		return "URI";
+ 
+ 	case RECORD_TYPE_WKT_SMART_POSTER:
+-		type = "SmartPoster";
+-		break;
++		return "SmartPoster";
+ 
+ 	case RECORD_TYPE_WKT_HANDOVER_REQUEST:
+-		type = "HandoverRequest";
+-		break;
++		return "HandoverRequest";
+ 
+ 	case RECORD_TYPE_WKT_HANDOVER_SELECT:
+-		type = "HandoverSelect";
+-		break;
++		return "HandoverSelect";
+ 
+ 	case RECORD_TYPE_WKT_HANDOVER_CARRIER:
+-		type = "HandoverCarrier";
+-		break;
++		return "HandoverCarrier";
+ 
+ 	case RECORD_TYPE_MIME_TYPE:
+-		type = "MIME";
+-		break;
++		return "MIME";
+ 
+ 	case RECORD_TYPE_EXT_AAR:
+-		type = "AAR";
+-		break;
++		return "AAR";
+ 	}
++}
+ 
+-	if (!type)
+-		return FALSE;
+-
+-	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &type);
++static void append_valid_utf8_string(DBusMessageIter *iter, const char *str)
++{
++	gchar *valid = g_utf8_make_valid(str ? str : "", -1);
+ 
+-	return TRUE;
++	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &valid);
++	g_free(valid);
+ }
+ 
+-static gboolean text_exists(const GDBusPropertyTable *property, void *data)
++static gboolean type_exists(const GDBusPropertyTable *property, void *data)
+ {
+ 	struct near_ndef_record *record = data;
+ 
+-	DBG("");
++	return record_type_string(record) != NULL;
++}
+ 
+-	if (record->text)
+-		return TRUE;
++static gboolean property_get_type(const GDBusPropertyTable *property,
++					DBusMessageIter *iter, void *user_data)
++{
++	struct near_ndef_record *record = user_data;
++	const char *type;
+ 
+-	if (record->sp && record->sp->title_records)
+-		return TRUE;
++	DBG("");
+ 
+-	DBG("No text");
++	type = record_type_string(record);
++	if (!type)
++		return FALSE;
+ 
+-	return FALSE;
++	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &type);
++
++	return TRUE;
+ }
+ 
+ static const char *get_text_payload(const GDBusPropertyTable *property,
+@@ -286,6 +279,27 @@ static const char *get_text_payload(const GDBusPropertyTable *property,
+ 		return NULL;
+ }
+ 
++static gboolean text_exists(const GDBusPropertyTable *property, void *data)
++{
++	struct near_ndef_record *record = data;
++
++	DBG("");
++
++	if (record->text)
++		return get_text_payload(property, record->text) != NULL;
++
++	if (record->sp && record->sp->title_records) {
++		for (int i = 0; i < record->sp->number_of_title_records; i++) {
++			if (get_text_payload(property, record->sp->title_records[i]))
++				return TRUE;
++		}
++	}
++
++	DBG("No text");
++
++	return FALSE;
++}
++
+ static gboolean property_get_text(const GDBusPropertyTable *property,
+ 					DBusMessageIter *iter, void *user_data)
+ {
+@@ -301,7 +315,7 @@ static gboolean property_get_text(const GDBusPropertyTable *property,
+ 
+ 		DBG("text %s", text);
+ 
+-		dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &text);
++		append_valid_utf8_string(iter, text);
+ 
+ 		return TRUE;
+ 	}
+@@ -315,26 +329,32 @@ static gboolean property_get_text(const GDBusPropertyTable *property,
+ 			if (!text)
+ 				continue;
+ 
+-			dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING,
+-									&text);
++			append_valid_utf8_string(iter, text);
++			return TRUE;
+ 		}
+-
+-		return TRUE;
+ 	}
+ 
+ 	return FALSE;
+ }
+ 
++static struct near_ndef_uri_payload *get_uri_payload(struct near_ndef_record *record)
++{
++	if (record->uri)
++		return record->uri;
++	if (record->sp && record->sp->uri)
++		return record->sp->uri;
++	return NULL;
++}
++
+ static gboolean uri_exists(const GDBusPropertyTable *property, void *data)
+ {
+ 	struct near_ndef_record *record = data;
++	struct near_ndef_uri_payload *uri;
+ 
+ 	DBG("");
+ 
+-	if (record->uri)
+-		return TRUE;
+-
+-	if (record->sp && record->sp->uri)
++	uri = get_uri_payload(record);
++	if (uri && uri->identifier <= NFC_MAX_URI_ID)
+ 		return TRUE;
+ 
+ 	DBG("No URI");
+@@ -352,11 +372,8 @@ static gboolean property_get_uri(const GDBusPropertyTable *property,
+ 
+ 	DBG("");
+ 
+-	if (record->uri)
+-		uri = record->uri;
+-	else if (record->sp && record->sp->uri)
+-		uri = record->sp->uri;
+-	else
++	uri = get_uri_payload(record);
++	if (!uri)
+ 		return FALSE;
+ 
+ 	if (uri->identifier > NFC_MAX_URI_ID) {
+@@ -371,7 +388,7 @@ static gboolean property_get_uri(const GDBusPropertyTable *property,
+ 	value = g_strdup_printf("%s%.*s", prefix, (int)uri->field_length,
+ 				uri->field);
+ 
+-	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &value);
++	append_valid_utf8_string(iter, value);
+ 
+ 	g_free(value);
+ 
+@@ -440,7 +457,7 @@ static gboolean property_get_mime_type(const GDBusPropertyTable *property,
+ 
+ 	DBG("%s", record->sp->type);
+ 
+-	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &record->sp->type);
++	append_valid_utf8_string(iter, record->sp->type);
+ 
+ 	return TRUE;
+ }
+@@ -463,7 +480,7 @@ static gboolean mime_exists(const GDBusPropertyTable *property, void *data)
+ 
+ 	DBG("");
+ 
+-	if (record->mime)
++	if (record->mime && record->mime->type)
+ 		return TRUE;
+ 
+ 	DBG("No MIME");
+@@ -478,7 +495,7 @@ static gboolean property_get_mime(const GDBusPropertyTable *property,
+ 
+ 	DBG("");
+ 
+-	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &record->mime->type);
++	append_valid_utf8_string(iter, record->mime->type);
+ 
+ 	return TRUE;
+ }
+@@ -489,7 +506,7 @@ static gboolean aar_exists(const GDBusPropertyTable *property, void *data)
+ 
+ 	DBG("");
+ 
+-	if (record->aar)
++	if (record->aar && record->aar->package)
+ 		return TRUE;
+ 
+ 	DBG("No AAR");
+@@ -504,7 +521,7 @@ static gboolean property_get_aar(const GDBusPropertyTable *property,
+ 
+ 	DBG("");
+ 
+-	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &record->aar->package);
++	append_valid_utf8_string(iter, record->aar->package);
+ 
+ 	return TRUE;
+ }
+@@ -540,7 +557,7 @@ static gboolean property_get_mime_payload(const GDBusPropertyTable *property,
+ 
+ static const GDBusPropertyTable record_properties[] = {
+ 
+-	{ "Type", "s", property_get_type },
++	{ "Type", "s", property_get_type, NULL, type_exists },
+ 	{ "Encoding", "s", property_get_text, NULL, text_exists },
+ 	{ "Language", "s", property_get_text, NULL, text_exists },
+ 	{ "Representation", "s", property_get_text, NULL, text_exists},
+diff --git a/src/tag.c b/src/tag.c
+index 91cd255..34cc866 100644
+--- a/src/tag.c
++++ b/src/tag.c
+@@ -228,6 +228,13 @@ static const char *protocol_string(struct near_tag *tag)
+ 	return protocol;
+ }
+ 
++static gboolean type_exists(const GDBusPropertyTable *property, void *data)
++{
++	struct near_tag *tag = data;
++
++	return type_string(tag) != NULL;
++}
++
+ static gboolean property_get_type(const GDBusPropertyTable *property,
+ 					DBusMessageIter *iter, void *user_data)
+ {
+@@ -243,6 +250,16 @@ static gboolean property_get_type(const GDBusPropertyTable *property,
+ 	return TRUE;
+ }
+ 
++static gboolean uid_exists(const GDBusPropertyTable *property, void *data)
++{
++	struct near_tag *tag = data;
++	uint8_t *uid;
++	uint8_t len;
++
++	len = uid_array(tag, &uid);
++	return uid && len;
++}
++
+ static gboolean property_get_uid(const GDBusPropertyTable *property,
+ 					DBusMessageIter *iter, void *user_data)
+ {
+@@ -256,7 +273,7 @@ static gboolean property_get_uid(const GDBusPropertyTable *property,
+ 		return FALSE;
+ 
+ 	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY,
+-					 "{y}", &entry);
++					 DBUS_TYPE_BYTE_AS_STRING, &entry);
+ 
+ 	for (int i = 0; i < len; i++)
+ 		dbus_message_iter_append_basic(&entry, DBUS_TYPE_BYTE,
+@@ -267,6 +284,13 @@ static gboolean property_get_uid(const GDBusPropertyTable *property,
+ 	return TRUE;
+ }
+ 
++static gboolean protocol_exists(const GDBusPropertyTable *property, void *data)
++{
++	struct near_tag *tag = data;
++
++	return protocol_string(tag) != NULL;
++}
++
+ static gboolean property_get_protocol(const GDBusPropertyTable *property,
+ 					DBusMessageIter *iter, void *user_data)
+ {
+@@ -295,6 +319,18 @@ static gboolean property_get_readonly(const GDBusPropertyTable *property,
+ 	return TRUE;
+ }
+ 
++static gboolean adapter_exists(const GDBusPropertyTable *property, void *data)
++{
++	struct near_tag *tag = data;
++	struct near_adapter *adapter;
++
++	adapter = __near_adapter_get(tag->adapter_idx);
++	if (!adapter)
++		return FALSE;
++
++	return __near_adapter_get_path(adapter) != NULL;
++}
++
+ static gboolean property_get_adapter(const GDBusPropertyTable *property,
+ 					DBusMessageIter *iter, void *user_data)
+ {
+@@ -568,11 +604,11 @@ static const GDBusMethodTable tag_methods[] = {
+ };
+ 
+ static const GDBusPropertyTable tag_properties[] = {
+-	{ "Type", "s", property_get_type },
+-	{ "Protocol", "s", property_get_protocol },
++	{ "Type", "s", property_get_type, NULL, type_exists },
++	{ "Protocol", "s", property_get_protocol, NULL, protocol_exists },
+ 	{ "ReadOnly", "b", property_get_readonly },
+-	{ "Adapter", "o", property_get_adapter },
+-	{ "Uid", "ay", property_get_uid },
++	{ "Adapter", "o", property_get_adapter, NULL, adapter_exists },
++	{ "Uid", "ay", property_get_uid, NULL, uid_exists },
+ 
+ 	{ }
+ };
