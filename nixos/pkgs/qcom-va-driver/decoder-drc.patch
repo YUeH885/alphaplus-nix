@@ -1,0 +1,202 @@
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index 1b13105..af495e7 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -204,8 +204,19 @@ void Decoder::allocate(unsigned type, unsigned count, std::vector<std::shared_pt
+     }
+ }
+ void Decoder::configure_capture() {
+-    check(!capture_on_, "in-context dynamic resolution change not yet implemented",
+-          VA_STATUS_ERROR_UNIMPLEMENTED);
++    if (capture_on_) {
++        trace("DRC reconfiguring CAPTURE (pending=%zu)", pending_.size());
++        unsigned type = CAPTURE;
++        checked(fd_, VIDIOC_STREAMOFF, &type, "STREAMOFF CAPTURE");
++        capture_on_ = false;
++        // Existing surfaces and exported DMA-BUFs retain the old allocation.
++        // Iris supports orphaned buffers, so only release the queue's references.
++        capture_.clear();
++        v4l2_requestbuffers req{};
++        req.type = CAPTURE;
++        req.memory = V4L2_MEMORY_MMAP;
++        checked(fd_, VIDIOC_REQBUFS, &req, "REQBUFS CAPTURE 0");
++    }
+     v4l2_format fmt{};
+     fmt.type = CAPTURE;
+     checked(fd_, VIDIOC_G_FMT, &fmt, "G_FMT CAPTURE");
+@@ -235,6 +246,7 @@ void Decoder::configure_capture() {
+         m->height = fmt.fmt.pix_mp.height;
+         m->fourcc = fourcc_;
+     }
++    last_ = false;
+     requeue();
+     unsigned type = CAPTURE;
+     checked(fd_, VIDIOC_STREAMON, &type, "STREAMON CAPTURE");
+@@ -246,12 +258,20 @@ void Decoder::configure_capture() {
+ void Decoder::requeue() {
+     if (last_)
+         return;
++    bool draining = capture_on_ && source_change_;
++    // Iris can return an empty LAST immediately on QBUF during DRC. Give the
++    // already queued buffers a chance to return the old pictures first.
++    if (draining && std::any_of(capture_.begin(), capture_.end(),
++                                [](const auto &m) { return m->queued; }))
++        return;
+     for (auto &m : capture_) {
+         if (!m->queued && m.use_count() == 1) {
+             QueueBuffer q(CAPTURE, m->index);
+             q.plane.length = m->size;
+             checked(fd_, VIDIOC_QBUF, &q.buffer, "QBUF CAPTURE");
+             m->queued = true;
++            if (draining)
++                break;
+         }
+     }
+ }
+@@ -285,7 +305,6 @@ void Decoder::recover_picture(uint64_t token) {
+ }
+ void Decoder::pump(int timeout_ms) {
+     check(failure_ == VA_STATUS_SUCCESS, "decoder session has failed", failure_);
+-    requeue();
+     if (timeout_ms) {
+         pollfd p{fd_, POLLIN | POLLPRI | POLLOUT, 0};
+         int ret;
+@@ -294,28 +313,6 @@ void Decoder::pump(int timeout_ms) {
+         } while (ret < 0 && errno == EINTR);
+         check(ret >= 0 && !(p.revents & POLLNVAL), "poll Iris failed");
+     }
+-    for (;;) {
+-        v4l2_event event{};
+-        if (call(fd_, VIDIOC_DQEVENT, &event) < 0) {
+-            check(errno == EAGAIN || errno == ENOENT, "DQEVENT failed");
+-            break;
+-        }
+-        if (event.type == V4L2_EVENT_SOURCE_CHANGE)
+-            source_change_ = true;
+-    }
+-    if (source_change_ && !capture_on_) {
+-        try {
+-            configure_capture();
+-        } catch (const Error &e) {
+-            // STREAMON failure can leave the kernel session unusable. Close it
+-            // and complete pending surfaces instead of retrying S_FMT forever.
+-            fail(e.status);
+-            throw;
+-        } catch (...) {
+-            fail(VA_STATUS_ERROR_ALLOCATION_FAILED);
+-            throw;
+-        }
+-    }
+     for (;;) {
+         QueueBuffer q(OUTPUT);
+         if (call(fd_, VIDIOC_DQBUF, &q.buffer) < 0) {
+@@ -330,12 +327,11 @@ void Decoder::pump(int timeout_ms) {
+             recover_picture(token);
+         }
+     }
+-    if (!capture_on_ || last_)
+-        return;
+-    for (;;) {
++    while (capture_on_ && !last_) {
+         QueueBuffer q(CAPTURE);
+         if (call(fd_, VIDIOC_DQBUF, &q.buffer) < 0) {
+-            check(errno == EAGAIN || errno == EPIPE, "DQBUF CAPTURE failed");
++            last_ = errno == EPIPE;
++            check(last_ || errno == EAGAIN, "DQBUF CAPTURE failed");
+             break;
+         }
+         check(q.buffer.index < capture_.size(), "invalid CAPTURE index");
+@@ -360,7 +356,9 @@ void Decoder::pump(int timeout_ms) {
+                 auto surface = it->second;
+                 m->data_offset = q.plane.data_offset;
+                 surface->status = VA_STATUS_SUCCESS;
+-                if (surface->persistent_export) {
++                if (surface->width > m->width || surface->height > m->height) {
++                    surface->status = VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
++                } else if (surface->persistent_export) {
+                     // Keep the fd/offset/pitch which the client already imported.
+                     // CAPTURE selection is owned by the stateful decoder, not VA.
+                     try {
+@@ -368,9 +366,6 @@ void Decoder::pump(int timeout_ms) {
+                         copier_.copy(surface->memory, m, surface->width, surface->height);
+                     } catch (const Error &e) {
+                         surface->status = e.status;
+-                        surface->pending = false;
+-                        pending_.erase(it);
+-                        throw;
+                     }
+                 } else {
+                     surface->memory = m;
+@@ -381,22 +376,41 @@ void Decoder::pump(int timeout_ms) {
+                 pending_.erase(it);
+             }
+         }
+-        if (q.buffer.flags & V4L2_BUF_FLAG_LAST) {
+-            last_ = true;
++        last_ = q.buffer.flags & V4L2_BUF_FLAG_LAST;
++    }
++    for (;;) {
++        v4l2_event event{};
++        if (call(fd_, VIDIOC_DQEVENT, &event) < 0) {
++            check(errno == EAGAIN || errno == ENOENT, "DQEVENT failed");
+             break;
+         }
++        if (event.type == V4L2_EVENT_SOURCE_CHANGE &&
++            (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION))
++            source_change_ = true;
++    }
++    if (source_change_ && (!capture_on_ || last_)) {
++        try {
++            configure_capture();
++        } catch (const Error &e) {
++            // STREAMON failure can leave the kernel session unusable. Close it
++            // and complete pending surfaces instead of retrying S_FMT forever.
++            fail(e.status);
++            throw;
++        } catch (...) {
++            fail(VA_STATUS_ERROR_ALLOCATION_FAILED);
++            throw;
++        }
++    } else {
++        requeue();
+     }
+-    check(!source_change_, "in-context dynamic resolution change not yet implemented",
+-          VA_STATUS_ERROR_UNIMPLEMENTED);
+ }
+ void Decoder::submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Surface> &surface) {
+     std::lock_guard<std::mutex> lock(mutex_);
+     // VLC allocates its renderer pool before creating the FFmpeg context,
+     // which can pass zero render targets to VA. Preserve the allocation hint
+     // on each surface as a preference, subject to the CAPTURE memory budget.
+-    if (!capture_on_)
+-        preferred_pool_size_ =
+-            std::min(64u, std::max(preferred_pool_size_, surface->allocation_count + 4));
++    preferred_pool_size_ =
++        std::min(64u, std::max(preferred_pool_size_, surface->allocation_count + 4));
+     pump(0);
+     auto start = std::chrono::steady_clock::now();
+     std::shared_ptr<Memory> slot;
+@@ -461,9 +475,12 @@ void Decoder::finish() {
+ }
+ void Decoder::sync(const std::shared_ptr<Surface> &surface) {
+     std::unique_lock<std::mutex> lock(mutex_);
+-    pump(0);
+     auto start = std::chrono::steady_clock::now();
+     while (surface->pending) {
++        pump(0);
++        if (!surface->pending)
++            break;
++        check(!last_, "surface missing at LAST", VA_STATUS_ERROR_DECODING_ERROR);
+         if (expired(start)) {
+             unsigned queued = 0, retained = 0;
+             for (auto &m : capture_) {
+@@ -482,9 +499,6 @@ void Decoder::sync(const std::shared_ptr<Surface> &surface) {
+         pollfd p{fd_, POLLIN | POLLPRI, 0};
+         poll(&p, 1, 10);
+         lock.lock();
+-        pump(0);
+-        check(!last_ || !surface->pending, "surface missing at LAST",
+-              VA_STATUS_ERROR_DECODING_ERROR);
+     }
+     if (surface->status != VA_STATUS_SUCCESS)
+         throw Error(surface->status, "surface decode failed");

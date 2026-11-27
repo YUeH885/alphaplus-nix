@@ -132,7 +132,7 @@ packages // {
 
   ffmpeg-vpu = import ./pkgs/ffmpeg-vpu { ffmpeg_7 = ffmpeg; };
   qcom-va-driver = native.qcom-va-driver.override {
-    inherit (cross) stdenv meson pkg-config;
+    inherit (cross) stdenv buildPackages meson pkg-config;
     inherit (build) ninja fetchFromGitHub;
   };
   inherit libcamera-alphaplus libssc;

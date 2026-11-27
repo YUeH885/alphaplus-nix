@@ -1,6 +1,7 @@
 {
   lib,
   stdenv,
+  buildPackages,
   fetchFromGitHub,
   meson,
   ninja,
@@ -9,6 +10,8 @@
   libdrm,
   libgbm,
   libglvnd,
+  vulkan-headers,
+  vulkan-loader,
 }:
 
 stdenv.mkDerivation {
@@ -22,12 +25,18 @@ stdenv.mkDerivation {
     hash = "sha256-RFtxyomnichk1ifcbc3xd862gDE6YOTZLrSvpOaiQXQ=";
   };
 
+  patches = [
+    ./vulkan-vpp-32bit-ssbo.patch
+    ./decoder-drc.patch
+  ];
+
   strictDeps = true;
 
   nativeBuildInputs = [
     meson
     ninja
     pkg-config
+    buildPackages.glslang
   ];
 
   buildInputs = [
@@ -35,12 +44,14 @@ stdenv.mkDerivation {
     libdrm
     libgbm
     libglvnd
+    vulkan-headers
+    vulkan-loader
   ];
 
   mesonFlags = [
     "-Dcdsp_vpp=disabled"
     "-Dgpu_copy=enabled"
-    "-Dvulkan_vpp=disabled"
+    "-Dvulkan_vpp=enabled"
     "-Dvpp_backend=auto"
     "-Dv4l2_symlink=true"
     "-Dtests=false"

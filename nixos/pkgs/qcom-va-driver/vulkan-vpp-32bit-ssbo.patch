@@ -1,0 +1,542 @@
+diff --git a/src/vulkan/meson.build b/src/vulkan/meson.build
+index e49b2a5..653a7ab 100644
+--- a/src/vulkan/meson.build
++++ b/src/vulkan/meson.build
+@@ -1,22 +1,27 @@
++storage_glsl = files('storage.glsl')
+ tonemap_spirv = custom_target(
+   'tonemap_spirv',
+   input: 'tonemap.comp',
+   output: 'tonemap_spirv.h',
++  depend_files: storage_glsl,
+   command: [glslang, '-V', '--target-env', 'vulkan1.1', '--vn', 'tonemap_spirv',
+             '-o', '@OUTPUT@', '@INPUT@'],
+ )
+ overlay_spirv = custom_target(
+   'overlay_spirv', input: 'overlay.comp', output: 'overlay_spirv.h',
++  depend_files: storage_glsl,
+   command: [glslang, '-V', '--target-env', 'vulkan1.1', '--vn', 'overlay_spirv',
+             '-o', '@OUTPUT@', '@INPUT@'],
+ )
+ transform_spirv = custom_target(
+   'transform_spirv', input: 'transform.comp', output: 'transform_spirv.h',
++  depend_files: storage_glsl,
+   command: [glslang, '-V', '--target-env', 'vulkan1.1', '--vn', 'transform_spirv',
+             '-o', '@OUTPUT@', '@INPUT@'],
+ )
+ vertical_spirv = custom_target(
+   'vertical_spirv', input: 'transform.comp', output: 'vertical_spirv.h',
++  depend_files: storage_glsl,
+   command: [glslang, '-V', '--target-env', 'vulkan1.1', '-DVERTICAL_PASS=1',
+             '--vn', 'vertical_spirv', '-o', '@OUTPUT@', '@INPUT@'],
+ )
+diff --git a/src/vulkan/overlay.comp b/src/vulkan/overlay.comp
+index 47cbf7f..01f07dc 100644
+--- a/src/vulkan/overlay.comp
++++ b/src/vulkan/overlay.comp
+@@ -1,10 +1,11 @@
+ // SPDX-License-Identifier: MIT
+ #version 450
+-#extension GL_EXT_shader_16bit_storage : require
++#extension GL_GOOGLE_include_directive : require
++#include "storage.glsl"
+ layout(local_size_x=64) in;
+-layout(set=0,binding=0,std430) readonly buffer Base { uint16_t base[]; };
+-layout(set=0,binding=1,std430) buffer Output { uint16_t output_data[]; };
++layout(set=0,binding=0,std430) readonly buffer Base { uint base[]; };
+ layout(set=0,binding=2,std430) readonly buffer RGB { uint rgba[]; };
++const int in_place_unaligned = 8;
+ // Matches OverlayParams in ../overlay-params.h.
+ layout(push_constant,std430) uniform Parameters {
+     int width,height,src_stride,src_y,src_uv,dst_stride,dst_y,dst_uv;
+@@ -34,30 +35,51 @@ ivec4 sample_rgb(ivec2 xy) {
+     return (v*p.alpha+128)>>8;
+ }
+ int contribution(int row,ivec4 v) { return (p.matrix[row]*v.r+p.matrix[row+1]*v.g+p.matrix[row+2]*v.b+8192)>>14; }
+-ivec2 load_pair(int offset,bool wide) {
+-    uint first=uint(base[offset/2]);
+-    return wide ? ivec2(first>>6,uint(base[offset/2+1])>>6) : ivec2(first&255u,first>>8);
++uint load_halfword(int byte_offset) {
++    uint index = uint(byte_offset) >> 2u;
++    // The host binds the same buffer as base/output for subsequent layers.
++    // Read shared words atomically when a neighbor can write the other half.
++    uint word = (p.flags & in_place_unaligned) != 0 ? atomicOr(output_data[index], 0u) : base[index];
++    return extract_halfword(word, byte_offset);
+ }
+-void store_pair(int offset,ivec2 v,bool wide) {
+-    v=clamp(v,ivec2(0),ivec2(wide?1023:255));
+-    if (wide) { output_data[offset/2]=uint16_t(v.x<<6); output_data[offset/2+1]=uint16_t(v.y<<6); }
+-    else output_data[offset/2]=uint16_t(v.x|(v.y<<8));
++ivec2 load_pair(int offset, bool wide) {
++    uint first = load_halfword(offset);
++    return wide ? ivec2(first >> 6u, load_halfword(offset + 2) >> 6u)
++                : ivec2(first & 255u, first >> 8u);
+ }
+-void main() {
+-    int x=int(gl_GlobalInvocationID.x)*2,y=int(gl_GlobalInvocationID.y)*2;
+-    if (x>=p.width) return;
+-    bool wide=(p.flags&1)!=0; int bytes=wide?2:1,scale=wide?4:1;
+-    int sum_a=0,sum_u=0,sum_v=0;
+-    for (int row=0;row<2;++row) {
+-        ivec2 v=load_pair(p.src_y+(y+row)*p.src_stride+x*bytes,wide);
+-        for (int col=0;col<2;++col) {
+-            ivec4 rgb=sample_rgb(ivec2(x+col,y+row));
+-            v[col]=(v[col]*(255-rgb.a)+p.black*scale*rgb.a+contribution(0,rgb)*scale+127)/255;
+-            sum_a+=rgb.a; sum_u+=contribution(3,rgb); sum_v+=contribution(6,rgb);
++uint pack_pair(ivec2 value, bool wide) {
++    return pack_pixel_pair(clamp(value, ivec2(0), ivec2(wide ? 1023 : 255)), wide);
++}
++uvec3 blend_block(int x, int y, bool wide) {
++    int bytes = wide ? 2 : 1, scale = wide ? 4 : 1;
++    int sum_a = 0, sum_u = 0, sum_v = 0;
++    uvec3 result;
++    for (int row = 0; row < 2; ++row) {
++        ivec2 value = load_pair(p.src_y + (y + row) * p.src_stride + x * bytes, wide);
++        for (int col = 0; col < 2; ++col) {
++            ivec4 rgb = sample_rgb(ivec2(x + col, y + row));
++            value[col] = (value[col] * (255 - rgb.a) + p.black * scale * rgb.a +
++                          contribution(0, rgb) * scale + 127) / 255;
++            sum_a += rgb.a;
++            sum_u += contribution(3, rgb);
++            sum_v += contribution(6, rgb);
+         }
+-        store_pair(p.dst_y+(y+row)*p.dst_stride+x*bytes,v,wide);
++        result[row] = pack_pair(value, wide);
+     }
+-    ivec2 uv=load_pair(p.src_uv+(y/2)*p.src_stride+x*bytes,wide);
+-    uv=(uv*(1020-sum_a)+128*scale*sum_a+ivec2(sum_u,sum_v)*scale+510)/1020;
+-    store_pair(p.dst_uv+(y/2)*p.dst_stride+x*bytes,uv,wide);
++    ivec2 uv = load_pair(p.src_uv + (y / 2) * p.src_stride + x * bytes, wide);
++    uv = (uv * (1020 - sum_a) + 128 * scale * sum_a + ivec2(sum_u, sum_v) * scale + 510) / 1020;
++    result.z = pack_pair(uv, wide);
++    return result;
++}
++void main() {
++    int x = int(gl_GlobalInvocationID.x) * 4, y = int(gl_GlobalInvocationID.y) * 2;
++    if (x >= p.width || y >= p.height) return;
++    bool wide = (p.flags & 1) != 0;
++    bool has_second = x + 2 < p.width;
++    uvec3 first = blend_block(x, y, wide);
++    uvec3 second = has_second ? blend_block(x + 2, y, wide) : uvec3(0);
++    int column = x * (wide ? 2 : 1);
++    store_pixel_pairs(p.dst_y + y * p.dst_stride + column, first.x, second.x, has_second, wide);
++    store_pixel_pairs(p.dst_y + (y + 1) * p.dst_stride + column, first.y, second.y, has_second, wide);
++    store_pixel_pairs(p.dst_uv + (y / 2) * p.dst_stride + column, first.z, second.z, has_second, wide);
+ }
+diff --git a/src/vulkan/storage.glsl b/src/vulkan/storage.glsl
+new file mode 100644
+index 0000000..e8db198
+--- /dev/null
++++ b/src/vulkan/storage.glsl
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: MIT
++layout(set=0, binding=1, std430) coherent buffer Output { uint output_data[]; };
++
++uint extract_halfword(uint word, int byte_offset) {
++    return (word >> ((byte_offset & 2) * 8)) & 0xffffu;
++}
++
++void store_halfword(int byte_offset, uint value) {
++    uint index = uint(byte_offset) >> 2u;
++    int shift = (byte_offset & 2) * 8;
++    // Adjacent invocations can own different halves of an unaligned word.
++    atomicAnd(output_data[index], ~(0xffffu << shift));
++    atomicOr(output_data[index], (value & 0xffffu) << shift);
++}
++
++void store_word(int byte_offset, uint value) {
++    if ((byte_offset & 3) == 0) {
++        output_data[uint(byte_offset) >> 2u] = value;
++    } else {
++        store_halfword(byte_offset, value);
++        store_halfword(byte_offset + 2, value >> 16u);
++    }
++}
++
++uint pack_pixel_pair(ivec2 value, bool wide) {
++    return wide ? (uint(value.x) << 6u) | (uint(value.y) << 22u)
++                : uint(value.x) | (uint(value.y) << 8u);
++}
++
++void store_pixel_pairs(int byte_offset, uint first, uint second, bool has_second, bool wide) {
++    if (wide) {
++        store_word(byte_offset, first);
++        if (has_second)
++            store_word(byte_offset + 4, second);
++    } else if (has_second) {
++        store_word(byte_offset, first | (second << 16u));
++    } else {
++        store_halfword(byte_offset, first);
++    }
++}
+diff --git a/src/vulkan/tonemap.comp b/src/vulkan/tonemap.comp
+index f6dd3fe..5eb21d6 100644
+--- a/src/vulkan/tonemap.comp
++++ b/src/vulkan/tonemap.comp
+@@ -1,11 +1,11 @@
+ // SPDX-License-Identifier: MIT
+ #version 450
+-#extension GL_EXT_shader_16bit_storage : require
++#extension GL_GOOGLE_include_directive : require
++#include "storage.glsl"
+ layout(local_size_x = 64) in;
+-layout(set = 0, binding = 0, std430) readonly buffer Input { uint16_t src[]; };
+-layout(set = 0, binding = 1, std430) writeonly buffer Output { uint16_t dst[]; };
++layout(set = 0, binding = 0, std430) readonly buffer Input { uint src[]; };
+ layout(push_constant) uniform Params {
+-    uint width, height, src_stride, src_y, src_uv, dst_stride, dst_y, dst_uv;
++    int width, height, src_stride, src_y, src_uv, dst_stride, dst_y, dst_uv;
+     float source_pq, destination, knee;
+ } p;
+ 
+@@ -53,25 +53,31 @@ uint pack_pair(ivec2 value) {
+     uvec2 bytes = uvec2(clamp(value, 0, 255));
+     return bytes.x | (bytes.y << 8);
+ }
++int load_p010(int byte_offset) {
++    return int(extract_halfword(src[uint(byte_offset) >> 2u], byte_offset) >> 6u);
++}
++uvec3 tone_block(int x, int y) {
++    int uv = p.src_uv + (y / 2) * p.src_stride + x * 2;
++    ivec2 chroma = ivec2(load_p010(uv), load_p010(uv + 2));
++    ivec2 sum = ivec2(0);
++    uvec3 result;
++    for (int row = 0; row < 2; ++row) {
++        int yy = p.src_y + (y + row) * p.src_stride + x * 2;
++        ivec3 a = tone(ivec3(load_p010(yy), chroma));
++        ivec3 b = tone(ivec3(load_p010(yy + 2), chroma));
++        result[row] = pack_pair((ivec2(a.x, b.x) + 2) / 4);
++        sum += a.yz + b.yz;
++    }
++    result.z = pack_pair((sum + 8) / 16);
++    return result;
++}
+ void main() {
+-    // Each invocation owns 4x2 pixels. Halfword stores also handle widths
+-    // congruent to 2 modulo 4, without overlapping another invocation's bytes.
+-    uint x = gl_GlobalInvocationID.x*4u, y = gl_GlobalInvocationID.y*2u;
++    int x = int(gl_GlobalInvocationID.x) * 4, y = int(gl_GlobalInvocationID.y) * 2;
+     if (x >= p.width || y >= p.height) return;
+-    for (uint pair = 0u; pair < 2u; ++pair) {
+-        uint column = x + pair*2u;
+-        if (column >= p.width) break;
+-        uint uv = (p.src_uv + (y/2u)*p.src_stride)/2u + column;
+-        ivec2 chroma = ivec2(uint(src[uv]) >> 6, uint(src[uv+1u]) >> 6);
+-        ivec2 sum = ivec2(0);
+-        for (uint row = 0u; row < 2u; ++row) {
+-            uint yy = (p.src_y + (y+row)*p.src_stride)/2u + column;
+-            ivec3 a = tone(ivec3(int(uint(src[yy]) >> 6), chroma));
+-            ivec3 b = tone(ivec3(int(uint(src[yy+1u]) >> 6), chroma));
+-            dst[(p.dst_y + (y+row)*p.dst_stride + column)/2u] =
+-                uint16_t(pack_pair((ivec2(a.x, b.x) + 2)/4));
+-            sum += a.yz + b.yz;
+-        }
+-        dst[(p.dst_uv + (y/2u)*p.dst_stride + column)/2u] = uint16_t(pack_pair((sum+8)/16));
+-    }
++    bool has_second = x + 2 < p.width;
++    uvec3 first = tone_block(x, y);
++    uvec3 second = has_second ? tone_block(x + 2, y) : uvec3(0);
++    store_pixel_pairs(p.dst_y + y * p.dst_stride + x, first.x, second.x, has_second, false);
++    store_pixel_pairs(p.dst_y + (y + 1) * p.dst_stride + x, first.y, second.y, has_second, false);
++    store_pixel_pairs(p.dst_uv + (y / 2) * p.dst_stride + x, first.z, second.z, has_second, false);
+ }
+diff --git a/src/vulkan/transform.comp b/src/vulkan/transform.comp
+index 5801f00..d651a87 100644
+--- a/src/vulkan/transform.comp
++++ b/src/vulkan/transform.comp
+@@ -1,9 +1,8 @@
+ // SPDX-License-Identifier: MIT
+ #version 450
+-#extension GL_EXT_shader_16bit_storage : require
++#extension GL_GOOGLE_include_directive : require
++#include "storage.glsl"
+ 
+-// Each invocation owns a complete 2x2 Y block and its UV pair. In particular,
+-// neighboring invocations never write different bytes of the same NV12 word.
+ // Specialize uniform format/rotation and tap counts so the driver can unroll
+ // common 2x area and four-tap cubic kernels without per-sample branches.
+ layout(constant_id=0) const int source_wide = 0;
+@@ -13,10 +12,9 @@ layout(constant_id=3) const int filter_mode = 0; // copy, area, separable cubic/
+ layout(constant_id=4) const int taps_x = 0;
+ layout(constant_id=5) const int taps_y = 0;
+ layout(local_size_x=8, local_size_y=8) in;
+-layout(set=0, binding=0, std430) readonly buffer Input { uint16_t input_data[]; };
+-layout(set=0, binding=1, std430) writeonly buffer Output { uint16_t output_data[]; };
++layout(set=0, binding=0, std430) readonly buffer Input { uint input_data[]; };
+ layout(set=0, binding=3, std430) readonly buffer Filters { uint filters[]; };
+-layout(set=0, binding=4, std430) buffer Scratch { int16_t scratch[]; };
++layout(set=0, binding=4, std430) buffer Scratch { uint scratch[]; };
+ layout(push_constant, std430) uniform Parameters {
+     int src_width, src_height, scaled_width, scaled_height, width, height;
+     int src_stride, src_y, src_uv, dst_stride, dst_y, dst_uv;
+@@ -34,9 +32,12 @@ ivec2 source_position(ivec2 output_pos, bool chroma) {
+ int load_sample(ivec2 xy, bool chroma, int channel) {
+     int x = chroma ? xy.x * 2 + channel : xy.x;
+     int offset = (chroma ? p.src_uv : p.src_y) + xy.y * p.src_stride + x * (1 + source_wide);
+-    uint word = uint(input_data[offset / 2]);
+-    if (source_wide != 0) return int(word >> 6);
+-    return int((word >> ((offset & 1) * 8)) & 255u) << (target_wide != 0 ? 2 : 0);
++    uint word32 = input_data[uint(offset) >> 2u];
++    if (source_wide != 0) {
++        uint word16 = extract_halfword(word32, offset);
++        return int(word16 >> 6u);
++    }
++    return int((word32 >> ((uint(offset) & 3u) * 8u)) & 255u) << (target_wide != 0 ? 2 : 0);
+ }
+ int scratch_index(ivec2 xy, bool chroma, int channel) {
+     return (chroma ? p.src_width * p.scaled_height : 0) + xy.y * p.src_width +
+@@ -75,8 +76,10 @@ int filtered(ivec2 xy, bool chroma, int channel) {
+         for (int i = 0; i < nx; ++i) {
+             uint tap = filters[fx + 2 + i];
+             ivec2 pos = ivec2(tap & 65535u, xy.y);
+-            int value = filter_mode >= 2 ? int(scratch[scratch_index(pos, chroma, channel)])
+-                                         : vertical(pos, chroma, channel);
++            int sidx = scratch_index(pos, chroma, channel);
++            int value = filter_mode >= 2
++                ? bitfieldExtract(int(scratch[uint(sidx) >> 1u]), (sidx & 1) * 16, 16)
++                : vertical(pos, chroma, channel);
+             sum += value * (int(tap) >> 16);
+         }
+         int shift = sx + fraction + (wide && target_wide == 0 ? 2 : 0);
+@@ -85,37 +88,46 @@ int filtered(ivec2 xy, bool chroma, int channel) {
+     if (wide && target_wide == 0) result = (result + 2) >> 2;
+     return clamp(result, 0, target_wide != 0 ? 1023 : 255);
+ }
+-void store_pair(int offset, ivec2 value) {
+-    if (target_wide != 0) {
+-        output_data[offset / 2] = uint16_t(value.x << 6);
+-        output_data[offset / 2 + 1] = uint16_t(value.y << 6);
+-    } else {
+-        output_data[offset / 2] = uint16_t(value.x | (value.y << 8));
+-    }
+-}
+ #ifdef VERTICAL_PASS
+ void main() {
+     ivec2 xy = ivec2(gl_GlobalInvocationID.xy) * 2;
+     if (xy.x >= p.src_width || xy.y >= p.scaled_height) return;
+-    for (int row = 0; row < 2; ++row)
+-        for (int col = 0; col < 2; ++col) {
+-            ivec2 pos = xy + ivec2(col, row);
+-            scratch[scratch_index(pos, false, 0)] = int16_t(vertical(pos, false, 0));
+-        }
+-    for (int ch = 0; ch < 2; ++ch)
+-        scratch[scratch_index(xy / 2, true, ch)] = int16_t(vertical(xy / 2, true, ch));
++    for (int row = 0; row < 2; ++row) {
++        ivec2 pos = xy + ivec2(0, row);
++        int v0 = vertical(pos, false, 0);
++        int v1 = vertical(pos + ivec2(1, 0), false, 0);
++        scratch[uint(scratch_index(pos, false, 0)) >> 1u] =
++            (uint(v0) & 0xffffu) | ((uint(v1) & 0xffffu) << 16u);
++    }
++    int c0 = vertical(xy / 2, true, 0);
++    int c1 = vertical(xy / 2, true, 1);
++    scratch[uint(scratch_index(xy / 2, true, 0)) >> 1u] =
++        (uint(c0) & 0xffffu) | ((uint(c1) & 0xffffu) << 16u);
+ }
+ #else
++uint luma_pair(ivec2 xy) {
++    return pack_pixel_pair(ivec2(filtered(xy, false, 0), filtered(xy + ivec2(1, 0), false, 0)),
++                           target_wide != 0);
++}
++uint chroma_pair(ivec2 xy) {
++    return pack_pixel_pair(ivec2(filtered(xy, true, 0), filtered(xy, true, 1)), target_wide != 0);
++}
+ void main() {
+-    ivec2 xy = ivec2(gl_GlobalInvocationID.xy) * 2;
++    ivec2 xy = ivec2(gl_GlobalInvocationID.xy) * ivec2(4, 2);
+     if (xy.x >= p.width || xy.y >= p.height) return;
++    bool has_second = xy.x + 2 < p.width;
++    int column = xy.x * (1 + target_wide);
+     for (int row = 0; row < 2; ++row) {
+-        ivec2 a = xy + ivec2(0, row);
+-        store_pair(p.dst_y + a.y * p.dst_stride + a.x * (1 + target_wide),
+-                   ivec2(filtered(a, false, 0), filtered(a + ivec2(1, 0), false, 0)));
++        ivec2 pos = xy + ivec2(0, row);
++        uint first = luma_pair(pos);
++        uint second = has_second ? luma_pair(pos + ivec2(2, 0)) : 0u;
++        store_pixel_pairs(p.dst_y + pos.y * p.dst_stride + column, first, second, has_second,
++                          target_wide != 0);
+     }
+-    store_pair(p.dst_uv + (xy.y / 2) * p.dst_stride + xy.x * (1 + target_wide),
+-               ivec2(filtered(xy / 2, true, 0), filtered(xy / 2, true, 1)));
++    ivec2 uv = xy / 2;
++    uint first = chroma_pair(uv);
++    uint second = has_second ? chroma_pair(uv + ivec2(1, 0)) : 0u;
++    store_pixel_pairs(p.dst_uv + uv.y * p.dst_stride + column, first, second, has_second,
++                      target_wide != 0);
+ }
+-
+ #endif
+diff --git a/src/vulkan/vpp.cpp b/src/vulkan/vpp.cpp
+index cd35722..704eccf 100644
+--- a/src/vulkan/vpp.cpp
++++ b/src/vulkan/vpp.cpp
+@@ -26,9 +26,10 @@ void vk_check(VkResult result, const char *operation) {
+         throw Error(VA_STATUS_ERROR_OPERATION_FAILED, operation);
+     }
+ }
++constexpr int overlay_in_place_unaligned = 8;
+ static_assert(sizeof(OverlayParams) == 120, "overlay push constant ABI");
+ struct Parameters {
+-    uint32_t width, height, src_stride, src_y, src_uv, dst_stride, dst_y, dst_uv;
++    int32_t width, height, src_stride, src_y, src_uv, dst_stride, dst_y, dst_uv;
+     float source_pq, destination, knee;
+ };
+ struct TransformParameters {
+@@ -49,7 +50,7 @@ void validate_layout(const Memory &memory, const Surface &surface) {
+     check(memory.fd >= 0 && memory.fourcc == surface.fourcc && memory.width >= surface.width &&
+               memory.height >= surface.height && memory.stride >= row_bytes &&
+               memory.storage_height >= surface.height && !(memory.stride & 1) &&
+-              !(memory.data_offset & 1) && !(memory.chroma() & 1) && memory.size <= UINT32_MAX &&
++              !(memory.data_offset & 1) && !(memory.chroma() & 1) && memory.size <= INT32_MAX &&
+               uint64_t(memory.chroma()) + uint64_t(memory.stride) * (surface.height / 2 - 1) +
+                       row_bytes <=
+                   memory.size,
+@@ -77,6 +78,7 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
+         std::shared_ptr<Impl> owner;
+         VkBuffer buffer = VK_NULL_HANDLE;
+         VkDeviceMemory memory = VK_NULL_HANDLE;
++        VkDeviceSize range = 0;
+         ~Import() {
+             vkDestroyBuffer(owner->device, buffer, nullptr);
+             vkFreeMemory(owner->device, memory, nullptr);
+@@ -181,14 +183,6 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
+             if ((!matches_render && !matches_primary) ||
+                 properties.properties.apiVersion < VK_API_VERSION_1_1)
+                 continue;
+-            VkPhysicalDevice16BitStorageFeatures storage{};
+-            storage.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+-            VkPhysicalDeviceFeatures2 features{};
+-            features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+-            features.pNext = &storage;
+-            vkGetPhysicalDeviceFeatures2(candidate, &features);
+-            if (!storage.storageBuffer16BitAccess)
+-                continue;
+             VkPhysicalDeviceExternalBufferInfo external{};
+             external.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO;
+             external.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+@@ -222,12 +216,8 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
+         queue_info.queueFamilyIndex = family;
+         queue_info.queueCount = 1;
+         queue_info.pQueuePriorities = &priority;
+-        VkPhysicalDevice16BitStorageFeatures storage{};
+-        storage.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+-        storage.storageBuffer16BitAccess = VK_TRUE;
+         VkDeviceCreateInfo device_info{};
+         device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+-        device_info.pNext = &storage;
+         device_info.queueCreateInfoCount = 1;
+         device_info.pQueueCreateInfos = &queue_info;
+         device_info.enabledExtensionCount = std::size(extensions);
+@@ -324,24 +314,30 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
+             check(imported->owner.get() == this, "DMA-BUF belongs to another Vulkan device");
+             return imported;
+         }
+-        check(memory.size <= max_buffer_range, "Vulkan storage buffer exceeds device limit",
+-              VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+         auto imported = std::make_shared<Import>();
+         imported->owner = shared_from_this();
++        // The last active halfword can share a word with DMA-BUF padding that
++        // the VA descriptor does not count towards the surface size.
++        imported->range = (VkDeviceSize(memory.size) + 3) & ~VkDeviceSize{3};
++        check(imported->range <= max_buffer_range, "Vulkan storage buffer exceeds device limit",
++              VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+         VkExternalMemoryBufferCreateInfo external{};
+         external.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+         VkBufferCreateInfo buffer_info{};
+         buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+         buffer_info.pNext = &external;
+-        buffer_info.size = memory.size;
++        buffer_info.size = imported->range;
+         buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+         vk_check(vkCreateBuffer(device, &buffer_info, nullptr, &imported->buffer),
+                  "create external buffer");
+         VkMemoryRequirements requirements;
+         vkGetBufferMemoryRequirements(device, imported->buffer, &requirements);
+-        check(requirements.size <= memory.size, "DMA-BUF too small for Vulkan alignment",
+-              VA_STATUS_ERROR_INVALID_SURFACE);
++        if (requirements.size > memory.size) {
++            auto allocation_size = lseek(memory.fd, 0, SEEK_END);
++            check(allocation_size >= 0 && VkDeviceSize(allocation_size) >= requirements.size,
++                  "DMA-BUF too small for Vulkan alignment", VA_STATUS_ERROR_INVALID_SURFACE);
++        }
+         VkMemoryFdPropertiesKHR properties{};
+         properties.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+         vk_check(get_fd_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+@@ -485,7 +481,8 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
+         for (unsigned i = 0; i < 5; ++i) {
+             if (i < 3) {
+                 wait_surface_access(*memories[i], i == 1 ? POLLOUT : POLLIN);
+-                buffers[i] = {import(*memories[i])->buffer, 0, memories[i]->size};
++                auto imported = import(*memories[i]);
++                buffers[i] = {imported->buffer, 0, imported->range};
+             } else if (i == 3)
+                 buffers[i] = filtering ? VkDescriptorBufferInfo{filter_buffer, 0, VK_WHOLE_SIZE}
+                                        : buffers[0];
+@@ -517,8 +514,9 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
+             }
+             unsigned j = barrier_count++;
+             barriers[j].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+-            barriers[j].dstAccessMask =
+-                i == 1 ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT;
++            barriers[j].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++            if (i == 1)
++                barriers[j].dstAccessMask |= VK_ACCESS_SHADER_WRITE_BIT;
+             barriers[j].srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+             barriers[j].dstQueueFamilyIndex = family;
+             barriers[j].buffer = buffers[i].buffer;
+@@ -598,13 +596,12 @@ void VulkanVpp::process(const VppPicture &picture, Surface &target) {
+     float destination = encode_pq(100.0) / source_pq;
+     Parameters params{crop.width,
+                       crop.height,
+-                      src.stride,
+-                      src.data_offset + unsigned(crop.y) * src.stride + unsigned(crop.x) * 2,
+-                      unsigned(src.chroma()) + unsigned(crop.y / 2) * src.stride +
+-                          unsigned(crop.x) * 2,
+-                      dst.stride,
+-                      dst.data_offset,
+-                      unsigned(dst.chroma()),
++                      int32_t(src.stride),
++                      int32_t(src.data_offset + crop.y * src.stride + crop.x * 2),
++                      int32_t(src.chroma() + (crop.y / 2) * src.stride + crop.x * 2),
++                      int32_t(dst.stride),
++                      int32_t(dst.data_offset),
++                      int32_t(dst.chroma()),
+                       float(source_pq),
+                       destination,
+                       1.5f * destination - 0.5f};
+@@ -616,17 +613,20 @@ void VulkanVpp::overlay(Surface &base, Surface &rgba, Surface &target,
+     std::lock_guard<std::mutex> guard(impl_->mutex);
+     validate_layout(*base.memory, base);
+     validate_layout(*target.memory, target);
++    check(rgba.memory->size <= INT32_MAX, "Vulkan overlay buffer exceeds signed offset range",
++          VA_STATUS_ERROR_INVALID_SURFACE);
++    auto shader_params = params;
++    if (base.memory == target.memory && ((params.src_stride | params.src_y | params.src_uv) & 3))
++        shader_params.flags |= overlay_in_place_unaligned;
+     impl_->dispatch(impl_->overlay_pipeline, base.memory.get(), target.memory.get(),
+-                    rgba.memory.get(), &params, sizeof(params), (target.width + 127) / 128,
+-                    target.height / 2);
++                    rgba.memory.get(), &shader_params, sizeof(shader_params),
++                    (target.width + 255) / 256, target.height / 2);
+ }
+ void VulkanVpp::transform(const VppPicture &picture, Surface &target) {
+     std::lock_guard<std::mutex> guard(impl_->mutex);
+     auto &src = *picture.source->memory, &dst = *target.memory;
+     validate_layout(src, *picture.source);
+     validate_layout(dst, target);
+-    check(src.size <= INT32_MAX && dst.size <= INT32_MAX,
+-          "Vulkan transform buffer exceeds signed offset range", VA_STATUS_ERROR_INVALID_SURFACE);
+     TransformParameters p{};
+     auto crop = picture.region;
+     p.src_width = crop.width;
+@@ -663,7 +663,7 @@ void VulkanVpp::transform(const VppPicture &picture, Surface &target) {
+             impl_->scratch_size = size;
+         }
+     }
+-    impl_->dispatch(pipelines[0], &src, &dst, nullptr, &p, sizeof(p), (target.width + 15) / 16,
++    impl_->dispatch(pipelines[0], &src, &dst, nullptr, &p, sizeof(p), (target.width + 31) / 32,
+                     (target.height + 15) / 16, scaling, pipelines[1],
+                     pipelines[1] ? (p.src_width + 15) / 16 : 0, (p.scaled_height + 15) / 16);
+     trace("VPP Vulkan %ux%u -> %ux%u rotation=%u", crop.width, crop.height, target.width,
