@@ -24,6 +24,6 @@
 
 ## 未实现
 
-- **TFA9872 SaaM 扬声器拾音（DMIC0）**：缺少 `saam_ctl`、WCD9340 DMIC0/ADC MUX8 时钟路由及 `Speaker microphone` ACP 端口。
+- **TFA9872 SaaM 扬声器拾音（DMIC0）**：内核已修正 WCD9340 `ADC MUX8`（`tx_adc_mux8_enum`）寄存器地址并在 `SLIM TX8` 上验证通路；原厂 `Tfa9872.cnt` 无 SaaM 配置，真机实测 `DMIC0` 在不同 TFA9872 / WCD9340 寄存器组合下均无有效拾音信号，暂未启用。
 - **FM 收音接收**：主线缺少控制协议驱动与 AFE 后端路由。
 - **AMIC4 麦克风**：实测仅为底噪（疑似韩版未贴片或偏置特殊），未开放为可用输入。
