@@ -6,5 +6,6 @@ ffmpeg_7.overrideAttrs (oldAttrs: {
   patches = (oldAttrs.patches or [ ]) ++ [
     ./patches/0001-v4l2-p010-drm-prime.patch
     ./patches/0002-v4l2-format-lifecycle-encoding.patch
+    ./patches/0003-v4l2-qcom-ubwc-drm-prime.patch
   ];
 })

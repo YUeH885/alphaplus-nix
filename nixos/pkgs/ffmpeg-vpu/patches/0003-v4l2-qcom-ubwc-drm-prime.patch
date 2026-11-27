@@ -1,0 +1,164 @@
+Subject: [PATCH] avcodec/v4l2: export QCOM UBWC NV12 via DRM_PRIME
+
+diff --git a/libavcodec/v4l2_buffers.c b/libavcodec/v4l2_buffers.c
+index fe16851..5c1f40b 100644
+--- a/libavcodec/v4l2_buffers.c
++++ b/libavcodec/v4l2_buffers.c
+@@ -554,6 +554,45 @@ static int v4l2_buffer_export_dmabuf(V4L2Buffer *avbuf)
+     if (avbuf->num_planes != 1 && avbuf->num_planes != 2)
+         return AVERROR_PATCHWELCOME;
+ 
++#if defined(V4L2_PIX_FMT_QC08C) && defined(DRM_FORMAT_MOD_QCOM_COMPRESSED)
++    if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type) &&
++        ctx->format.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_QC08C) {
++        struct v4l2_exportbuffer expbuf = {
++            .type = ctx->type,
++            .index = avbuf->buf.index,
++            .plane = 0,
++            .flags = O_CLOEXEC | O_RDONLY,
++        };
++        uint32_t w = ctx->format.fmt.pix_mp.width;
++        uint32_t h = ctx->format.fmt.pix_mp.height;
++        uint32_t y_stride = ctx->format.fmt.pix_mp.plane_fmt[0].bytesperline;
++        uint32_t y_meta_stride = FFALIGN(AV_CEIL_RSHIFT(w, 5), 64);
++        uint32_t y_meta_scanlines = FFALIGN(AV_CEIL_RSHIFT(h, 3), 16);
++        size_t y_meta_size = FFALIGN((size_t)y_meta_stride * y_meta_scanlines, 4096);
++        size_t y_size = FFALIGN((size_t)y_stride * FFALIGN(h, 32), 4096);
++
++        if (avbuf->num_planes != 1 || !y_stride || y_meta_size + y_size >= avbuf->planes[0].length)
++            return AVERROR(EINVAL);
++        if (ioctl(buf_to_m2mctx(avbuf)->fd, VIDIOC_EXPBUF, &expbuf) < 0)
++            return AVERROR(errno);
++
++        desc->nb_layers = 1;
++        desc->nb_objects = 1;
++        desc->objects[0].fd = expbuf.fd;
++        desc->objects[0].size = avbuf->planes[0].length;
++        desc->objects[0].format_modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
++        layer->format = DRM_FORMAT_NV12;
++        layer->nb_planes = 2;
++        layer->planes[0].object_index = 0;
++        layer->planes[0].offset = 0;
++        layer->planes[0].pitch = y_stride;
++        layer->planes[1].object_index = 0;
++        layer->planes[1].offset = y_meta_size + y_size;
++        layer->planes[1].pitch = y_stride;
++        return 0;
++    }
++#endif
++
+     desc->nb_layers = 1;
+     layer->format = ctx->av_pix_fmt == AV_PIX_FMT_P010LE ?
+                     DRM_FORMAT_P010 : DRM_FORMAT_NV12;
+diff --git a/libavcodec/v4l2_m2m_dec.c b/libavcodec/v4l2_m2m_dec.c
+index 50e803f..b09e12e 100644
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -23,6 +23,10 @@
+ 
+ #include <linux/videodev2.h>
+ #include <sys/ioctl.h>
++#include "config.h"
++#if CONFIG_LIBDRM
++#include <drm_fourcc.h>
++#endif
+ #include "libavutil/pixfmt.h"
+ #include "libavutil/pixdesc.h"
+ #include "libavutil/opt.h"
+@@ -37,6 +41,50 @@
+ #include "v4l2_m2m.h"
+ #include "v4l2_fmt.h"
+ 
++#if CONFIG_LIBDRM && defined(V4L2_PIX_FMT_QC08C) && defined(DRM_FORMAT_MOD_QCOM_COMPRESSED)
++static int v4l2_set_capture_pixfmt(AVCodecContext *avctx, V4L2Context *capture,
++                                   uint32_t pixfmt, int probe_first)
++{
++    V4L2m2mContext *s = ((V4L2m2mPriv *)avctx->priv_data)->context;
++    struct v4l2_format fmt = capture->format;
++    int multiplanar = V4L2_TYPE_IS_MULTIPLANAR(capture->type);
++    uint32_t cur_pixfmt = multiplanar ? fmt.fmt.pix_mp.pixelformat : fmt.fmt.pix.pixelformat;
++
++    if (cur_pixfmt == pixfmt)
++        return 0;
++
++    if (multiplanar) {
++        fmt.fmt.pix_mp.pixelformat = pixfmt;
++        if (!fmt.fmt.pix_mp.width || !fmt.fmt.pix_mp.height) {
++            fmt.fmt.pix_mp.width = capture->width;
++            fmt.fmt.pix_mp.height = capture->height;
++        }
++    } else {
++        fmt.fmt.pix.pixelformat = pixfmt;
++        if (!fmt.fmt.pix.width || !fmt.fmt.pix.height) {
++            fmt.fmt.pix.width = capture->width;
++            fmt.fmt.pix.height = capture->height;
++        }
++    }
++
++    if (probe_first) {
++        struct v4l2_format try_fmt = fmt;
++        if (ioctl(s->fd, VIDIOC_TRY_FMT, &try_fmt) < 0)
++            return AVERROR(errno);
++        if ((multiplanar ? try_fmt.fmt.pix_mp.pixelformat : try_fmt.fmt.pix.pixelformat) != pixfmt)
++            return AVERROR(EINVAL);
++    }
++
++    if (ioctl(s->fd, VIDIOC_S_FMT, &fmt) < 0)
++        return AVERROR(errno);
++    if ((multiplanar ? fmt.fmt.pix_mp.pixelformat : fmt.fmt.pix.pixelformat) != pixfmt)
++        return AVERROR(EINVAL);
++
++    capture->format = fmt;
++    return 0;
++}
++#endif
++
+ static int v4l2_select_capture_format(AVCodecContext *avctx)
+ {
+     V4L2m2mContext *s = ((V4L2m2mPriv *)avctx->priv_data)->context;
+@@ -63,6 +111,11 @@ static int v4l2_select_capture_format(AVCodecContext *avctx)
+         AVHWFramesContext *frames;
+         int ret;
+ 
++#if CONFIG_LIBDRM && defined(V4L2_PIX_FMT_QC08C) && defined(DRM_FORMAT_MOD_QCOM_COMPRESSED)
++        if (capture->av_pix_fmt == AV_PIX_FMT_NV12)
++            v4l2_set_capture_pixfmt(avctx, capture, V4L2_PIX_FMT_QC08C, 1);
++#endif
++
+         if (!device_ref)
+             return AVERROR(ENOMEM);
+         ((AVDRMDeviceContext *)((AVHWDeviceContext *)device_ref->data)->hwctx)->fd = -1;
+@@ -86,6 +139,13 @@ static int v4l2_select_capture_format(AVCodecContext *avctx)
+             av_buffer_unref(&capture->drm_frames_ref);
+             return ret;
+         }
++#if CONFIG_LIBDRM && defined(V4L2_PIX_FMT_QC08C) && defined(DRM_FORMAT_MOD_QCOM_COMPRESSED)
++    } else if (V4L2_TYPE_IS_MULTIPLANAR(capture->type) &&
++               capture->format.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_QC08C) {
++        int ret = v4l2_set_capture_pixfmt(avctx, capture, V4L2_PIX_FMT_NV12, 0);
++        if (ret < 0)
++            return ret;
++#endif
+     }
+ 
+     return 0;
+@@ -130,10 +190,15 @@ static int v4l2_try_start(AVCodecContext *avctx)
+     }
+ 
+     /* 2.1 update the AVCodecContext */
+-    capture->av_pix_fmt = ff_v4l2_format_v4l2_to_avfmt(
+-        V4L2_TYPE_IS_MULTIPLANAR(capture->type) ?
+-        capture->format.fmt.pix_mp.pixelformat : capture->format.fmt.pix.pixelformat,
+-        AV_CODEC_ID_RAWVIDEO);
++    {
++        uint32_t v4l2_pixfmt = V4L2_TYPE_IS_MULTIPLANAR(capture->type) ?
++            capture->format.fmt.pix_mp.pixelformat : capture->format.fmt.pix.pixelformat;
++        capture->av_pix_fmt =
++#ifdef V4L2_PIX_FMT_QC08C
++            v4l2_pixfmt == V4L2_PIX_FMT_QC08C ? AV_PIX_FMT_NV12 :
++#endif
++            ff_v4l2_format_v4l2_to_avfmt(v4l2_pixfmt, AV_CODEC_ID_RAWVIDEO);
++    }
+ 
+     /* 3. set the crop parameters */
+     selection.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
