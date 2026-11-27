@@ -1,6 +1,6 @@
 # alphaplus-nix
 
-LG G8 ThinQ（`LM-G820N`，Qualcomm SM8150 / `alphaplus` 韩版）的 NixOS Flake 与板级适配仓库：基于主线 Linux `7.3.3`、U-Boot `v2026.10` 与 KDE Plasma 6（Wayland）。
+LG G8 ThinQ（`LM-G820N`，Qualcomm SM8150 / `alphaplus` 韩版）的 NixOS Flake 与板级适配仓库：基于主线 Linux `7.3.6`、U-Boot `v2026.10` 与 KDE Plasma 6（Wayland）。
 
 ## 硬件支持
 

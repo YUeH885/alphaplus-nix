@@ -3,11 +3,11 @@
     "linux-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1795779560,
-        "narHash": "sha256-ejEtMZ2gMsbYOfkF1MvMD5SDMZQ2F7/7QJbgJjmCvo0=",
+        "lastModified": 1795782487,
+        "narHash": "sha256-WW3xba8DTIAp/J42nlUPap4F4FkcVEt5r0kZmjX3zMY=",
         "owner": "YUeH885",
         "repo": "linux",
-        "rev": "09a88f74b6ba5455d787b27cc17266148bd6573e",
+        "rev": "0bacd4de16e9fc64d6428a354159a6bf781d9d53",
         "type": "github"
       },
       "original": {
