@@ -11,6 +11,6 @@
 | [音频与触觉](audio-haptics.md) | WCD9340、ES9218P、双扬声器/听筒、BT SCO、DW7800 与动态声道路由 |
 | [相机](camera.md) | Titan 175 CAMSS/FD501、四摄 RGB + 前置 ToF、libcamera 3A/OIS/PDAF/ToF-AF |
 | [CDSP 计算](cdsp.md) | `remoteproc_cdsp`、`hexagonrpcd` 与推理部署取舍 |
-| [VPU](vpu.md) | Iris 1.xx 视频编解码与 `ffmpeg-vpu` DRM PRIME 零拷贝 |
+| [VPU](vpu.md) | Iris 1.xx 视频编解码、`qcom-va-driver` VA-API 与 `ffmpeg-vpu` DRM PRIME 零拷贝 |
 | [辅助外设](auxiliary-peripherals.md) | PM8941 RTC、PN547 NFC、PM8150L 闪光灯与指纹 |
 | [传感器](sensors.md) | SLPI FastRPC、`hexagonrpc`、`libssc` 与 `iio-sensor-proxy` |

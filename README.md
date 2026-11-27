@@ -15,7 +15,7 @@ LG G8 ThinQ（`LM-G820N`，Qualcomm SM8150 / `alphaplus` 韩版）的 NixOS Flak
 | 音频与触觉 | 部分 | WCD9340、ES9218P Quad DAC、双扬声器/听筒、BT SCO、Q6Voice（`VoiceMMode1`）、DW7800；缺 DMIC0 | [audio-haptics.md](docs/components/audio-haptics.md) |
 | 相机 | 可用 | 4 颗 RGB（3A/PDAF/ToF-AF/OIS/FD501/FC4）+ 前置 ToF 深度相机 | [camera.md](docs/components/camera.md) |
 | CDSP | 部分 | `remoteproc_cdsp` + `hexagonrpcd` 基础计算通路可用；缺 HVX/NN 运行时与安全计算域 | [cdsp.md](docs/components/cdsp.md) |
-| VPU | 可用 | Iris 1.xx 4K 解码/编码、LLCC、动态 DDR 带宽缩放与 8-bit UBWC 零拷贝；缺 10-bit UBWC EGL 导入与安全视频/8K | [vpu.md](docs/components/vpu.md) |
+| VPU | 可用 | Iris 1.xx 4K 解码/编码、LLCC、动态 DDR 带宽缩放、8-bit UBWC 与 VA-API（`qcom-va-driver`）；缺 VA-API VPP、10-bit UBWC EGL 导入与安全视频/8K | [vpu.md](docs/components/vpu.md) |
 | 辅助外设 | 部分 | PM8941 RTC、PN547 NFC（`neard` + 托盘读写 UI）、PM8150L 闪光灯与托盘手电筒；缺 Goodix 指纹与 HCE | [auxiliary-peripherals.md](docs/components/auxiliary-peripherals.md) |
 | 传感器 | 可用 | SLPI FastRPC + `hexagonrpc` + `libssc` + `iio-sensor-proxy` | [sensors.md](docs/components/sensors.md) |
 
