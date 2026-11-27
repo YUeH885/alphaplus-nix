@@ -12,7 +12,7 @@ LG G8 ThinQ（`LM-G820N`，Qualcomm SM8150 / `alphaplus` 韩版）的 NixOS Flak
 | 电源、充电与热管理 | 可用 | PM8150B + SMB1355 并联 PD 快充、VTS 温控、维护回睡、充电阈值与旁路供电 | [power-charging-thermal.md](docs/components/power-charging-thermal.md) |
 | 无线与 Modem | 可用 | WCN3990 Wi-Fi（VHT160）、WCN3998 蓝牙（FTM MAC）、LTE 移动数据、`imsd` VoLTE 双向通话与 SMS over IP（Spacebar） | [wireless-modem.md](docs/components/wireless-modem.md) |
 | GNSS | 可用 | MPSS QMI LOC、NMEA socket、XTRA / 粗位置注入与 ModemManager / BeaconDB 辅助 GeoClue | [gnss.md](docs/components/gnss.md) |
-| 音频与触觉 | 部分 | WCD9340、ES9218P Quad DAC、双扬声器/听筒、BT SCO、Q6Voice（`VoiceMMode1`）、DW7800；缺 SaaM 扬声器拾音 | [audio-haptics.md](docs/components/audio-haptics.md) |
+| 音频与触觉 | 可用 | WCD9340、ES9218P Quad DAC、双扬声器/听筒、BT SCO、Q6Voice（`VoiceMMode1`）、DW7800；缺 FM 收音 | [audio-haptics.md](docs/components/audio-haptics.md) |
 | 相机 | 可用 | 4 颗 RGB（3A/PDAF/ToF-AF/OIS/FD501/FC4）+ 前置 ToF 深度相机 | [camera.md](docs/components/camera.md) |
 | CDSP | 部分 | `remoteproc_cdsp` + `hexagonrpcd` 基础计算通路可用；缺 HVX/NN 运行时与安全计算域 | [cdsp.md](docs/components/cdsp.md) |
 | VPU | 可用 | Iris 1.xx 4K 解码/编码、LLCC、动态 DDR 带宽缩放、8-bit UBWC 与 VA-API（`qcom-va-driver`，含 Vulkan VPP 与单上下文 DRC）；缺 CDSP VPP、10-bit UBWC EGL 导入与安全视频/8K | [vpu.md](docs/components/vpu.md) |
