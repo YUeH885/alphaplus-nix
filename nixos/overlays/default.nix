@@ -92,6 +92,7 @@ EOF
     libcamera = prev.libcamera.override { withQcam = true; };
   };
   ffmpeg-vpu = final.callPackage ../pkgs/ffmpeg-vpu { inherit (prev) ffmpeg_7; };
+  qcom-va-driver = final.callPackage ../pkgs/qcom-va-driver { };
   pipewire-spa-alphaplus = final.callPackage ../pkgs/pipewire-bluetooth { };
   snapshot-alphaplus = final.callPackage ../pkgs/snapshot {
     snapshot = prev.snapshot.override { libcamera = final.libcamera-alphaplus; };

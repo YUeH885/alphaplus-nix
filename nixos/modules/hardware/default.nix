@@ -29,7 +29,11 @@ in
   ];
 
   environment.systemPackages = [ pkgs.feedbackd feedbackdTheme pkgs.libqmi pkgs.iw ];
-  hardware.graphics.extraPackages = [ (lib.hiPrio pkgs.turnip-alphaplus) ];
+  environment.variables.GST_VA_ALL_DRIVERS = "1";
+  hardware.graphics.extraPackages = [
+    (lib.hiPrio pkgs.turnip-alphaplus)
+    pkgs.qcom-va-driver
+  ];
   services.dbus.packages = [ pkgs.feedbackd ];
   systemd.packages = [ pkgs.feedbackd ];
   # Preserve numeric 70-/72- rule ordering ahead of systemd 73-seat-late.rules for uaccess ACLs.

@@ -128,6 +128,7 @@
           libssc = pkgsAarch64.libssc;
           libcamera = pkgsAarch64.libcamera-alphaplus;
           ffmpeg-vpu = pkgsAarch64.ffmpeg-vpu;
+          qcom-va-driver = pkgsAarch64.qcom-va-driver;
           desktop-helpers = pkgsAarch64.alphaplus-desktop-helpers;
 
           default = self.packages.${system}.rootfs;
