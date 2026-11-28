@@ -4,8 +4,9 @@
 The touchscreen is grabbed and its contacts are forwarded to a virtual
 touchpad, so libinput and KWin provide pointer motion, tap-to-click,
 tap-and-drag, scrolling and touchpad gestures, all configurable in the
-system settings. A four-finger tap switches between touchpad mode and
-direct touch. Display orientation follows the compositor through Wayland output events.
+system settings. The Assistant key controls the on-screen keyboard and
+switches between touchpad mode and direct touch. Display orientation
+follows the compositor through Wayland output events.
 """
 
 import glob
@@ -18,10 +19,7 @@ import time
 from display_orientation import DisplayOrientation, TRANSFORMS
 from screen_lock import ScreenLockMonitor
 
-KEYBOARD_FINGERS = 3
-TOGGLE_FINGERS = 4
-TOGGLE_TIMEOUT = 0.35
-TOGGLE_SLOP = 80
+DOUBLE_PRESS_TIMEOUT_MS = 300
 GRAB_DELAY = 0.15
 TOUCHPAD_RESOLUTION = 45
 BLANK_SUPPRESSION_TIMEOUT = 1.2
@@ -67,6 +65,18 @@ def find_touchscreen(paths, InputDevice, ecodes):
     return selected
 
 
+def find_key_device(paths, InputDevice, ecodes, name, code):
+    for path in paths:
+        try:
+            device = InputDevice(path)
+        except OSError:
+            continue
+        if device.name == name and code in device.capabilities(absinfo=False).get(ecodes.EV_KEY, []):
+            return device
+        device.close()
+    return None
+
+
 class Touchpad:
     def __init__(self, device, ecodes, UInput, AbsInfo, raw_x_max, raw_y_max, initial_transform="Normal"):
         self.device = device
@@ -95,7 +105,6 @@ class Touchpad:
         self.grabbed_for_suppression = False
         self.keyboard_shown = False
         self.restore_touchpad = False
-        self.reset_gesture()
         self.on_virtual_replaced = None
         self.on_keyboard_toggle = None
 
@@ -174,10 +183,6 @@ class Touchpad:
             if not self.grabbed_for_suppression:
                 self.ungrab()
             logging.info("Touchpad mode disabled")
-        self.contacts.clear()
-        self.changed.clear()
-        self.removed.clear()
-        self.reset_gesture()
 
     def schedule_grab(self):
         from gi.repository import GLib
@@ -266,12 +271,6 @@ class Touchpad:
         self.cancel_suppression()
         return False
 
-    def reset_gesture(self):
-        self.max_contacts = 0
-        self.started = 0.0
-        self.released = 0.0
-        self.moved = 0.0
-
     def cancel_gesture(self):
         # Include contacts whose frames are still queued on the physical device.
         while (event := self.device.read_one()) is not None:
@@ -289,7 +288,6 @@ class Touchpad:
         self.pressed = False
         self.tool = None
         self.cancelled = bool(self.contacts)
-        self.reset_gesture()
 
     def release(self):
         # Lift every forwarded contact so the virtual touchpad cannot stick.
@@ -324,65 +322,28 @@ class Touchpad:
                 contact = self.contacts.get(self.slot)
                 if contact is not None:
                     index = 0 if event.code == ecodes.ABS_MT_POSITION_X else 1
-                    contact["position"][index] = event.value
-                    contact["known"][index] = True
+                    contact[index] = event.value
                     self.changed.add(self.slot)
         elif event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
             self.on_frame()
 
     def on_tracking_id(self, value):
         if value >= 0:
-            self.contacts[self.slot] = {"position": [0, 0], "known": [False, False],
-                                        "previous": None}
+            self.contacts[self.slot] = [None, None]
             self.changed.add(self.slot)
-            if len(self.contacts) > self.max_contacts:
-                self.max_contacts = len(self.contacts)
-                self.started = time.monotonic()
-                self.released = 0.0
-                self.moved = 0.0
         elif self.slot in self.contacts:
             del self.contacts[self.slot]
             self.changed.add(self.slot)
             self.removed.add(self.slot)
-            if self.released == 0.0:
-                self.released = time.monotonic()
 
     def on_frame(self):
         if not self.contacts and self.grab_when_released:
             self.grab_if_enabled()
-        if self.is_suppressed():
-            self.reset_gesture()
-            self.changed.clear()
-            self.removed.clear()
-            return
-        if self.locked:
-            self.reset_gesture()
-            self.changed.clear()
-            self.removed.clear()
-            return
-        if self.cancelled:
-            if not self.contacts:
-                self.cancelled = False
-                self.reset_gesture()
-            self.changed.clear()
-            self.removed.clear()
-            return
-        # Wait for real coordinates; the placeholder must not become a delta.
-        for contact in self.contacts.values():
-            if not all(contact["known"]):
-                continue
-            previous = contact["previous"]
-            if previous is None:
-                contact["previous"] = list(contact["position"])
-                continue
-            dx = contact["position"][0] - previous[0]
-            dy = contact["position"][1] - previous[1]
-            self.moved += (dx * dx + dy * dy) ** 0.5
-            previous[0], previous[1] = contact["position"][0], contact["position"][1]
-        if self.enabled and self.grabbed:
-            self.forward()
-        if not self.contacts:
-            self.finish()
+        if not self.is_suppressed() and not self.locked:
+            if self.cancelled:
+                self.cancelled = bool(self.contacts)
+            elif self.enabled and self.grabbed:
+                self.forward()
         self.changed.clear()
         self.removed.clear()
 
@@ -414,34 +375,24 @@ class Touchpad:
                     self.virtual.write(self.ecodes.EV_ABS, self.ecodes.ABS_MT_TRACKING_ID, -1)
                     del self.ids[slot]
                 continue
-            entry = self.contacts[slot]
-            if not all(entry["known"]):
+            raw_x, raw_y = self.contacts[slot]
+            if raw_x is None or raw_y is None:
                 continue
             if slot not in self.ids:
                 self.ids[slot] = self.next_id
                 self.next_id += 1
                 self.virtual.write(self.ecodes.EV_ABS, self.ecodes.ABS_MT_TRACKING_ID,
                                    self.ids[slot])
-            position = entry["position"]
-            x, y = self.transform_coordinates(position[0], position[1])
+            x, y = self.transform_coordinates(raw_x, raw_y)
             self.virtual.write(self.ecodes.EV_ABS, self.ecodes.ABS_MT_POSITION_X, x)
             self.virtual.write(self.ecodes.EV_ABS, self.ecodes.ABS_MT_POSITION_Y, y)
             self.virtual.write(self.ecodes.EV_ABS, self.ecodes.ABS_X, x)
             self.virtual.write(self.ecodes.EV_ABS, self.ecodes.ABS_Y, y)
         self.virtual.syn()
 
-    def finish(self):
-        end = self.released or time.monotonic()
-        duration = end - self.started if self.started else TOGGLE_TIMEOUT + 1
-        contacts = self.max_contacts
-        moved = self.moved
-        self.reset_gesture()
-        if not self.locked and duration <= TOGGLE_TIMEOUT and moved <= TOGGLE_SLOP:
-            if contacts == TOGGLE_FINGERS:
-                self.restore_touchpad = False
-                self.set_enabled(not self.enabled)
-            elif contacts == KEYBOARD_FINGERS:
-                self.toggle_keyboard()
+    def toggle_mode(self):
+        self.restore_touchpad = False
+        self.set_enabled(not self.enabled)
 
     def set_keyboard_shown(self, shown):
         shown = bool(shown)
@@ -457,15 +408,8 @@ class Touchpad:
             self.set_enabled(True)
 
     def toggle_keyboard(self):
-        if not self.on_keyboard_toggle:
-            return
-        want_show = not self.keyboard_shown
-        if want_show and self.enabled:
-            self.restore_touchpad = True
-            self.set_enabled(False)
-        if not self.on_keyboard_toggle(want_show) and want_show and self.restore_touchpad:
-            self.restore_touchpad = False
-            self.set_enabled(True)
+        if self.on_keyboard_toggle:
+            self.on_keyboard_toggle(not self.keyboard_shown)
 
     def close(self):
         self.cancel_suppression()
@@ -475,6 +419,47 @@ class Touchpad:
             self.virtual.close()
         except Exception:
             pass
+
+
+class AssistantKey:
+    def __init__(self, device, touchpad, ecodes, GLib):
+        self.device = device
+        self.touchpad = touchpad
+        self.ecodes = ecodes
+        self.GLib = GLib
+        self.single_press_source = None
+
+    def can_activate(self):
+        return not self.touchpad.locked and not self.touchpad.is_suppressed()
+
+    def cancel_single_press(self):
+        if self.single_press_source is not None:
+            self.GLib.source_remove(self.single_press_source)
+            self.single_press_source = None
+
+    def on_single_press(self):
+        self.single_press_source = None
+        if self.can_activate():
+            self.touchpad.toggle_keyboard()
+        return False
+
+    def on_readable(self, fd, condition):
+        while (event := self.device.read_one()) is not None:
+            # The board reports the Assistant button as KEY_TV on gpio-keys alongside volume up.
+            if event.type != self.ecodes.EV_KEY or event.code != self.ecodes.KEY_TV or event.value != 1:
+                continue
+            if not self.can_activate():
+                self.cancel_single_press()
+            elif self.single_press_source is not None:
+                self.cancel_single_press()
+                self.touchpad.toggle_mode()
+            else:
+                self.single_press_source = self.GLib.timeout_add(DOUBLE_PRESS_TIMEOUT_MS, self.on_single_press)
+        return True
+
+    def close(self):
+        self.cancel_single_press()
+        self.device.close()
 
 
 class PowerKeyRelay:
@@ -565,7 +550,8 @@ def main():
 
     DBusGMainLoop(set_as_default=True)
     bus = dbus.SessionBus()
-    device = find_touchscreen(list_devices(), InputDevice, ecodes)
+    input_paths = list_devices()
+    device = find_touchscreen(input_paths, InputDevice, ecodes)
     device_x_max = device.absinfo(ecodes.ABS_MT_POSITION_X).max
     device_y_max = device.absinfo(ecodes.ABS_MT_POSITION_Y).max
 
@@ -580,13 +566,7 @@ def main():
     )
     logging.info("Using %s as a touchpad (initial orientation: %s)", device.name, initial_transform)
 
-    power_key = None
-    for path in list_devices():
-        candidate = InputDevice(path)
-        if candidate.name == "pm8941_pwrkey":
-            power_key = candidate
-            break
-        candidate.close()
+    power_key = find_key_device(input_paths, InputDevice, ecodes, "pm8941_pwrkey", ecodes.KEY_POWER)
     if power_key is None:
         raise RuntimeError("No pm8941 power key found")
 
@@ -678,10 +658,8 @@ def main():
                 controller.ForceShow()
             else:
                 controller.ForceHide()
-            return True
         except dbus.DBusException as error:
             logging.warning("Failed to %s on-screen keyboard: %s", "show" if show else "hide", error)
-            return False
 
     touchpad.on_keyboard_toggle = toggle_keyboard
     keyboard_watcher = KeyboardWatcher()
@@ -689,6 +667,13 @@ def main():
     orientation.start(touchpad.set_transform, loop)
     GLibUnix.fd_add_full(GLib.PRIORITY_DEFAULT, device.fd, GLib.IO_IN, touchpad.on_readable)
     GLibUnix.fd_add_full(GLib.PRIORITY_HIGH, power_key.fd, GLib.IO_IN, power.on_readable)
+    assistant_device = find_key_device(input_paths, InputDevice, ecodes, "gpio-keys", ecodes.KEY_TV)
+    assistant_key = None
+    if assistant_device is not None:
+        assistant_key = AssistantKey(assistant_device, touchpad, ecodes, GLib)
+        GLibUnix.fd_add_full(GLib.PRIORITY_DEFAULT, assistant_device.fd, GLib.IO_IN, assistant_key.on_readable)
+    else:
+        logging.warning("No Assistant key found")
     for signum in (signal.SIGTERM, signal.SIGINT):
         GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signum, lambda: (loop.quit(), False)[1])
     try:
@@ -705,6 +690,8 @@ def main():
         keyboard_watcher.close()
         monitor.close()
         orientation.close()
+        if assistant_key is not None:
+            assistant_key.close()
         touchpad.close()
         device.close()
         power.close()
