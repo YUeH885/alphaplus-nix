@@ -1,0 +1,14 @@
+diff --git a/src/encoder.cpp b/src/encoder.cpp
+index 42789db..ff81de3 100644
+--- a/src/encoder.cpp
++++ b/src/encoder.cpp
+@@ -864,7 +864,8 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+             q.plane.m.fd = memory->fd;
+         q.plane.length = memory->size;
+         q.plane.bytesused = e.input_size;
+-        const uint64_t token = e.token + 1;
++        // Iris firmware uses input timestamp intervals for rate control.
++        const uint64_t token = e.token + 1'000'000ULL * s.fps_den / s.fps_num;
+         q.buffer.timestamp.tv_sec = token / 1000000;
+         q.buffer.timestamp.tv_usec = token % 1000000;
+         auto job = std::make_shared<Impl::Job>();
