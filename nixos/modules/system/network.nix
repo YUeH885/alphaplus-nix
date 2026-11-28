@@ -19,6 +19,11 @@ in
     "net.ipv6.conf.all.accept_ra" = 2;
     "net.ipv6.conf.default.accept_ra" = 2;
   };
+  environment.etc."NetworkManager/conf.d/90-alphaplus-usb0.conf".text = ''
+    [device-usb0]
+    match-device=interface-name:usb0
+    managed=1
+  '';
   environment.etc."NetworkManager/dnsmasq-shared.d/hotspot.conf".text = ''
     resolv-file=/run/NetworkManager/no-stub-resolv.conf
   '';
