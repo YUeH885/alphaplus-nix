@@ -42,9 +42,17 @@ def is_display_on():
     raise RuntimeError("DSI-1 DPMS attribute is unavailable")
 
 
+def is_virtual_input(path):
+    # uinput devices (Sunshine, our own touchpad) live under /sys/devices/virtual.
+    sysfs = os.path.realpath(os.path.join("/sys/class/input", os.path.basename(path)))
+    return sysfs.startswith("/sys/devices/virtual/")
+
+
 def find_touchscreen(paths, InputDevice, ecodes):
     candidates = []
     for path in paths:
+        if is_virtual_input(path):
+            continue
         try:
             device = InputDevice(path)
         except OSError:
