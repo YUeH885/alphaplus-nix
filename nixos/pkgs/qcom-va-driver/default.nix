@@ -29,6 +29,7 @@ stdenv.mkDerivation {
     ./vulkan-vpp-32bit-ssbo.patch
     ./decoder-drc.patch
     ./encoder-frame-timestamps.patch
+    ./hevc-main10-encode.patch
   ];
 
   strictDeps = true;
