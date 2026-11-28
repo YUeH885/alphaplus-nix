@@ -160,7 +160,7 @@ def main():
                     if name.startswith("app-") and name.endswith((".service", ".scope")):
                         return name
                     if name.startswith("dbus-") and name.endswith(".service"):
-                        slice_name = str(properties.Get(manager_name + ".Unit", "Slice", signature="ss"))
+                        slice_name = str(properties.Get(manager_name + ".Service", "Slice", signature="ss"))
                         if slice_name == "app.slice" or slice_name.startswith("app-"):
                             return name
                     return None
