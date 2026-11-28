@@ -23,6 +23,6 @@
 
 ## 蜂窝通话与短信
 
-- LTE 通话由 `imsd` 通过 ModemManager 请求独立的 `ims` 承载。基带缺少 IPv6 IMS 配置时，`imsd` 创建一条启用 P-CSCF PCO 请求的配置，再读取运营商返回的地址。IMS 注册使用 USIM AKA 和内核 XFRM/ESP（已适配无 `qop` AKA 鉴权、AUTS 重同步、基于服务小区的 FDD/TDD `P-Access-Network-Info` 以及接听后的 delayed-offer `re-INVITE`/`ACK` 媒体重协商）。`imsd.service` 随 `ModemManager.service` 启动并在其重启后同步重建 `ims` 承载；Plasma Dialer 随桌面会话常驻 `imsd-dialerd` 以接听来电并呼叫。
+- LTE 通话由 `imsd` 通过 ModemManager 请求独立的 `ims` 承载。基带缺少 IPv6 IMS 配置时，`imsd` 创建一条启用 P-CSCF PCO 请求的配置，再读取运营商返回的地址。IMS 注册使用 USIM AKA 和内核 XFRM/ESP（已适配无 `qop` AKA 鉴权、AUTS 重同步、基于服务小区的 FDD/TDD `P-Access-Network-Info` 以及接听后的 delayed-offer `re-INVITE`/`ACK` 媒体重协商）。`imsd-radio-gate.service` 监听 ModemManager 的 modem 状态：射频启用（含 `locked`）时启动 `imsd.service`，状态变为 `disabled`（关闭 WWAN）时停止，`imsd` 随 `ModemManager.service` 重启而重启；Plasma Dialer 随桌面会话常驻 `imsd-dialerd` 以接听来电并呼叫。
 - 基带直接处理的通话仍可通过 ModemManager Voice 接口控制，音频使用 QDSP6 的 `VoiceMMode1`。详见 [音频与触觉](audio-haptics.md)。
 - 短信默认通过 `imsd` 的 SMS over IP 收发（[modem.nix](../../nixos/modules/hardware/modem.nix) 中设置 `SMS_OVER_IMS=1`，由 SIM 卡 `EF_SMSP` 读取短信中心地址）。桌面端采用 `spacebar-alphaplus`（[add-imsd-messaging-backend.patch](../../nixos/overlays/patches/spacebar/add-imsd-messaging-backend.patch)），在 `spacebar-daemon` 中通过 `net.catcrafts.IMS1.Messaging` 导入暂存短信、接收实时来信信号、提交发送并跟踪 `sent` / `failed` 状态；未启用 SMS over IP 时仍保留原有 ModemManager 通路。

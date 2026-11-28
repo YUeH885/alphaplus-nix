@@ -25,6 +25,30 @@ let
     load_env_file /etc/imsd.env
     exec ${lib.getExe imsd}
   '';
+  # imsd has no way to learn that the radio was switched on again, so its
+  # lifetime follows the ModemManager state instead of a restart-poll loop.
+  imsdRadioGateScript = pkgs.writeShellScript "alphaplus-imsd-radio-gate" ''
+    set -u
+    while :; do
+      radio=unknown
+      mmcli -m any --monitor-state 2>/dev/null | while IFS= read -r line; do
+        state=$(printf '%s\n' "$line" | grep -o "'[a-z-]*'" | tail -n1 | tr -d "'")
+        case "$state" in
+          disabled) next=off ;;
+          locked|enabling|enabled|searching|registered|connecting|connected) next=on ;;
+          *) continue ;;
+        esac
+        [ "$next" = "$radio" ] && continue
+        radio=$next
+        if [ "$next" = on ]; then
+          systemctl start imsd.service
+        else
+          systemctl stop imsd.service
+        fi
+      done
+      sleep 2
+    done
+  '';
   rprocBootScript = pkgs.writeShellScript "alphaplus-rproc-boot" ''
     for r in /sys/class/remoteproc/remoteproc*; do
       [ -f "$r/state" ] || continue
@@ -72,7 +96,6 @@ in
     requires = [ "ModemManager.service" ];
     partOf = [ "ModemManager.service" ];
     after = [ "ModemManager.service" "network.target" ];
-    wantedBy = [ "multi-user.target" "ModemManager.service" ];
     path = with pkgs; [
       coreutils gawk gnugrep gnused iproute2 libqmi
       modemmanager-alphaplus nftables pipewire sudo util-linux
@@ -92,6 +115,21 @@ in
       RestartSec = 120;
       KillMode = "mixed";
       TimeoutStopSec = 10;
+    };
+  };
+
+  systemd.services.imsd-radio-gate = {
+    description = "Run imsd only while the modem radio is enabled";
+    requires = [ "ModemManager.service" ];
+    partOf = [ "ModemManager.service" ];
+    after = [ "ModemManager.service" ];
+    wantedBy = [ "multi-user.target" "ModemManager.service" ];
+    path = [ pkgs.modemmanager-alphaplus ];
+    environment.LC_ALL = "C";
+    serviceConfig = {
+      ExecStart = "${imsdRadioGateScript}";
+      Restart = "always";
+      RestartSec = 5;
     };
   };
 
