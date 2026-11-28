@@ -38,6 +38,7 @@ rustPlatform.buildRustPackage {
   patches = [
     ./patches/0001-window-lifecycle.patch
     ./patches/0002-candidate-extbutton.patch
+    ./patches/0003-overlay-desktop-keyboard.patch
   ];
 
   cargoHash = "sha256-Zx3wPuIrvWbLsMWtCP0efq1rLolVMS94xlKaaFqgJeA=";

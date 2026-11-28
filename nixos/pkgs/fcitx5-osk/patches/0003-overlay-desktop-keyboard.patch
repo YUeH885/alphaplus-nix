@@ -1,0 +1,28 @@
+--- a/fcitx5-osk/src/window/wayland.rs
++++ b/fcitx5-osk/src/window/wayland.rs
+@@ -110,7 +110,7 @@
+         }
+         let placement = settings.placement;
+         let (anchor, exclusive_zone) = match placement {
+-            Placement::Dock => {
++            Placement::Dock if self.mode == WindowManagerMode::KwinLockScreen => {
+                 if let Some(exclusive_zone) = self.exclusive_zone {
+                     tracing::error!(
+                         "Multiple dock windows, there is already one dock with height: {}",
+@@ -121,6 +121,8 @@
+                 self.exclusive_zone = Some(size.1);
+                 (Anchor::Bottom, self.exclusive_zone.map(|n| n as i32))
+             }
++            // Keep the desktop keyboard at the screen edge without moving other panels.
++            Placement::Dock => (Anchor::Bottom, Some(-1)),
+             Placement::Float => {
+                 // In kwin, if you anchor all edges, and doesn't set size, the final window size
+                 // will be the size of the screen subtract the size of margin. In the meantime, if
+@@ -261,6 +263,7 @@
+                 task = task.chain(self.set_margin(id, margin));
+             } else if old_size.map(|s| s.height) != Some(size.height)
+                 && settings.placement == Placement::Dock
++                && self.exclusive_zone.is_some()
+             {
+                 tracing::debug!("changing exclusive zone to: {}", size.height);
+                 self.exclusive_zone = Some(size.height as u32);
