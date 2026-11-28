@@ -101,6 +101,7 @@ EOF
   alphaplus-kernel = final.callPackage ../pkgs/kernel { inherit linux-src; };
   alphaplus-uboot = final.callPackage ../pkgs/boot/uboot.nix { inherit uboot-src; };
   alphaplus-desktop-helpers = final.callPackage ../pkgs/desktop-helpers { };
+  alphaplus-kwin-keyboard = final.callPackage ../pkgs/kwin-keyboard { };
   alphaplus-flashlight = final.callPackage ../pkgs/flashlight { };
   alphaplus-bypass-charging = final.callPackage ../pkgs/bypass-charging { };
   alphaplus-nfc = final.callPackage ../pkgs/nfc { };

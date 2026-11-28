@@ -214,6 +214,11 @@ packages // {
     inherit (build) fetchgit;
   };
   inherit modemmanager-alphaplus mobile-broadband-provider-info-alphaplus callaudiod;
+  alphaplus-kwin-keyboard = native.alphaplus-kwin-keyboard.override {
+    inherit (cross) stdenv pkg-config;
+    inherit (build) cmake ninja;
+    qtbaseHost = build.qt6.qtbase;
+  };
   kdePackages = native.kdePackages // {
     # Override plasma-dialer so its build tools run natively on x86_64 with the cross callaudiod.
     plasma-dialer = (native.kdePackages.plasma-dialer.override {

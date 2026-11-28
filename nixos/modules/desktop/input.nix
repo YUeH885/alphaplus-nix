@@ -29,7 +29,7 @@ in
       ${lib.getExe' (lib.getDev pkgs.gtk3) "gtk-query-immodules-3.0"} > "${gtkCache}"
   '';
   fonts.packages = [ keyboard ];
-  environment.systemPackages = [ keyboard ];
+  environment.systemPackages = [ keyboard pkgs.alphaplus-kwin-keyboard ];
   services.dbus.packages = [ keyboard ];
   systemd.packages = [ keyboard ];
   systemd.services.fcitx5-osk-key-helper.wantedBy = [ "multi-user.target" ];
